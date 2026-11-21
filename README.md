@@ -16,10 +16,10 @@ Start it in one of two ways, and say which:
 
 ```
 docker run -d --name clanker-learn --stop-timeout 60 --runtime=sysbox-runc -e CL_MODE=sysbox \
-    -p 127.0.0.1:7788:7788 -p 127.0.0.1:8080:8080 -v clanker-learn-docker:/var/lib/docker -v clanker-learn-data:/data clanker-learn
+    -p 127.0.0.1:7788:7788 -p 127.0.0.1:8080:8080 -p 127.0.0.1:11100-11164:11100-11164 -p 127.0.0.1:11200-11299:11200-11299 -v clanker-learn-docker:/var/lib/docker -v clanker-learn-data:/data clanker-learn
 
 docker run -d --name clanker-learn --stop-timeout 60 --privileged -e CL_MODE=privileged \
-    -p 127.0.0.1:7788:7788 -p 127.0.0.1:8080:8080 -v clanker-learn-docker:/var/lib/docker -v clanker-learn-data:/data clanker-learn
+    -p 127.0.0.1:7788:7788 -p 127.0.0.1:8080:8080 -p 127.0.0.1:11100-11164:11100-11164 -p 127.0.0.1:11200-11299:11200-11299 -v clanker-learn-docker:/var/lib/docker -v clanker-learn-data:/data clanker-learn
 ```
 
 Give it its own namespaces and its own init: no `--pid=host`, `--network=host`, `--cgroupns=host`, `--init` or other entrypoint, and no network shared with another container (`--network=container:…`). With them its rules and its daemon would act on the machine's own processes, network or control groups, so it refuses to start and says which one it found. Two limits:
@@ -52,7 +52,7 @@ Each is given with `-e NAME=value` on the run command.
 - `CL_MODE`: `sysbox` or `privileged`, as above. It has no default.
 - `CL_WEB`: `on` (the default) or `off`. Off, no web server runs, and one left by an earlier start is removed; projects and the `cl` command work all the same.
 - `CL_WEB_PORT`: the page's port, 7788 by default. Publish the same port: `-e CL_WEB_PORT=8443 -p 127.0.0.1:8443:8443`.
-- `CL_ORIGIN_PORTS` (11100-11164 by default) and `CL_PASSTHROUGH_PORTS` (11200-11299 by default): two ranges of ports for what the sandboxes will show in the interface. They are read and checked now, and used by later parts.
+- `CL_ORIGIN_PORTS` (11100-11164 by default) and `CL_PASSTHROUGH_PORTS` (11200-11299 by default): two ranges of ports. A web app of a sandbox is shown on a port of its own from the first range. A raw TCP port of a sandbox named by hand is reached on a port of the second, which has no login in front of it. Publish the same ranges.
 - `CL_STATUS_PORT`: the port of the status answer (`state.json`), 8080 by default.
 
 The page's port and the two ranges are ports from 1024 to 65535, as `7788` or `11100-11164`, and none may overlap another or the status port. A wrong web setting leaves the container working, sandboxes, broker and all: `state.json` says `web: down` with the reason. A wrong `CL_STATUS_PORT` refuses the start; the status answer is then on 8080 and says why.
@@ -100,7 +100,7 @@ Use it only for a server that listens on loopback. Listed for a server that list
 
 The broker is the door through which the web interface will ask for anything that touches projects. It is a process of clanker-learn's container, started once the container is ready, and it listens on a unix socket (`/run/cl/broker/broker.sock`) that no sandbox has. It is the web server's one narrow place to ask.
 
-- It knows a short, closed list of things to do (list, status, create, start, stop, recreate, limits, destroy, how an operation stands, whether a first password can be set, and setting it). There is no way through it to the inner Docker itself.
+- It knows a short, closed list of things to do (list, status, create, start, stop, recreate, limits, destroy, how an operation stands, whether a first password can be set, and setting it; a project's Shell login for the terminal, what listens in its sandbox, and the ports named by hand: adding, removing and listing them). There is no way through it to the inner Docker itself.
 - Listing the projects, one project's status and how an operation stands need nothing. Everything else needs a session, which a login with the password gives; destroying a project needs the password again.
 - While no password is set, the first one can also be set from the page with the one-time set-up code printed in the container's log at its start. That works only while no password exists, never replaces one, and ten wrong codes within a minute shut it for a minute.
 - Set the password from the machine clanker-learn runs on. It is read from standard input, or asked for twice without echo at a terminal, and must have at least eight characters:
