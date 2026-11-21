@@ -2,7 +2,7 @@
 
 A self-hosted tutor: you learn a technical subject by doing it in a real environment, with a tutor that knows what you already know. One container, no tool on the host.
 
-It is being built. What exists so far is the outer container and, inside it, projects with their sandboxes, the broker, and the web server that the interface will be served by; the page itself is not built yet.
+It is being built. What exists so far is the outer container and, inside it, projects with their sandboxes, the broker, the web server, and its page: projects, a terminal, the editor and the web apps of a sandbox in the browser. The tutor, its lessons and the knowledge base are not built yet.
 
 ## The outer container
 
@@ -35,15 +35,30 @@ At every start the container applies the guard rules, starts its daemon, checks 
 
 The page is at `https://127.0.0.1:7788`. Its certificate is its own, made by clanker-learn and signed by nobody else, so the browser warns the first time: accept it for that address once.
 
-While no password is set, the first one is set with a set-up code, which the page will ask for once it is built. The container prints the code in its log at every start while no password exists:
+While no password is set, the page asks for a set-up code and a new password. The container prints the code in its log at every start while no password exists:
 
 ```
 docker logs clanker-learn
 ```
 
-The code is good until the container stops or a password is set. `docker exec -i clanker-learn cl passwd` sets the password without it (see the broker, below), and until the page is built that is the way to set one by hand.
+The code is good until the container stops or a password is set. `docker exec -i clanker-learn cl passwd` sets the password without it (see the broker, below).
 
-The first start takes a few minutes longer: the web server's image is built then, once, and needs the internet. `http://127.0.0.1:8080/state.json` says `web: preparing` meanwhile, then `web: up`; once the page answers, the sandbox image is built too (`sandbox_image`), so that the first project starts sooner. Until the page itself is built, the address shows a placeholder.
+The first start takes a few minutes longer: the web server's image is built then, once, and needs the internet. `http://127.0.0.1:8080/state.json` says `web: preparing` meanwhile, then `web: up`; once the page answers, the sandbox image is built too (`sandbox_image`), so that the first project starts sooner.
+
+### The page
+
+After the login the projects are listed down the left side. `+ New project` makes one and shows its progress; the gear beside a project starts, stops and recreates it, changes its limits, and destroys it (which asks for the password again).
+
+A project has these tabs:
+
+- **Shell**: a terminal in the sandbox. It keeps its session when the tab or the browser is closed.
+- **Editor**: the code editor (code-server) on the project's workspace, where its files are browsed and edited.
+- **One tab per web app** that listens in the sandbox. It appears a few seconds after the app starts listening, and is marked when the app is gone.
+- **Ports**: name a port by hand, as a web app (a tab, behind your login) or as raw TCP (an address, with **no login in front of it**).
+
+Every web tab, the Editor included, is served on a port of its own from the first range below. Some browsers want the certificate accepted once for each such address: if a tab stays empty, use its "open in a new tab" link, accept the certificate there, and reload the tab.
+
+The password never leaves the browser: the page sends a proof derived from it. The browser's storage holds only which project and tab were last shown.
 
 ### Settings
 
@@ -59,9 +74,9 @@ The page's port and the two ranges are ports from 1024 to 65535, as `7788` or `1
 
 ## Projects and sandboxes
 
-A project is one sandbox: a container of its own inside clanker-learn, on a network of its own, with a workspace (`/workspace`), a home folder, a user (`learner`) who can become root, an SSH server for the tutor to come in by, and a small server that shows the workspace's files on port 7070. A sandbox reaches the internet and nothing private: not clanker-learn's container, not another sandbox, not your network. It has no raw sockets: packet capture does not work in it; `ping` still does.
+A project is one sandbox: a container of its own inside clanker-learn, on a network of its own, with a workspace (`/workspace`), a home folder, a user (`learner`) who can become root, an SSH server for the tutor to come in by, the editor (code-server) on port 8443, and a small server that shows the workspace's files on port 7070. A sandbox reaches the internet and nothing private: not clanker-learn's container, not another sandbox, not your network. It has no raw sockets: packet capture does not work in it; `ping` still does.
 
-Until the web interface exists, projects are driven by a command inside the container:
+Projects are driven from the page, or by a command inside the container:
 
 ```
 docker exec clanker-learn cl create kafka --memory 4g --cpus 2
@@ -87,7 +102,7 @@ Two files in the workspace, which the tutor will keep current and you can edit, 
 - `/workspace/.learn/setup.sh`, the setup recipe: what was installed. It runs once in every new container, as the sandbox user (who can `sudo`), so after a `recreate` the software is back. It does not run at a plain stop and start, where nothing was lost. `cl status` says how it went (`setup`: none, running, done, failed), and its output is in `/var/log/cl/setup.log` in the sandbox. If the sandbox is stopped while it runs, it runs again from the top at the next start, so it must be safe to run twice. A recipe that failed is not tried again until the next `recreate`, and one that never ends holds the services back: there is no time limit on it.
 - `/workspace/.learn/services`, what should be running: one line each, `name: command`. A name is lower-case letters, digits and dashes, starts with a letter or a digit and has at most 32 characters; other lines are skipped, with a line in the sandbox's log (`docker logs` of its container). At most 64 services and 64 KiB are read. They are started at every start of the sandbox, after the recipe, as the sandbox user, with their output in `/workspace/.learn/logs/<name>.log`. They are started, not watched: one that ends stays down until the next start. At a stop they are asked to end before they are killed.
 
-A server that listens only on the sandbox's loopback address (many development and notebook servers do by default) cannot be reached from outside the sandbox, so the interface will show no tab for it. Inside the sandbox, `cl-expose 8888` puts it on the sandbox's own address; listed in the services file, that comes back too:
+A server that listens only on the sandbox's loopback address (many development and notebook servers do by default) cannot be reached from outside the sandbox, so the page shows no tab for it. Inside the sandbox, `cl-expose 8888` puts it on the sandbox's own address; listed in the services file, that comes back too:
 
 ```
 notebook: jupyter lab --port 8888
@@ -98,7 +113,7 @@ Use it only for a server that listens on loopback. Listed for a server that list
 
 ## The broker
 
-The broker is the door through which the web interface will ask for anything that touches projects. It is a process of clanker-learn's container, started once the container is ready, and it listens on a unix socket (`/run/cl/broker/broker.sock`) that no sandbox has. It is the web server's one narrow place to ask.
+The broker is the door through which the web server asks for anything that touches projects. It is a process of clanker-learn's container, started once the container is ready, and it listens on a unix socket (`/run/cl/broker/broker.sock`) that no sandbox has. It is the web server's one narrow place to ask.
 
 - It knows a short, closed list of things to do (list, status, create, start, stop, recreate, limits, destroy, how an operation stands, whether a first password can be set, and setting it; a project's Shell login for the terminal, what listens in its sandbox, and the ports named by hand: adding, removing and listing them). There is no way through it to the inner Docker itself.
 - Listing the projects, one project's status and how an operation stands need nothing. Everything else needs a session, which a login with the password gives; destroying a project needs the password again.
