@@ -22,11 +22,14 @@ docker run -d --name clanker-learn --stop-timeout 60 --privileged -e CL_MODE=pri
     -p 127.0.0.1:8080:8080 -v clanker-learn-docker:/var/lib/docker -v clanker-learn-data:/data clanker-learn
 ```
 
-Give it its own namespaces and its own init: no `--pid=host`, `--network=host`, `--cgroupns=host`, `--init` or other entrypoint. It refuses the ones it can tell (the process namespace and the init); the other two it cannot tell, and with them its rules and its daemon would act on the machine's own network and control groups.
+Give it its own namespaces and its own init: no `--pid=host`, `--network=host`, `--cgroupns=host`, `--init` or other entrypoint, and no network shared with another container (`--network=container:…`). With them its rules and its daemon would act on the machine's own processes, network or control groups, so it refuses to start and says which one it found. Two limits:
+
+- It tells `--network=host` by the bridges of the machine's Docker (`docker0`, `br-…`). On a machine whose Docker has none, or names its only bridge differently, the flag goes unnoticed. A network shared with another container is refused only when a Docker daemon's bridges are already in it, which usually means not at the first start and at every later one.
+- On a machine with cgroup v1, Docker's default is the machine's control groups: add `--cgroupns=private` to the command.
 
 On sysbox the container is confined from the host: a process that gets out of a sandbox into it is still not root on the machine. Privileged, the container is root-equivalent on the host: what then stands between a sandbox and the host is an ordinary container boundary and the guard rules. Only the privileged way is exercised by the tests so far; the sysbox way has not been run.
 
-At every start the container applies the guard rules, starts its daemon, checks the rules, and runs one self-test container. If any of that fails it ends everything it started and says why: in `docker logs`, and as a 503 answer on port 8080. It does the same if, while running, the rules are lost and cannot be put back, or the daemon dies.
+At every start the container applies the guard rules, starts its daemon, checks the rules, and runs one self-test container. If any of that fails it ends everything it started and says why: in `docker logs`, and as a 503 answer on port 8080. (Refused because its network is not its own, as with `--network=host`, it opens no port, because the port would be someone else's: `docker logs` says why.) It does the same if, while running, the rules are lost and cannot be put back, or the daemon dies.
 
 ## Tests
 
