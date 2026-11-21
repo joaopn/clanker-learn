@@ -36,21 +36,40 @@ import datetime
 import fcntl
 import hashlib
 import io
+import ipaddress
 import json
 import os
 import re
 import select
 import shutil
+import ssl
 import subprocess
 import sys
 import tarfile
 import time
+import urllib.error
+import urllib.request
 
 DATA = "/data"
 LOCKS = "/run/cl/locks"
 SANDBOX_DIR = "/opt/cl/sandbox"
 IMAGE_REPO = "cl-sandbox"
+WEB_DIR = "/opt/cl/web"
+WEB_REPO = "cl-web"
+IMAGES = {"sandbox": (SANDBOX_DIR, IMAGE_REPO, "the sandbox image"), "web": (WEB_DIR, WEB_REPO, "the web server's image")}
+PRELOAD = "/opt/cl/preload"   # <repository>.tar here is loaded where it holds the image wanted; else the image is built
 BUILD_NET = "cl-build"
+# The web server's container and the network its ports are published on. The subnet is
+# fixed (the web server listens on its address there and nowhere else) and lies outside
+# the range the inner daemon draws project networks from.
+WEB_CONTAINER = "cl-web"
+FRONT_NET = "cl-front"
+FRONT_SUBNET = "10.209.0.0/24"
+BROKER_RUN = "/run/cl/broker"
+WEB_PIDS = 512
+WEB_RESTART_S = 5
+WEB_SILENT_S = 30
+WEB_DEFAULTS = {"CL_WEB_PORT": "7788", "CL_ORIGIN_PORTS": "11100-11164", "CL_PASSTHROUGH_PORTS": "11200-11299"}
 BUILD_TIMEOUT_S = 3600
 SANDBOX_UID = 1000
 SANDBOX_USER = "learner"
@@ -309,7 +328,7 @@ def image_files(folder):
     return sorted(found)
 
 
-def image_tag(folder=None):
+def image_tag(folder=None, repo=None):
     """The tag is a hash of the definition: a changed definition is another image, and a
     sandbox keeps the one it was created from until it is recreated."""
     folder = folder or SANDBOX_DIR
@@ -317,26 +336,39 @@ def image_tag(folder=None):
     for name in image_files(folder):
         with open(os.path.join(folder, name), "rb") as fh:
             digest.update(name.encode() + b"\0" + fh.read() + b"\0")
-    return f"{IMAGE_REPO}:{digest.hexdigest()[:12]}"
+    return f"{repo or IMAGE_REPO}:{digest.hexdigest()[:12]}"
 
 
-def ensure_image(say=say_nothing):
-    """The sandbox image, built if it is not there: once on a new installation, and again when
-    its definition changed. The build runs on a network of its own, which the guard rules
-    fence like a sandbox's; one build at a time."""
-    tag = image_tag()
+class ImageError(CoreError):
+    """An image could not be had. Not tried again on a timer: at the next start, or when a
+    project is created."""
+
+
+def ensure_image(say=say_nothing, kind="sandbox"):
+    """One of clanker-learn's inner images (the sandbox's, the web server's), had if it is not
+    there: once on a new installation, and again when its definition changed. It is loaded
+    from the preload folder when that holds it, and built otherwise, on a network of its own,
+    which the guard rules fence like a sandbox's; one at a time."""
+    folder, repo, called = IMAGES[kind]
+    tag = image_tag(folder, repo)
     if there_is("image", tag):
         return tag
     with flocked(".build.lock"):
         if there_is("image", tag):
             return tag
-        say("building the sandbox image (once; this takes a few minutes and needs the internet)")
+        preloaded = f"{PRELOAD}/{repo}.tar"
+        if os.path.isfile(preloaded):
+            loaded = docker("load", "-i", preloaded, timeout=BUILD_TIMEOUT_S, check=False)
+            if loaded.returncode == 0 and there_is("image", tag):
+                return tag
+            say(f"{preloaded} does not hold {tag}; building it")
+        say(f"building {called} (once; this takes a few minutes and needs the internet)")
         if not there_is("network", BUILD_NET):
             docker("network", "create", BUILD_NET)
-        done = docker("build", "--network", BUILD_NET, "-t", tag, SANDBOX_DIR, timeout=BUILD_TIMEOUT_S, check=False)
+        done = docker("build", "--network", BUILD_NET, "-t", tag, folder, timeout=BUILD_TIMEOUT_S, check=False)
         if done.returncode != 0:
-            raise CoreError("The sandbox image could not be built: " + (done.stderr.strip() or done.stdout.strip())[-600:])
-        say("the sandbox image is built")
+            raise ImageError(f"{called[0].upper()}{called[1:]} could not be built: " + (done.stderr.strip() or done.stdout.strip())[-600:])
+        say(f"{called} is built")
     return tag
 
 
@@ -423,6 +455,9 @@ def ensure(record, say=say_nothing):
     write_provisioning(name)
     if not there_is("network", p["network"]):
         docker("network", "create", "--label", f"cl.project={name}", p["network"])
+    # The network first, then the web server onto it: web_up, the other way round, makes its
+    # container first and then lists the networks, so one of the two always connects them.
+    connect_web(p["network"], say)
     if not there_is("container", p["container"]):
         docker("create", *container_args(record, ensure_image(say)))
 
@@ -625,10 +660,13 @@ def remove_everything(name):
     if there_is("network", p["network"]):
         # What else sits on the project's network (the services that join every project's) is
         # taken off it, not removed.
-        attached = docker("network", "inspect", "-f", "{{range .Containers}}{{.Name}} {{end}}", p["network"], check=False)
-        for other in attached.stdout.split():
-            docker("network", "disconnect", "-f", p["network"], other, check=False)
-        done = docker("network", "rm", p["network"], check=False)
+        for _attempt in (1, 2):  # the web server may be connected again between the two steps: once more, then
+            attached = docker("network", "inspect", "-f", "{{range .Containers}}{{.Name}} {{end}}", p["network"], check=False)
+            for other in attached.stdout.split():
+                docker("network", "disconnect", "-f", p["network"], other, check=False)
+            done = docker("network", "rm", p["network"], check=False)
+            if done.returncode == 0:
+                break
         if done.returncode != 0:
             problems.append(f"the network ({done.stderr.strip()[-200:]})")
     for key in FOLDERS:
@@ -670,6 +708,256 @@ def start_wanted(say=say_nothing):
             failed[name] = str(exc) or type(exc).__name__
             say(f"{name} could not be started: {failed[name]}")
     return {"started": started, "failed": failed}
+
+
+# --- the web server's container ------------------------------------------------------------
+
+def port_setting(text, called):
+    try:
+        port = int(str(text).strip())
+    except ValueError:
+        port = 0
+    if not 1024 <= port <= 65535 or str(port) != str(text).strip():
+        raise CoreError(f"{called} is {text!r}: it must be a port number from 1024 to 65535.")
+    return port
+
+
+def range_setting(text, called):
+    low, dash, high = str(text).strip().partition("-")
+    if not dash:
+        raise CoreError(f"{called} is {text!r}: it must be a range of ports, as 11100-11164.")
+    low, high = port_setting(low, called), port_setting(high, called)
+    if low > high:
+        raise CoreError(f"{called} is {text!r}: its first port is above its last.")
+    return low, high
+
+
+def web_wanted(env):
+    """Whether clanker-learn runs its web server (CL_WEB: on, the default, or off)."""
+    said = env.get("CL_WEB", "on").strip().lower()
+    if said not in ("on", "off"):
+        raise CoreError(f"CL_WEB is {env.get('CL_WEB')!r}: it must be on or off.")
+    return said == "on"
+
+
+def web_settings(env, status_port):
+    """The page's port and the two ranges, as the run command names them, checked: each a
+    port or a range above 1023, none overlapping another or the status page's port."""
+    said = {key: env.get(key, default) for key, default in WEB_DEFAULTS.items()}
+    out = {"port": port_setting(said["CL_WEB_PORT"], "CL_WEB_PORT"),
+           "origin": range_setting(said["CL_ORIGIN_PORTS"], "CL_ORIGIN_PORTS"),
+           "passthrough": range_setting(said["CL_PASSTHROUGH_PORTS"], "CL_PASSTHROUGH_PORTS")}
+    spans = [("the status page's port", (status_port, status_port)), ("CL_WEB_PORT", (out["port"], out["port"])),
+             ("CL_ORIGIN_PORTS", out["origin"]), ("CL_PASSTHROUGH_PORTS", out["passthrough"])]
+    for i, (first, (a_low, a_high)) in enumerate(spans):
+        for second, (b_low, b_high) in spans[i + 1:]:
+            if a_low <= b_high and b_low <= a_high:
+                raise CoreError(f"{first} and {second} overlap ({a_low}-{a_high} and {b_low}-{b_high}).")
+    return out
+
+
+def web_args(settings, image):
+    """What `docker create` is given for the web server's container: no capability and no
+    way to gain one, the front network pinned as the one its published port lives on, the
+    broker's socket folder read-only, its own folder of the data volume, and nothing of a
+    project. The label is a hash of all of it: a container made from another image or with
+    other settings is told by it and made again."""
+    port = settings["port"]
+    args = [
+        "--name", WEB_CONTAINER, "--hostname", WEB_CONTAINER, "--network", f"name={FRONT_NET},gw-priority=1",
+        "--label", "cl.role=web",
+        "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--pids-limit", str(WEB_PIDS),
+        "--log-opt", "max-size=10m", "--log-opt", "max-file=3",
+        "-p", f"{port}:{port}",
+        "--mount", f"type=bind,source={BROKER_RUN},target=/run/cl-broker,readonly",
+        "--mount", f"type=bind,source={DATA}/web,target=/data",
+        "-e", f"CL_WEB_PORT={port}", "-e", f"CL_LISTEN_SUBNET={FRONT_SUBNET}",
+    ]
+    made_from = hashlib.sha256(json.dumps([args, image]).encode()).hexdigest()[:16]
+    return [*args, "--label", f"cl.made-from={made_from}", image]
+
+
+def overlapping_route(subnet, routes_text, own_device=""):
+    """The first route of this container that overlaps `subnet`, or "". A network made with a
+    subnet of our choosing gets no such check from the daemon, and replies to the browser
+    would go into it. The routes of `own_device` (the front network's own bridge, once it
+    exists) are left out: they are that network."""
+    wanted = ipaddress.ip_network(subnet)
+    for line in routes_text.splitlines():
+        words = line.split()  # "default" is no network: ip_network refuses it below
+        if not words:
+            continue
+        if own_device and "dev" in words[:-1] and words[words.index("dev") + 1] == own_device:
+            continue
+        with contextlib.suppress(ValueError):
+            if ipaddress.ip_network(words[0], strict=False).overlaps(wanted):
+                return line.strip()
+    return ""
+
+
+def read_routes():
+    """This container's IPv4 routes, as `ip` lists them. Routes that cannot be read are an
+    error: an overlap that was not seen would send the browser's replies astray."""
+    try:
+        listed = subprocess.run(["ip", "-4", "route", "show"], capture_output=True, text=True, timeout=20, check=False)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise CoreError(f"This container's routes could not be read ({exc}), so the web server's network was not checked.") from exc
+    if listed.returncode != 0:
+        raise CoreError(f"This container's routes could not be read ({listed.stderr.strip()[-200:]}), so the web server's network was not checked.")
+    return listed.stdout
+
+
+def connect_web(network, say=say_nothing):
+    """Put the web server on a project's network, if there is a web server. Not being able to
+    is a line in the log, never a failed start of a project."""
+    try:
+        if not there_is("container", WEB_CONTAINER):
+            return
+        done = docker("network", "connect", network, WEB_CONTAINER, check=False)
+        if done.returncode != 0 and "already exists" not in done.stderr:
+            say(f"the web server could not be connected to {network}: {done.stderr.strip()[-200:]}")
+    except CoreError as exc:
+        say(f"the web server could not be connected to {network}: {exc}")
+
+
+def web_up(settings, say=say_nothing):
+    """The web server's container, made if it is missing or was made from another image or
+    other settings, connected to every project's network, and started."""
+    image = ensure_image(say, "web")
+    # Checked at every start, not only when the network is made: a route added since (a VPN
+    # of the machine's, another network) would take the replies of the browser.
+    front = inspected("network", FRONT_NET)
+    own_device = f"br-{front['Id'][:12]}" if front is not None else ""
+    clash = overlapping_route(FRONT_SUBNET, read_routes(), own_device)
+    if clash:
+        raise CoreError(f"The web server's network {FRONT_SUBNET} overlaps a network this container is on ({clash}).")
+    if front is None:
+        docker("network", "create", "--subnet", FRONT_SUBNET, "--label", "cl.role=front", FRONT_NET)
+    os.makedirs(f"{DATA}/web", mode=0o700, exist_ok=True)
+    args = web_args(settings, image)
+    existing = inspect_container(WEB_CONTAINER)
+    if existing is not None and existing["Config"]["Labels"].get("cl.made-from") != args[-2].partition("=")[2]:
+        say("the web server's container was made from another image or other settings; making it again")
+        docker("rm", "-f", "-v", WEB_CONTAINER, timeout=STOP_GRACE_S + 120)
+        existing = None
+    if existing is None:
+        docker("create", *args)
+    for name in recorded_names():  # after the container exists: see ensure()
+        network = paths(name)["network"]
+        if there_is("network", network):
+            connect_web(network, say)
+    docker("start", WEB_CONTAINER)
+
+
+def web_health(settings, timeout=3):
+    """How the web server stands, as (kind, text): "up"; "absent" (no container); "ended"
+    (its container is not running; the text holds the last line of its log); "silent" (it
+    runs and does not answer on its front address); "unknown" (the daemon could not be
+    asked). Asked from this container, without running anything in the web server's."""
+    try:
+        container = inspect_container(WEB_CONTAINER)
+        if container is None:
+            return "absent", "there is no web server container"
+        if not container["State"].get("Running"):
+            last = docker("logs", "--tail", "1", WEB_CONTAINER, check=False)
+            return "ended", ("the web server ended: " + (last.stderr.strip() or last.stdout.strip())[-300:]).rstrip(": ")
+    except CoreError as exc:
+        return "unknown", str(exc)
+    address = (container["NetworkSettings"]["Networks"].get(FRONT_NET) or {}).get("IPAddress", "")
+    if not address:
+        return "silent", f"the web server does not answer yet (it has no address on {FRONT_NET})"
+    try:
+        # The certificate is the web server's own, self-signed, and names no address of the
+        # front network: this asks whether it answers, not who it is.
+        context = ssl.create_default_context()
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        with urllib.request.urlopen(f"https://{address}:{settings['port']}/", timeout=timeout, context=context) as answer:
+            if answer.status == 200:
+                return "up", ""
+            return "silent", f"the web server does not answer yet (it answered {answer.status})"
+    except (OSError, urllib.error.URLError, ValueError) as exc:
+        return "silent", f"the web server does not answer yet ({getattr(exc, 'reason', exc)})"
+
+
+def keep_web(env, status_port, report, sleep=time.sleep, turns=None, now=time.monotonic):
+    """Bring the web server up and keep it up, saying how it stands through `report(key,
+    value)`: "preparing", "up", "off", or "down: <why>". Returns 0 when it is off, 3 when it
+    is down for good this run (a wrong setting, an image that cannot be had: the next start of
+    clanker-learn tries again). A web server that is missing, ended, or cannot be asked about is
+    started again, a turn apart; one that runs and does not answer is left alone, and called
+    down after WEB_SILENT_S. `turns` bounds the loop, for tests."""
+    try:
+        wanted = web_wanted(env)
+    except CoreError as exc:
+        report("web", f"down: {exc}")
+        return 3
+    if not wanted:
+        try:
+            if there_is("container", WEB_CONTAINER):  # left by an earlier start with CL_WEB=on
+                docker("rm", "-f", "-v", WEB_CONTAINER, timeout=STOP_GRACE_S + 120)
+        except CoreError as exc:
+            report("web", f"down: {exc}")
+            return 3
+        report("web", "off")
+        return 0
+    try:
+        settings = web_settings(env, status_port)
+    except CoreError as exc:
+        report("web", f"down: {exc}")
+        return 3
+    said = [None]
+
+    def tell(state):
+        if state != said[0]:
+            report("web", state)
+            said[0] = state
+
+    def progress(message):
+        # Said as it comes, and remembered as said, so that the state after it is said again.
+        report("web", f"preparing: {message}")
+        said[0] = f"preparing: {message}"
+    tell("preparing")
+    first, silent_since, sandbox_image_tried, up_failed = True, None, False, False
+    while turns is None or turns > 0:
+        turns = None if turns is None else turns - 1
+        kind, text = web_health(settings)
+        if kind != "silent":
+            silent_since = None
+        if kind == "up":
+            tell("up")
+        elif kind == "silent":
+            # Starting, or stuck: no restart either way, but not "preparing" for ever.
+            silent_since = now() if silent_since is None else silent_since
+            if now() - silent_since > WEB_SILENT_S:
+                tell(f"down: {text}")
+        else:
+            # No container yet, one that ended, or a daemon that did not answer: made, or
+            # started again. Only the first two, and only at the first turn, are a start.
+            # After a web_up that failed the state holds its reason, which this would hide
+            # (and the two would take turns in the log while it lasts).
+            if not (first and kind in ("absent", "ended")) and not up_failed:
+                tell(f"down: {text}")
+            try:
+                web_up(settings, progress)
+                up_failed = False
+            except ImageError as exc:
+                tell(f"down: {exc}")
+                return 3
+            except (CoreError, OSError) as exc:  # OSError: its folder on the data volume, say
+                tell(f"down: {exc}")
+                up_failed = True
+        first = False
+        if said[0] == "up" and not sandbox_image_tried:
+            # The page is up first; the sandbox's image is its own line, never "web: down".
+            sandbox_image_tried = True
+            try:
+                ensure_image(lambda message: report("sandbox_image", f"preparing: {message}"), "sandbox")
+                report("sandbox_image", "ready")
+            except CoreError as exc:
+                report("sandbox_image", f"failed: {exc}")
+        sleep(1 if said[0].startswith("preparing") else WEB_RESTART_S)
+    return 0
 
 
 # --- the `cl` command ----------------------------------------------------------------------
@@ -716,6 +1004,8 @@ def main(argv=None):
     verbs = parser.add_subparsers(dest="verb", required=True)
     verbs.add_parser("list")
     verbs.add_parser("start-wanted")
+    keeper = verbs.add_parser("web-keep", help="(run by the init) bring the web server up and keep it up")
+    keeper.add_argument("status_port", type=int)
     verbs.add_parser("passwd", help="set the interface's password: read from standard input, or asked for at a terminal")
     for verb in ("status", "create", "start", "stop", "recreate", "destroy", "limits"):
         one = verbs.add_parser(verb)
@@ -729,6 +1019,10 @@ def main(argv=None):
         print(f"clanker-learn: {message}", file=sys.stderr, flush=True)
 
     try:
+        if args.verb == "web-keep":
+            def report(key, value):
+                print(json.dumps({key: value}), flush=True)
+            return keep_web(os.environ, args.status_port, report)
         if args.verb == "passwd":
             out = set_password(read_new_password())
         elif args.verb == "list":
