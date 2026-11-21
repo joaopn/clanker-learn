@@ -17,14 +17,23 @@ server, which clanker-learn transplants, finds what it reads today:
 One request per connection, handled one at a time. Containment, by construction:
 
   * A closed table of verbs (FIELDS). A verb not in it is unknown; there is no pass-through.
-  * Deny by default: a verb that is not an open read (OPEN_VERBS) needs a session token.
-    `login` checks a proof derived from the password (broker_auth) and issues one; it is held
-    only in this process's memory, so a restart of the broker ends every session, and so does
-    a change of the password.
+  * Deny by default: a verb that is not an open read (OPEN_VERBS) or one of the two set-up
+    verbs needs a session token. `login` checks a proof derived from the password
+    (broker_auth) and issues one; it is held only in this process's memory, so a restart of
+    the broker ends every session, and so does a change of the password.
+  * The first password can be set without a token, with the one-time set-up code the init
+    makes at a start with no password set, prints in the container's log and hands to this
+    process on its standard input. The code is held only in memory. `setup_needed` says
+    whether a first password can be set now; `first_password` sets it, never over an existing
+    one, and ten wrong codes within a minute shut it for a minute. Its code and proof reach no
+    log, no audit line and no child.
   * Step-up: `destroy` needs the proof again in the request. It is checked after the token,
     so a caller without a token never learns that it exists, and it is taken out of the
     request there: it reaches no log and no child.
   * Each verb takes only its own fields; any other is refused.
+  * The gates come in this order: a changed password's end of sessions, auth verbs, unknown verb, args an object, the set-up verbs,
+    token, step-up, the verb's fields and name, op_id, the project's lock. A caller without a
+    token learns nothing beyond the three open reads and whether a first password can be set.
   * The socket is 0600 and the peer must be this process's own user.
   * A request larger than MAX_REQUEST_BYTES is refused before its body is read, and a
     request that has not arrived whole within READ_TIMEOUT_S is dropped.
@@ -43,17 +52,23 @@ written anywhere; the child lets go when the work is done, just before its last 
 ending. A second lock, on a marker file per operation, held to the child's end, says in the
 same way whether the operation still runs.
 """
+import base64
 import contextlib
 import fcntl
+import hmac
 import json
+import math
 import os
+import pathlib
 import re
+import select
 import signal
 import socket
 import socketserver
 import struct
 import subprocess
 import sys
+import tempfile
 import time
 import traceback
 
@@ -72,7 +87,13 @@ MSG_CHARS = 4000
 OP_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 LEN = struct.Struct(">I")
 
+SETUP_CODE = re.compile(rb"[a-z0-9]{20}\n?")  # as the init makes it; one newline after it is tolerated
+SETUP_CODE_BYTES = 256                         # read at most this much of standard input
+NO_CODE = "-" * 20                             # compared with when no code is held: the time taken says nothing
+WRONG_CODES, WRONG_WINDOW_S, SHUT_S = 10, 60, 60
+
 AUTH_VERBS = ("login", "logout")
+SETUP_VERBS = frozenset({"setup_needed", "first_password"})
 OPEN_VERBS = frozenset({"list", "status", "op"})
 STEP_UP_VERBS = frozenset({"destroy"})
 OP_VERBS = frozenset({"create", "start", "stop", "recreate", "destroy"})
@@ -89,6 +110,8 @@ FIELDS = {
     "recreate": frozenset({"name"}),
     "limits": frozenset({"name", *LIMITS}),
     "destroy": frozenset({"name"}),
+    "setup_needed": frozenset(),
+    "first_password": frozenset({"code", "proof"}),
 }
 
 
@@ -320,12 +343,136 @@ def proof_is_right(proof):
     return isinstance(proof, str) and broker_auth.verify_password(proof, path=broker_auth.PASSWD_FILE)
 
 
-def dispatch(verb, args, token=None, tokens=None, *, op_id=None, audit=None, spawn=None, sync_tokens=None):
+# --- the first password ----------------------------------------------------------------------
+
+class SetupCode:
+    """The one-time set-up code, held only here, and the count of wrong codes. `now` is
+    injectable so that the shut door can be tested without waiting."""
+
+    def __init__(self, code=None, now=time.monotonic):
+        self.code = code
+        self.now = now
+        self.wrong = []           # when each recent wrong code came
+        self.shut_until = None
+
+    def wait_left(self):
+        """Seconds until a code is listened to again; 0 when it is now."""
+        if self.shut_until is None:
+            return 0
+        left = self.shut_until - self.now()
+        if left <= 0:
+            self.shut_until = None
+            return 0
+        return math.ceil(left)
+
+    def is_right(self, given):
+        """Constant-time, on bytes; with no code held, against a dummy that never matches."""
+        same = hmac.compare_digest(given.encode("utf-8", "surrogatepass"), (self.code or NO_CODE).encode())
+        return same and self.code is not None
+
+    def count_wrong(self):
+        now = self.now()
+        self.wrong = [when for when in self.wrong if now - when < WRONG_WINDOW_S] + [now]
+        if len(self.wrong) >= WRONG_CODES:
+            self.shut_until, self.wrong = now + SHUT_S, []
+
+
+def proof_has_its_form(proof):
+    """What derive_login_proof makes: standard base64, padded, of LOGIN_PROOF_DKLEN bytes. A
+    first password stored in another form could never be logged in with."""
+    try:
+        raw = base64.b64decode(proof.encode("ascii"), validate=True)
+    except (ValueError, UnicodeEncodeError):
+        return False
+    return len(raw) == broker_auth.LOGIN_PROOF_DKLEN and base64.b64encode(raw).decode("ascii") == proof
+
+
+def create_password_file(proof):
+    """Write the record beside the password file and link it into place: a link never replaces
+    a file, so a password set in the same moment (`cl passwd`) is kept. False when one was."""
+    target = pathlib.Path(broker_auth.PASSWD_FILE)
+    os.makedirs(target.parent, mode=0o700, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(dir=target.parent, prefix=".passwd-", suffix=".tmp")  # 0600 from its creation
+    try:
+        os.close(fd)
+        broker_auth.set_password(proof, path=pathlib.Path(temporary))
+        with open(temporary, "rb") as fh:
+            os.fsync(fh.fileno())
+        try:
+            os.link(temporary, target)
+        except FileExistsError:
+            return False
+        return True
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(temporary)
+
+
+def first_password(args, setup):
+    """Set the first password with the set-up code: (audit outcome, reply). A wrong code, no
+    code held and a password that exists already get the login's own refusal, so that this
+    verb does not tell whether a password is set."""
+    wait = setup.wait_left()
+    if wait:
+        return "rate_limited", err("rate_limited", f"Too many wrong set-up codes; wait {wait} seconds and try again.")
+    code, proof = args.get("code"), args.get("proof")
+    if set(args) - FIELDS["first_password"] or not isinstance(code, str) or not isinstance(proof, str):
+        return "bad_request", err("bad_request", "first_password takes a code and a proof, both strings, and nothing else")
+    if not setup.is_right(code):
+        setup.count_wrong()
+        return "auth_fail", err("auth", "invalid credentials")
+    if broker_auth.password_is_set(path=broker_auth.PASSWD_FILE):
+        return "refused", err("auth", "invalid credentials")
+    if not proof_has_its_form(proof):
+        return "refused", err("validation", "The password did not arrive in the form a login sends it; nothing was stored.")
+    try:
+        made = create_password_file(proof)
+    except OSError as exc:  # said without a path, as elsewhere
+        return "failed", err("failed", exc.strerror or "an input or output error")
+    if not made:
+        return "refused", err("auth", "invalid credentials")
+    setup.code = None  # one-time: it has done its work
+    return "ok", ok({"password": "set"})
+
+
+def take_setup_code(fd=0):
+    """The set-up code the init hands over on standard input, or None. Read once, bounded, and
+    never from a terminal; the descriptor is then /dev/null, so that no child inherits the
+    pipe. A malformed code is ignored, and not repeated in the log."""
+    raw = b""
+    try:
+        if not os.isatty(fd):
+            deadline = time.monotonic() + READ_TIMEOUT_S
+            while len(raw) < SETUP_CODE_BYTES:
+                left = deadline - time.monotonic()
+                if left <= 0 or not select.select([fd], [], [], left)[0]:
+                    break
+                chunk = os.read(fd, SETUP_CODE_BYTES - len(raw))
+                if not chunk:
+                    break
+                raw += chunk
+    except (OSError, ValueError):  # closed, or not something that can be read
+        raw = b""
+    with contextlib.suppress(OSError):
+        null = os.open(os.devnull, os.O_RDONLY)
+        if null != fd:  # with the descriptor closed, /dev/null takes its number by itself
+            os.dup2(null, fd)
+            os.close(null)
+    if not raw:
+        return None
+    if not SETUP_CODE.fullmatch(raw):
+        log("a malformed set-up code was given on standard input and is ignored")
+        return None
+    return raw.decode("ascii").removesuffix("\n")
+
+
+def dispatch(verb, args, token=None, tokens=None, *, op_id=None, audit=None, spawn=None, sync_tokens=None, setup=None):
     """Resolve and run one verb, mapping every outcome to a reply. Pure by default: `audit`,
-    if given, is called audit(principal, verb, outcome) for logins and writes; `spawn`, if
-    given, starts an operation's child (without it an operation is gated and checked but not
-    started); `sync_tokens`, if given, is called before any token is looked at, and ends
-    every session when the password has changed."""
+    if given, is called audit(principal, verb, outcome) for logins, writes and the first
+    password; `spawn`, if given, starts an operation's child (without it an operation is
+    gated and checked but not started); `sync_tokens`, if given, is called before any token
+    is looked at, and ends every session when the password has changed; `setup`, if given, is
+    the SetupCode (without it no first password can be set)."""
     def audited(principal, outcome, reply):
         if audit is not None:
             audit(principal, verb, outcome)
@@ -355,6 +502,14 @@ def dispatch(verb, args, token=None, tokens=None, *, op_id=None, audit=None, spa
         return err("unknown_verb", f"unknown verb {verb!r}; allowed: {sorted(FIELDS)}")
     if not isinstance(args, dict):
         return err("bad_request", "args must be a JSON object")
+
+    # The set-up verbs: open, since they serve before any password exists.
+    if verb == "setup_needed":
+        if args:
+            return err("validation", f"setup_needed takes no fields; not {sorted(args)}")
+        return ok({"needed": setup is not None and setup.code is not None and not broker_auth.password_is_set(path=broker_auth.PASSWD_FILE)})
+    if verb == "first_password":
+        return audited(None, *first_password(args, setup if setup is not None else SetupCode()))
 
     # Deny by default: anything that is not an open read needs a valid token.
     principal = None
@@ -482,9 +637,13 @@ class Handler(socketserver.StreamRequestHandler):
         try:
             reply = dispatch(message.get("verb"), message.get("args") or {}, message.get("token"), server.tokens,
                              op_id=message.get("op_id"), audit=broker_auth.audit_event,
-                             spawn=lambda spec: spawn_child(spec, server.children), sync_tokens=server.sync_tokens)
+                             spawn=lambda spec: spawn_child(spec, server.children), sync_tokens=server.sync_tokens,
+                             setup=server.setup)
         except Exception as exc:  # noqa: BLE001 - one request's fault is that request's failure, not the broker's end
-            traceback.print_exc()
+            if message.get("verb") == "first_password":
+                log(f"a first_password request failed in a way it does not know ({type(exc).__name__})")  # its text may hold the code or the proof
+            else:
+                traceback.print_exc()
             reply = err("failed", f"the broker failed in a way it does not know ({type(exc).__name__})")
         return self.send(reply)
 
@@ -504,11 +663,15 @@ def password_signature():
 
 
 class Server(socketserver.UnixStreamServer):
-    def __init__(self, path):
+    def __init__(self, path, setup_code=None):
         self.tokens = broker_auth.TokenStore()
         self.children = []
+        self.setup = SetupCode(setup_code)
         self.password_seen = password_signature()
-        if self.password_seen is None:
+        if self.password_seen is None and setup_code is not None:
+            log("no password is set: set the first one on the page with the set-up code printed in this container's log,"
+                " or with `docker exec -i clanker-learn cl passwd`")
+        elif self.password_seen is None:
             log("no password is set, so nobody can log in: `docker exec -i clanker-learn cl passwd` sets one")
         super().__init__(path, Handler)
 
@@ -536,12 +699,12 @@ class Server(socketserver.UnixStreamServer):
         self.children[:] = [child for child in self.children if child.poll() is None]
 
 
-def serve(path=SOCKET):
+def serve(path=SOCKET, setup_code=None):
     os.makedirs(os.path.dirname(path), mode=0o755, exist_ok=True)
     os.makedirs(OPLOGS, mode=0o755, exist_ok=True)
     os.makedirs(MARKERS, mode=0o700, exist_ok=True)
     os.makedirs(str(broker_auth.BROKER_DIR), mode=0o700, exist_ok=True)
-    server = Server(path)
+    server = Server(path, setup_code)
 
     def stop(*_):
         raise KeyboardInterrupt
@@ -591,7 +754,7 @@ def client_call(verb, args=None, *, token=None, op_id=None, socket_path=SOCKET, 
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     if argv[:1] == ["serve"]:
-        return serve()
+        return serve(setup_code=take_setup_code())
     if argv[:1] == ["__run-op"] and len(argv) == 2:
         return run_operation(json.loads(argv[1]))
     if argv[:1] == ["call"] and 2 <= len(argv) <= 5:

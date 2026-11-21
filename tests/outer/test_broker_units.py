@@ -1,6 +1,13 @@
 """The broker's gates and its bookkeeping of operations, without a daemon or a socket."""
+import base64
+import contextlib
 import json
 import os
+import pathlib
+import pty
+import subprocess
+import sys
+import threading
 
 import broker
 import broker_auth
@@ -64,7 +71,8 @@ def read(path):
 def test_a_verb_that_is_not_in_the_table_is_unknown_and_nothing_passes_through(world):
     for verb in ("docker", "exec", "update", "passwd", "", None, 7, "__run-op"):
         assert kind(world.call(verb)) == "unknown_verb"
-    assert sorted(broker.FIELDS) == ["build_alive", "create", "destroy", "lifecycle_active", "limits", "list", "op", "recreate", "start", "status", "stop"]
+    assert sorted(broker.FIELDS) == ["build_alive", "create", "destroy", "first_password", "lifecycle_active", "limits", "list", "op", "recreate",
+                                     "setup_needed", "start", "status", "stop"]
 
 
 def test_arguments_that_are_not_an_object_are_a_bad_request(world):
@@ -458,3 +466,294 @@ def test_setting_a_password_stores_what_the_browser_will_send(monkeypatch, tmp_p
     assert broker.proof_is_right(broker_auth.derive_login_proof("correct horse"))
     assert not broker.proof_is_right(broker_auth.derive_login_proof("correct horse\n"))
     assert not broker.proof_is_right("correct horse")   # the password itself is never what is sent
+
+
+# --- the first password, with the set-up code --------------------------------------------------
+
+CODE = "k3x9q2m7p4w8z1v6b5n0"                                   # the form the init makes: 20 of [a-z0-9]
+GOOD = base64.b64encode(bytes(range(32))).decode()             # the form derive_login_proof makes
+REFUSED = {"ok": False, "error": {"kind": "auth", "message": "invalid credentials"}}
+
+
+@pytest.fixture
+def first(monkeypatch, tmp_path):
+    """The real password check on a password file in a temp folder, a set-up code held, and
+    a clock for the shut door."""
+    monkeypatch.setattr(broker_auth, "PASSWD_FILE", tmp_path / "broker" / "passwd.json")
+
+    class First:
+        clock = Clock()
+        setup = broker.SetupCode(CODE, now=clock)
+        tokens = broker_auth.TokenStore()
+        passwd = tmp_path / "broker" / "passwd.json"
+
+        def call(self, verb, args=None, **more):
+            more.setdefault("setup", self.setup)
+            return broker.dispatch(verb, {} if args is None else args, None, self.tokens,
+                                   audit=lambda principal, v, outcome: self.audited.append((principal, v, outcome)), **more)
+
+        def set(self, code=CODE, proof=GOOD, **more):
+            return self.call("first_password", {"code": code, "proof": proof}, **more)
+
+    one = First()
+    one.audited = []
+    return one
+
+
+def test_the_right_code_sets_the_first_password_and_a_login_with_the_same_proof_succeeds(first):
+    proof = broker_auth.derive_login_proof("correct horse")   # what the browser sends
+    assert first.set(proof=proof) == {"ok": True, "result": {"password": "set"}}
+    assert first.audited == [(None, "first_password", "ok")] and first.setup.code is None   # spent
+    assert oct(first.passwd.stat().st_mode & 0o777) == "0o600" and oct(first.passwd.parent.stat().st_mode & 0o777) == "0o700"
+    assert proof not in first.passwd.read_text() and os.listdir(first.passwd.parent) == ["passwd.json"]
+    login = first.call("login", {"proof": proof})
+    assert login["ok"] and login["result"]["principal"] == "operator"
+    assert first.set(proof=GOOD) == REFUSED and first.passwd.read_text() and broker.proof_is_right(proof)   # once only
+
+
+def test_a_wrong_code_or_none_held_gets_the_logins_refusal_and_stores_nothing(first, monkeypatch):
+    compared = []
+    really_compare = broker.hmac.compare_digest
+    monkeypatch.setattr(broker.hmac, "compare_digest", lambda a, b: compared.append((type(a), type(b))) or really_compare(a, b))
+    for code in ("wrong", CODE.upper(), CODE[:-1], CODE + "x", CODE + "\n", "", "\ud800" * 20):
+        assert first.set(code=code) == REFUSED, code
+    for setup in (broker.SetupCode(None), None):   # none held, and no set-up object at all
+        for code in (CODE, broker.NO_CODE):
+            assert first.set(code=code, setup=setup) == REFUSED
+    assert first.audited == [(None, "first_password", "auth_fail")] * 11
+    assert compared == [(bytes, bytes)] * 11     # the same comparison, held or not
+    assert not first.passwd.parent.exists()
+
+
+def test_ten_wrong_codes_in_a_minute_shut_the_door_for_a_minute(first):
+    for _ in range(9):
+        assert first.set(code="wrong") == REFUSED
+        first.clock.now += 1
+    first.clock.now += 51                          # the first wrong code is out of the minute now: nine within it
+    assert first.set(code="wrong") == REFUSED
+    first.clock.now += 0.5
+    assert first.set(code="wrong") == REFUSED      # the tenth within the minute
+    for code in ("wrong", CODE):
+        shut = first.set(code=code)
+        assert shut == {"ok": False, "error": {"kind": "rate_limited", "message": "Too many wrong set-up codes; wait 60 seconds and try again."}}
+    first.clock.now += 59.5
+    assert "wait 1 seconds" in first.set()["error"]["message"]
+    assert not first.passwd.exists()
+    assert first.audited[-4:] == [(None, "first_password", "auth_fail")] + [(None, "first_password", "rate_limited")] * 3
+    first.clock.now += 0.5
+    assert first.set() == {"ok": True, "result": {"password": "set"}}
+
+
+def test_with_a_password_set_the_right_code_is_refused_and_the_file_is_untouched(first):
+    broker_auth.set_password("an earlier proof", path=broker_auth.PASSWD_FILE)   # `cl passwd`
+    before = first.passwd.read_bytes()
+    for proof in (GOOD, "not in the form"):   # the same refusal: whether a password is set is not told here
+        assert first.set(proof=proof) == REFUSED
+    assert first.passwd.read_bytes() == before and os.listdir(first.passwd.parent) == ["passwd.json"]
+    assert first.audited == [(None, "first_password", "refused")] * 2
+
+
+def test_a_password_file_that_appears_just_before_the_link_is_not_replaced(first, monkeypatch):
+    really_link = os.link
+
+    def cl_passwd_first(source, target):
+        broker_auth.set_password("set in the same moment", path=pathlib.Path(target))
+        return really_link(source, target)
+    monkeypatch.setattr(broker.os, "link", cl_passwd_first)
+    assert first.set() == REFUSED
+    assert broker.proof_is_right("set in the same moment") and not broker.proof_is_right(GOOD)
+    assert os.listdir(first.passwd.parent) == ["passwd.json"]   # and no temporary file is left
+    assert first.audited == [(None, "first_password", "refused")]
+
+
+def test_a_proof_not_in_the_form_a_login_sends_stores_nothing(first):
+    last = GOOD[-2]
+    alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+    not_canonical = GOOD[:-2] + alphabet[alphabet.index(last) + 1] + "="   # decodes to the same bytes, but a login never sends it
+    for proof in ("correct horse", "", base64.b64encode(bytes(31)).decode(), base64.b64encode(bytes(33)).decode(), GOOD[:-1], GOOD + "\n",
+                  " " + GOOD, GOOD.replace("A", "-"), base64.urlsafe_b64encode(bytes([251] * 32)).decode(), not_canonical, "é" * 44):
+        reply = first.set(proof=proof)
+        assert kind(reply) == "validation" and "nothing was stored" in reply["error"]["message"], proof
+    assert not first.passwd.exists() and first.audited == [(None, "first_password", "refused")] * 11
+    assert kind(first.set(proof=base64.b64encode(bytes([251] * 32)).decode())) == "ok"
+
+
+def test_setup_needed_says_whether_a_first_password_can_be_set_and_is_not_audited(first):
+    assert first.call("setup_needed") == {"ok": True, "result": {"needed": True}}
+    assert first.call("setup_needed", setup=broker.SetupCode(None)) == {"ok": True, "result": {"needed": False}}
+    assert broker.dispatch("setup_needed", {}) == {"ok": True, "result": {"needed": False}}   # no set-up object
+    assert kind(first.call("setup_needed", {"code": CODE})) == "validation"
+    assert first.audited == []
+    broker_auth.set_password("an earlier proof", path=broker_auth.PASSWD_FILE)
+    assert first.call("setup_needed") == {"ok": True, "result": {"needed": False}}
+    assert first.audited == []
+
+
+def test_the_set_up_verbs_take_an_object_and_first_password_takes_two_strings(first):
+    for verb in ("setup_needed", "first_password"):
+        for args in (["x"], "x", 7):
+            assert kind(first.call(verb, args)) == "bad_request"
+    for args in ({"code": CODE}, {"proof": GOOD}, {"code": 7, "proof": GOOD}, {"code": CODE, "proof": None}, {"code": CODE, "proof": GOOD, "name": "kafka"}):
+        assert kind(first.call("first_password", args)) == "bad_request", args
+    assert not first.passwd.exists() and first.setup.wrong == []
+    assert first.audited == [(None, "first_password", "bad_request")] * 5
+
+
+def test_the_unknown_verbs_message_names_every_verb(first):
+    message = first.call("passwd")["error"]["message"]
+    assert all(repr(verb) in message for verb in broker.FIELDS) and "'first_password'" in message and "'setup_needed'" in message
+
+
+# --- the set-up code at the broker's start, and through the socket ------------------------------
+
+def fed(data):
+    """A pipe holding `data`, its writing end closed: what the init hands over."""
+    read_end, write_end = os.pipe()
+    os.write(write_end, data)
+    os.close(write_end)
+    return read_end
+
+
+def is_dev_null(fd):
+    return os.path.samestat(os.fstat(fd), os.stat(os.devnull))
+
+
+@pytest.mark.parametrize("given, taken", [(CODE.encode(), CODE), (CODE.encode() + b"\n", CODE), (b"", None), (CODE.encode() + b"\n\n", None),
+                                          (CODE.upper().encode(), None), (CODE[:-1].encode(), None), (CODE.encode() + b"x", None),
+                                          (b" " + CODE.encode(), None), (CODE.encode() + b"\r\n", None), (CODE.encode() * 50, None)])
+def test_the_code_is_read_once_from_standard_input_and_a_malformed_one_is_not_logged(given, taken, capfd):
+    fd = fed(given)
+    try:
+        assert broker.take_setup_code(fd) == taken
+        assert is_dev_null(fd)   # nothing inherits the pipe
+    finally:
+        os.close(fd)
+    said = capfd.readouterr().err
+    assert ("malformed" in said) == (given != b"" and taken is None)
+    assert CODE not in said and CODE[:10] not in said and CODE.upper()[:10] not in said
+
+
+def test_no_code_from_dev_null_a_closed_input_or_a_terminal(capfd):
+    fd = os.open(os.devnull, os.O_RDONLY)
+    assert broker.take_setup_code(fd) is None and is_dev_null(fd)
+    os.close(fd)
+    assert broker.take_setup_code(fd) is None and is_dev_null(fd)   # closed: /dev/null takes its place
+    os.close(fd)
+    typing, terminal = pty.openpty()
+    os.write(typing, CODE.encode() + b"\n")   # someone typed it: still not read
+    try:
+        assert broker.take_setup_code(terminal) is None and is_dev_null(terminal)
+    finally:
+        os.close(typing)
+        os.close(terminal)
+    assert capfd.readouterr().err == ""
+
+
+def test_the_read_is_bounded(monkeypatch):
+    really_read, got = os.read, []
+    monkeypatch.setattr(broker.os, "read", lambda fd, count: got.append(len(chunk := really_read(fd, count))) or chunk)
+    fd = fed(b"x" * 1000)
+    try:
+        assert broker.take_setup_code(fd) is None
+    finally:
+        os.close(fd)
+    assert 0 < sum(got) <= broker.SETUP_CODE_BYTES
+
+
+SERVE_WITH = """
+import json, os, sys
+sys.path.insert(0, sys.argv[1])
+import broker
+seen = []
+broker.serve = lambda **given: seen.append(given) or 0
+broker.main(["serve"])
+print(json.dumps({"code": seen[0].get("setup_code"), "stdin_is_null": os.path.samestat(os.fstat(0), os.stat(os.devnull))}))
+"""
+
+
+@pytest.mark.parametrize("stdin, taken", [(CODE + "\n", CODE), ("", None), (subprocess.DEVNULL, None), ("nope\n", None), ("closed", None)])
+def test_serve_is_given_the_code_from_standard_input_which_is_dev_null_afterwards(stdin, taken):
+    how = {"input": stdin} if isinstance(stdin, str) and stdin != "closed" else {"stdin": stdin} if stdin != "closed" else {"preexec_fn": lambda: os.close(0)}
+    done = subprocess.run([sys.executable, "-c", SERVE_WITH, os.path.dirname(broker.__file__)], capture_output=True, text=True, timeout=60, check=False, **how)
+    assert done.returncode == 0, done.stderr
+    assert json.loads(done.stdout) == {"code": taken, "stdin_is_null": True}
+    assert ("malformed" in done.stderr) == (stdin == "nope\n") and "nope" not in done.stderr
+
+
+@contextlib.contextmanager
+def running(tmp_path, code):
+    """A real broker server on a socket in the temp folder, served from a thread."""
+    path = str(tmp_path / "b.sock")
+    server = broker.Server(path, code)
+    thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
+    thread.start()
+    try:
+        yield lambda verb, args=None, **more: broker.client_call(verb, args, socket_path=path, timeout=20, **more)
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=10)
+
+
+def test_neither_code_nor_proof_reaches_a_log_the_audit_file_or_any_file(monkeypatch, tmp_path, capfd):
+    monkeypatch.setattr(broker_auth, "PASSWD_FILE", tmp_path / "broker" / "passwd.json")
+    audit_file = tmp_path / "broker" / "audit.log"
+    really_audit, really_set = broker_auth.audit_event, broker_auth.set_password
+    monkeypatch.setattr(broker_auth, "audit_event", lambda principal, verb, outcome: really_audit(principal, verb, outcome, path=audit_file))
+
+    def fails_saying_what_it_was_given(proof, *, path):
+        raise RuntimeError(f"could not store {proof}")
+    replies = []
+    with running(tmp_path, CODE) as call:
+        replies.append(call("setup_needed"))
+        replies.append(call("first_password", {"code": CODE[::-1], "proof": GOOD}))
+        replies.append(call("first_password", {"code": CODE, "proof": "made of " + CODE}))
+        monkeypatch.setattr(broker_auth, "set_password", fails_saying_what_it_was_given)
+        replies.append(call("first_password", {"code": CODE, "proof": GOOD}))
+        monkeypatch.setattr(broker_auth, "set_password", really_set)
+        replies.append(call("first_password", {"code": CODE, "proof": GOOD}))
+        replies.append(call("login", {"proof": GOOD}))
+        replies.append(call("setup_needed"))
+    assert [kind(reply) for reply in replies] == ["ok", "auth", "validation", "failed", "ok", "ok", "ok"]
+    assert replies[0]["result"] == {"needed": True} and replies[-1]["result"] == {"needed": False}
+    said = capfd.readouterr()
+    assert "with the set-up code printed in this container's log" in said.err and "RuntimeError" in said.err
+    audited = audit_file.read_text()
+    assert [json.loads(line)["outcome"] for line in audited.splitlines()] == ["auth_fail", "refused", "ok", "ok"]   # the unknown failure did not reach its audit line
+    everything = said.out + said.err + json.dumps(replies[:-2]) + "".join(p.read_text(errors="replace") for p in tmp_path.rglob("*") if p.is_file())
+    for secret in (CODE, CODE[::-1], GOOD):
+        assert secret not in everything
+
+
+def test_the_code_reaches_no_child(monkeypatch, tmp_path):
+    monkeypatch.setattr(broker_auth, "PASSWD_FILE", tmp_path / "broker" / "passwd.json")
+    monkeypatch.setattr(broker_auth, "audit_event", lambda *given: None)
+    monkeypatch.setattr(broker, "OPLOGS", str(tmp_path / "oplogs"))
+    monkeypatch.setattr(broker, "MARKERS", str(tmp_path / "markers"))
+    monkeypatch.setattr(core, "LOCKS", str(tmp_path / "locks"))
+    broker_auth.set_password(GOOD, path=broker_auth.PASSWD_FILE)   # so that the code is still held
+    started = []
+
+    class Child:
+        def __init__(self, argv, **given):
+            started.append((argv, given, dict(os.environ)))
+
+        def poll(self):
+            return 0
+    monkeypatch.setattr(broker.subprocess, "Popen", Child)
+    with running(tmp_path, CODE) as call:
+        token = call("login", {"proof": GOOD})["result"]["token"]
+        assert kind(call("create", {"name": "kafka"}, token=token, op_id="op-1")) == "ok"
+    ((argv, given, environment),) = started
+    assert argv[2] == "__run-op" and json.loads(argv[3])["name"] == "kafka"
+    assert CODE not in json.dumps(argv) and "env" not in given and CODE not in json.dumps(environment)
+
+
+def test_the_start_says_how_a_first_password_can_be_set(monkeypatch, tmp_path, capfd):
+    monkeypatch.setattr(broker_auth, "PASSWD_FILE", tmp_path / "passwd.json")
+    for code in (CODE, None):
+        broker.Server(str(tmp_path / "b.sock"), code).server_close()
+    said = capfd.readouterr().err.splitlines()
+    assert said == [("clanker-learn broker: no password is set: set the first one on the page with the set-up code printed in this container's log,"
+                     " or with `docker exec -i clanker-learn cl passwd`"),
+                    "clanker-learn broker: no password is set, so nobody can log in: `docker exec -i clanker-learn cl passwd` sets one"]
