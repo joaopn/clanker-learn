@@ -1,0 +1,9 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "integration: starts real containers; needs a Docker daemon that can run a privileged one",
+]
+
+[tool.ruff]
+line-length = 160
+target-version = "py311"
