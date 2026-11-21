@@ -57,6 +57,12 @@ PRIVATE_RANGES = ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/
 LOCK_WAIT_S = "5"
 
 
+def is_inner_bridge(name):
+    """True when an interface name is one the rules take for a bridge of the inner daemon. A
+    trailing + is iptables' wildcard."""
+    return any(name.startswith(b[:-1]) if b.endswith("+") else name == b for b in INNER_BRIDGES)
+
+
 class GuardError(Exception):
     """The rules could not be applied."""
 

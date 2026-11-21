@@ -3,8 +3,10 @@
 
 Order of a start, and nothing is skipped:
 
-  1. the container must be its own: its own process namespace, with tini as pid 1; then the
-     mode the run command declared (CL_MODE=sysbox or privileged) is read and checked;
+  1. the container must be its own: its own process namespace, with tini as pid 1; a network
+     that holds no other Docker daemon's bridges (--network=host is told by them); then the
+     mode the run command declared (CL_MODE=sysbox or privileged) is read and checked, and
+     its control groups must be its own (not --cgroupns=host);
   2. the guard rules are applied and checked, before any daemon exists;
   3. the inner Docker daemon is started and waited for, and the rules are checked again
      (Docker's own jump to them must be in place);
@@ -15,9 +17,11 @@ Order of a start, and nothing is skipped:
 Only then is the container "ready". If any step fails the start is refused: every other
 process in the container is ended, the daemon and anything it ran included, so nothing runs
 unfenced, and the interface's port answers 503 with the reason until the container is
-stopped. A fault nobody foresaw is refused the same way, not left as a traceback. The one
-exception is the first check: where the process namespace is not the container's own, or
-tini is not pid 1, nothing was started and nothing is ended. While ready, the rules are checked again every few seconds and restored when they
+stopped. A fault nobody foresaw is refused the same way, not left as a traceback. Two
+refusals differ, both made before anything is started. Where the process namespace is not the
+container's own, or tini is not pid 1, nothing is ended. Where the network is not the
+container's own, nothing is ended and the port is not opened either: it would be opened on
+someone else's network, so the reason is only in the log and the state file. While ready, the rules are checked again every few seconds and restored when they
 are gone. If they cannot be restored, or the daemon has died, the container goes to
 "refused" in the same way: everything else in it is ended at once.
 
@@ -38,6 +42,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import guard
 
 STATE_FILE = "/run/cl/state.json"
+NET_DIR = "/sys/class/net"
 DAEMON_LOG = "/var/log/dockerd.log"
 DAEMON_LOG_MAX = 5 * 1024 * 1024
 DAEMON_JSON = "/etc/docker/daemon.json"
@@ -58,6 +63,18 @@ HOW_TO_RUN = (
     "(docker run --privileged -e CL_MODE=privileged ...)."
 )
 SEE_LOG = "The container's log (docker logs) says why."
+CGROUP_STARTS = ("/", "/init.scope")
+NOT_ITS_OWN_NETWORK = (
+    "This container's network already holds a Docker daemon's networks ({found}), as it does when it is started with "
+    "--network=host, or shares the network of a container in which a Docker daemon runs or ran. Its guard rules and its own "
+    "daemon would act on that network, so nothing was started and its port was not opened. Start it without --network=host, "
+    "on a network of its own. "
+) + HOW_TO_RUN
+NOT_ITS_OWN_CGROUPS = (
+    "This container does not have its own control groups, as with --cgroupns=host (which is also Docker's default on a "
+    "machine with cgroup v1). Its daemon would manage the machine's control groups, so nothing was started. Start it with "
+    "--cgroupns=private. "
+) + HOW_TO_RUN
 
 
 class Refused(Exception):
@@ -178,6 +195,34 @@ def own_process_namespace(my_parent, pid1_command):
     tini is pid 1 and this process is its child. With --pid=host, or another entrypoint, it
     is not, and then "every other process" would be someone else's."""
     return my_parent == 1 and pid1_command.strip() == "tini"
+
+
+def foreign_bridges(interfaces):
+    """The interfaces the guard rules would take for the inner daemon's bridges. At the start
+    of a container with a network of its own there are none: Docker gives it a new network
+    namespace at every start. With --network=host the machine's own docker0 and br-* are
+    there, and the rules and the daemon would act on them."""
+    return sorted(name for name in interfaces if guard.is_inner_bridge(name))
+
+
+def network_refusal(net_dir):
+    """Why the network is not this container's own, or "" when it is. A listing that cannot be
+    read is a refusal too: nothing may be opened on a network that cannot be told."""
+    try:
+        found = foreign_bridges(os.listdir(net_dir))
+    except OSError as exc:
+        return f"This container's network interfaces could not be listed ({exc}), so nothing was started and its port was not opened. " + HOW_TO_RUN
+    return NOT_ITS_OWN_NETWORK.format(found=", ".join(found)) if found else ""
+
+
+def own_cgroup_namespace(cgroup_text):
+    """True when this process sits where a container's processes start in a cgroup namespace
+    of its own (/proc/self/cgroup: one line on cgroup v2, one per hierarchy on v1): at the
+    root, "/", or in "/init.scope", where sysbox puts them on cgroup v2 so that the root can
+    hand controllers down. With --cgroupns=host the path is the container's place in the
+    machine's tree, which ends in a name Docker made from the container's id and so is
+    neither."""
+    return all(line.split(":", 2)[2] in CGROUP_STARTS for line in cgroup_text.splitlines() if line.count(":") >= 2)
 
 
 def declared_mode(env, uid_map_text, status_text):
@@ -386,9 +431,9 @@ def end_everything_else():
 def refuse(reason, mine=True):
     """Go to "refused": nothing else may keep running. The port says so before the ending
     starts ("refusing") and "refused" is written only once nothing else is left. If something
-    cannot be ended, the container itself exits, which ends it. `mine` is False only when the
-    process namespace is not this container's own: then nothing was started and nothing is
-    ended."""
+    cannot be ended, the container itself exits, which ends it. `mine` is False when the
+    process namespace or the network is not this container's own: then nothing was started
+    and nothing is ended."""
     if mine:
         set_state("refusing", reason)
         if not end_everything_else():
@@ -407,6 +452,9 @@ def bring_up(stop):
         status_text = fh.read()
     mode = declared_mode(os.environ, uid_map_text, status_text)
     set_state("starting", mode=mode)
+    with open("/proc/self/cgroup") as fh:
+        if not own_cgroup_namespace(fh.read()):
+            raise Refused(NOT_ITS_OWN_CGROUPS)
     dns = guard_up()
     daemon, delegated = start_daemon(mode, stop)
     if stop.is_set():
@@ -447,7 +495,9 @@ def unforeseen(exc):
 def main():
     stop = Stop()
     set_state("starting")
-    serve_status()
+    not_my_network = network_refusal(NET_DIR)
+    if not not_my_network:
+        serve_status()
     try:
         with open("/proc/1/comm") as fh:
             mine = own_process_namespace(os.getppid(), fh.read())
@@ -457,6 +507,8 @@ def main():
     ready = False
     if not mine:
         refuse("This container does not have its own process namespace and init. Start it without --pid=host, without --init and without another entrypoint. " + HOW_TO_RUN, mine=False)
+    elif not_my_network:
+        refuse(not_my_network, mine=False)
     else:
         try:
             daemon, dns = bring_up(stop)
