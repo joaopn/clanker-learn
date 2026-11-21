@@ -9,6 +9,15 @@
      one adds without being recreated.
   3. sshd is started: the tutor's way in. Its host key is the one in the provisioning folder.
   4. The files server is started as the sandbox user.
+  5. The setup recipe, /workspace/.learn/setup.sh, is run as the sandbox user if this
+     container has not run it: once per container, so never after a plain stop and start
+     and once after a recreate, which is how what the tutor installed comes back. Its state
+     (none, running, done, failed) is in /var/lib/cl/setup, a file of the container itself,
+     and its output in /var/log/cl/setup.log. Cut short by a stop, it runs again from the top
+     at the next start, so a recipe must be safe to run twice.
+  6. What /workspace/.learn/services lists is started as the sandbox user, one line each,
+     `name: command`, with its output in /workspace/.learn/logs/<name>.log. They are started,
+     not watched: one that ends stays down until the next start.
 
 Then it waits, and starts sshd or the files server again if one of them ends. On a stop it
 asks every other process to end, gives them a few seconds, and exits; what is left is ended
@@ -16,6 +25,7 @@ with the container.
 """
 import os
 import pwd
+import re
 import shutil
 import signal
 import subprocess
@@ -28,6 +38,14 @@ SSHD_CONFIG = "/etc/ssh/sshd_config.d/cl.conf"
 FILES_SERVER = "/opt/cl/files_server.py"
 STOP_GRACE_S = 5
 RESTART_PAUSE_S = 2
+SETUP_RECIPE = "/workspace/.learn/setup.sh"
+SERVICES = "/workspace/.learn/services"
+SERVICE_LOGS = "/workspace/.learn/logs"
+SETUP_STATE = "/var/lib/cl/setup"
+SETUP_LOG = "/var/log/cl/setup.log"
+SERVICE_NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,31}")
+MAX_SERVICES = 64
+SERVICES_BYTES = 64 * 1024
 
 
 def log(message):
@@ -99,6 +117,126 @@ def keep_running(services, running, tried, pause_s=RESTART_PAUSE_S, now=time.mon
             log(f"{name} could not be started: {exc}")
 
 
+def user_env(user):
+    return {"HOME": user.pw_dir, "USER": user.pw_name, "LOGNAME": user.pw_name, "SHELL": "/bin/bash",
+            "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C.UTF-8"}
+
+
+def as_user(user, command, **more):
+    """A process of the sandbox user's, in a session of its own, in the workspace."""
+    return subprocess.Popen(command, user=user.pw_uid, group=user.pw_gid, extra_groups=os.getgrouplist(user.pw_name, user.pw_gid),
+                            cwd="/workspace", env=user_env(user), stdin=subprocess.DEVNULL, start_new_session=True, **more)
+
+
+def setup_state(path=None):
+    try:
+        with open(path or SETUP_STATE) as fh:
+            return fh.read().strip()
+    except OSError:
+        return ""
+
+
+def write_setup_state(text, path=None):
+    path = path or SETUP_STATE
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as fh:
+        fh.write(text + "\n")
+    os.replace(tmp, path)
+
+
+def setup_is_owed(state):
+    """The recipe has not run in this container, or was cut short while running."""
+    return state in ("", "running")
+
+
+def start_setup(user, recipe=SETUP_RECIPE, log_path=SETUP_LOG):
+    """Run the recipe if there is one. Returns the process, or None where there is nothing to
+    run; the state is written either way."""
+    if not os.path.isfile(recipe):
+        write_setup_state("none")
+        return None
+    write_setup_state("running")
+    os.makedirs(os.path.dirname(log_path), exist_ok=True)
+    with open(log_path, "ab") as out:
+        log("running the setup recipe")
+        return as_user(user, ["bash", "-l", recipe], stdout=out, stderr=subprocess.STDOUT)  # a login shell, as the services get
+
+
+def setup_ended(setup):
+    """Record how the recipe went, once it has ended. Returns the process while it still runs,
+    else None. A state that cannot be written (a full disk, which a recipe that installs
+    software is the likeliest to cause) is a line in the log, never the end of this init."""
+    if setup is None or setup.poll() is None:
+        return setup
+    try:
+        write_setup_state("done" if setup.returncode == 0 else f"failed (exit {setup.returncode})")
+        log(f"the setup recipe ended with {setup.returncode}")
+    except OSError as exc:
+        log(f"the setup recipe ended with {setup.returncode}, which could not be recorded: {exc}")
+    return None
+
+
+def parse_services(text):
+    """The services a file lists: (name, command) for each line `name: command`, at most
+    MAX_SERVICES of them. Blank lines and lines that start with # are skipped; a line that is
+    not of that shape, repeats a name, holds a NUL (no command can), or is one too many is
+    returned in the second list."""
+    services, refused, seen = [], [], set()
+    for line in text.split("\n"):  # a newline and nothing else ends a line: splitlines() also cuts at a form feed, U+2028...
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        name, colon, command = line.partition(":")
+        name, command = name.strip(), command.strip()
+        if colon and command and "\0" not in command and SERVICE_NAME.fullmatch(name) and name not in seen and len(services) < MAX_SERVICES:
+            seen.add(name)
+            services.append((name, command))
+        else:
+            refused.append(line)
+    return services, refused
+
+
+def whole_lines(data, limit):
+    """The first `limit` bytes of the services file, of which one byte more than that was
+    read, without a last line that the limit cut: a command cut in the middle is another
+    command."""
+    if len(data) <= limit:
+        return data
+    log(f"the services file is longer than {limit} bytes; what is past that is not read")
+    return data[:data.rfind(b"\n") + 1]  # a line that ends with the one byte read past the limit is whole, and kept
+
+
+def start_listed_services(user, path=SERVICES):
+    """Start what the services file lists. Returns the processes, for the init to collect
+    when they end."""
+    # Read as the sandbox user, with a time limit and a size limit: this init, which is root,
+    # never opens a path the sandbox user can turn into a link or a pipe.
+    try:
+        read = subprocess.run(["head", "-c", str(SERVICES_BYTES + 1), path], user=user.pw_uid, group=user.pw_gid, extra_groups=[],
+                              stdin=subprocess.DEVNULL, capture_output=True, timeout=5, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    if read.returncode != 0:
+        return []
+    services, refused = parse_services(whole_lines(read.stdout, SERVICES_BYTES).decode(errors="replace"))
+    for line in refused[:20]:
+        log(f"not a service line, skipped: {line[:80]}")
+    started = []
+    for name, command in services:
+        # The log is opened by the service's own shell, as the sandbox user: this init, which
+        # is root, never opens a path the sandbox user chose. A log that cannot be opened is
+        # no reason not to run the service.
+        log_file = f"{SERVICE_LOGS}/{name}.log"
+        script = f'mkdir -p {SERVICE_LOGS} 2>/dev/null; ( : >> {log_file} ) 2>/dev/null && exec >> {log_file} 2>&1; exec bash -lc "$1"'
+        try:
+            started.append(as_user(user, ["bash", "-c", script, "service", command], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+            log(f"started the service {name}")
+        except (OSError, ValueError) as exc:
+            log(f"the service {name} could not be started: {exc}")
+    return started
+
+
 def end_the_others(grace_s=STOP_GRACE_S):
     """Ask every other process of the container to end, and wait for them a little."""
     try:
@@ -131,11 +269,25 @@ def main():
         log(f"the provisioning could not be installed: {exc}")
     services = {"sshd": start_sshd, "the files server": lambda: start_files_server(user)}
     running, tried = {}, {}
+    # The recipe first, then what the services file lists, which may need what it installed.
+    # Neither holds up sshd, the files server or a stop.
+    setup, listed = None, None
+    try:
+        if setup_is_owed(setup_state()):
+            setup = start_setup(user)
+    except OSError as exc:
+        log(f"the setup recipe could not be run: {exc}")
     log("up")
     while not stopping:
         keep_running(services, running, tried)
+        setup = setup_ended(setup)
+        if setup is None and listed is None:
+            listed = start_listed_services(user)
+        if listed:
+            listed = [process for process in listed if process.poll() is None]  # collect the ones that ended
         time.sleep(0.5)  # a signal that lands between the check and a pause() would be lost
     log("stopping")
+    setup_ended(setup)  # one that ended just before the stop is not run again for nothing
     end_the_others()
 
 
