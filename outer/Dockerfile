@@ -1,6 +1,7 @@
 # clanker-learn's one container: a Docker daemon of its own (the "inner" daemon), the guard
 # rules that fence what that daemon runs, and, from later steps, the broker and the inner
 # containers. It runs on sysbox, or privileged; see init.py.
+# Built from the repository's root: docker build -f outer/Dockerfile .
 # Debian 13: its crun (1.21) runs the containers of this Docker version. Debian 12's (1.8) is
 # refused by it ("unknown version specified"), and crun is the runtime of the sysbox mode.
 FROM debian:trixie-slim
@@ -14,7 +15,8 @@ ARG CONTAINERD_VERSION=2.4.2-4
 ADD --chmod=0644 --checksum=sha256:1500c1f56fa9e26b9b8f42452a553675796ade0807cdce11975eb98170b3a570 \
     https://download.docker.com/linux/debian/gpg /etc/apt/keyrings/docker.asc
 
-# Recommended packages are left out; procps is named because `docker top` needs it.
+# Recommended packages are left out; procps is named because `docker top` needs it, and the
+# OpenSSH client because the core makes each project's keys with ssh-keygen.
 RUN set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends ca-certificates; \
@@ -22,7 +24,7 @@ RUN set -eux; \
         > /etc/apt/sources.list.d/docker.list; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
-        iptables iproute2 python3 tini crun busybox-static procps \
+        iptables iproute2 python3 tini crun busybox-static procps openssh-client \
         "docker-ce=5:${DOCKER_VERSION}-1~debian.13~trixie" \
         "docker-ce-cli=5:${DOCKER_VERSION}-1~debian.13~trixie" \
         "containerd.io=${CONTAINERD_VERSION}~debian.13~trixie"; \
@@ -37,7 +39,14 @@ RUN if command -v zfs; then echo "a ZFS tool is on the image" >&2; exit 1; fi
 # network.
 RUN mkdir -p /opt/cl/selftest/bin && cp /bin/busybox /opt/cl/selftest/bin/busybox
 
-COPY guard.py init.py /opt/cl/
+COPY outer/guard.py outer/init.py outer/core.py /opt/cl/
+
+# The definition of the sandbox image. The core builds it in the inner daemon the first time
+# a project needs it, and tags it by a hash of these files.
+COPY sandbox/ /opt/cl/sandbox/
+
+# `cl`: the core as a command, for someone with a shell in this container.
+RUN printf '#!/bin/sh\nexec python3 /opt/cl/core.py "$@"\n' > /usr/local/bin/cl && chmod 0755 /usr/local/bin/cl
 
 VOLUME ["/var/lib/docker", "/data"]
 EXPOSE 8080

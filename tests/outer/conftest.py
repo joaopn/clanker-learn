@@ -4,8 +4,8 @@ The integration tests need a Docker daemon that can run a privileged container (
 container's is one). They publish no port on the machine: everything is asked through
 `docker exec`, or from a peer container on a test network. Every container, network and
 named volume they create starts with `cl-test-` and is removed afterwards, each container
-with the unnamed volumes the image gives it; the image they build, `cl-outer:test`, is kept
-as a build cache.
+with the unnamed volumes the image gives it; the images they build, `cl-outer:test` and the
+sandbox image `cl-sandbox:<hash>`, are kept as a build cache.
 """
 import json
 import pathlib
@@ -18,6 +18,9 @@ import pytest
 
 REPO = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / "outer"))
+sys.path.insert(0, str(REPO / "sandbox"))
+
+import core  # found through the path just added
 
 IMAGE = "cl-outer:test"
 NET = "cl-test-net"
@@ -85,8 +88,17 @@ def probe_from(container, kind, host, port):
 
 @pytest.fixture(scope="session")
 def image():
-    run("docker", "build", "-q", "-t", IMAGE, str(REPO / "outer"), timeout=1200)
+    run("docker", "build", "-q", "-t", IMAGE, "-f", str(REPO / "outer" / "Dockerfile"), str(REPO), timeout=1200)
     return IMAGE
+
+
+@pytest.fixture(scope="session")
+def sandbox_image(image):
+    """The sandbox image, built once on the test daemon under the tag the core computes, to be
+    loaded into an outer container so that the core finds it and builds nothing."""
+    tag = core.image_tag(str(REPO / "sandbox"))
+    run("docker", "build", "-q", "-t", tag, str(REPO / "sandbox"), timeout=2400)
+    return tag
 
 
 @pytest.fixture(scope="session")
@@ -118,13 +130,15 @@ class Outer:
         tag = uuid.uuid4().hex[:8]
         self.name = f"cl-test-outer-{tag}"
         self.volume = f"cl-test-docker-{tag}"
+        self.data = f"cl-test-data-{tag}"
         self.sandbox_gateway = None
+        self.sandbox_image = None
 
     def start(self, env=None, privileged=True, extra=(), command=()):
         """`docker run` the outer container. env=None declares the privileged mode."""
         env = {"CL_MODE": "privileged", "CL_WATCH_S": "1"} if env is None else env
         args = ["docker", "run", "-d", "--name", self.name, "--network", NET, "--stop-timeout", "60",
-                "-v", f"{self.volume}:/var/lib/docker"]
+                "-v", f"{self.volume}:/var/lib/docker", "-v", f"{self.data}:/data"]
         if privileged:
             args.append("--privileged")
         for key, value in env.items():
@@ -193,13 +207,45 @@ class Outer:
         assert done.returncode == 0 and out in ANSWERS, f"the probe failed: {done.stdout} {done.stderr}"
         return out
 
+    def load_image(self, tag):
+        """Give the inner daemon an image of the test daemon."""
+        with subprocess.Popen(["docker", "save", tag], stdout=subprocess.PIPE) as save:
+            load = subprocess.run(["docker", "exec", "-i", self.name, "docker", "load"], stdin=save.stdout,
+                                  capture_output=True, text=True, timeout=900, check=False)
+        assert load.returncode == 0, load.stderr
+        return self
+
+    def wait_sandboxes(self, after_boot=None, timeout=180):
+        """The state once the init is done starting the projects that should be running."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            state = self.state()
+            done = state["state"] == "refused" or (state["state"] == "ready" and state.get("sandboxes") in ("started", "some failed"))
+            if done and state.get("boot") != after_boot:
+                return state
+            time.sleep(0.5)
+        raise AssertionError(f"{self.name} did not finish starting its sandboxes in {timeout}s; state {self.state()}")
+
+    def cl(self, *args, check=True, timeout=300):
+        """The core's command in the outer container: the JSON it prints, or, when it fails
+        and `check` is off, {"error": ...}."""
+        done = run("docker", "exec", self.name, "cl", *args, check=False, timeout=timeout)
+        if done.returncode != 0:
+            assert not check, f"cl {' '.join(args)} failed: {done.stderr[-800:]}"
+            return json.loads(done.stderr.strip().splitlines()[-1])
+        return json.loads(done.stdout)
+
+    def sandbox(self, project, *command, user="root", check=True):
+        """A command in a project's sandbox, straight through the inner daemon."""
+        return self.inner("exec", "-u", user, f"cl-sb-{project}", *command, check=check)
+
     def address(self):
         return run("docker", "inspect", "-f", "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}", self.name).stdout.strip()
 
     def remove(self, volume=True):
         run("docker", "rm", "-f", "-v", self.name, check=False)
         if volume:
-            run("docker", "volume", "rm", self.volume, check=False)
+            run("docker", "volume", "rm", self.volume, self.data, check=False)
 
 
 @pytest.fixture
