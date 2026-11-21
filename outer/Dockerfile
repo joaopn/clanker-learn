@@ -39,7 +39,7 @@ RUN if command -v zfs; then echo "a ZFS tool is on the image" >&2; exit 1; fi
 # network.
 RUN mkdir -p /opt/cl/selftest/bin && cp /bin/busybox /opt/cl/selftest/bin/busybox
 
-COPY outer/guard.py outer/init.py outer/core.py /opt/cl/
+COPY outer/guard.py outer/init.py outer/core.py outer/broker.py outer/broker_auth.py /opt/cl/
 
 # The definition of the sandbox image. The core builds it in the inner daemon the first time
 # a project needs it, and tags it by a hash of these files.
