@@ -10,17 +10,22 @@
      version gains what a later one adds without being recreated.
   3. sshd is started: the tutor's way in, and the Shell's. Its host key is the one in the provisioning folder.
   4. The files server is started as the sandbox user.
-  5. The setup recipe, /workspace/.learn/setup.sh, is run as the sandbox user if this
+  5. The Editor's server, code-server, is started as the sandbox user, with a login's
+     environment, on port 8443 of every address, as the files server listens, so that the web
+     server, on the project's network, reaches it. It asks for no password of its own (the
+     gate is the web server's project session), sends no telemetry, looks for no update, opens
+     /workspace, and keeps its user data in the sandbox user's home, which persists.
+  6. The setup recipe, /workspace/.learn/setup.sh, is run as the sandbox user if this
      container has not run it: once per container, so never after a plain stop and start
      and once after a recreate, which is how what the tutor installed comes back. Its state
      (none, running, done, failed) is in /var/lib/cl/setup, a file of the container itself,
      and its output in /var/log/cl/setup.log. Cut short by a stop, it runs again from the top
      at the next start, so a recipe must be safe to run twice.
-  6. What /workspace/.learn/services lists is started as the sandbox user, one line each,
+  7. What /workspace/.learn/services lists is started as the sandbox user, one line each,
      `name: command`, with its output in /workspace/.learn/logs/<name>.log. They are started,
      not watched: one that ends stays down until the next start.
 
-Then it waits, and starts sshd or the files server again if one of them ends. On a stop it
+Then it waits, and starts sshd, the files server or code-server again if one of them ends. On a stop it
 asks every other process to end, gives them a few seconds, and exits; what is left is ended
 with the container.
 """
@@ -37,6 +42,7 @@ USER = "learner"
 PROVISION = "/etc/cl-provision"
 SSHD_CONFIG = "/etc/ssh/sshd_config.d/cl.conf"
 FILES_SERVER = "/opt/cl/files_server.py"
+EDITOR_PORT = 8443
 STOP_GRACE_S = 5
 RESTART_PAUSE_S = 2
 SETUP_RECIPE = "/workspace/.learn/setup.sh"
@@ -116,6 +122,12 @@ def start_files_server(user):
     env = {"HOME": user.pw_dir, "USER": user.pw_name, "LOGNAME": user.pw_name, "PATH": "/usr/local/bin:/usr/bin:/bin"}
     return subprocess.Popen(["python3", FILES_SERVER], user=user.pw_uid, group=user.pw_gid, extra_groups=[],
                             cwd="/", env=env, stdin=subprocess.DEVNULL)
+
+
+def start_editor(user):
+    return as_user(user, ["code-server", "--bind-addr", f"0.0.0.0:{EDITOR_PORT}", "--auth", "none", "--disable-telemetry",
+                          "--disable-update-check", "--user-data-dir", os.path.join(user.pw_dir, ".local/share/code-server"),
+                          "/workspace"])
 
 
 def keep_running(services, running, tried, pause_s=RESTART_PAUSE_S, now=time.monotonic):
@@ -291,10 +303,10 @@ def main():
         set_password()   # before sshd starts
     except (OSError, subprocess.TimeoutExpired) as exc:
         log(f"the Shell password could not be set: {exc}")
-    services = {"sshd": start_sshd, "the files server": lambda: start_files_server(user)}
+    services = {"sshd": start_sshd, "the files server": lambda: start_files_server(user), "code-server": lambda: start_editor(user)}
     running, tried = {}, {}
     # The recipe first, then what the services file lists, which may need what it installed.
-    # Neither holds up sshd, the files server or a stop.
+    # Neither holds up sshd, the files server, code-server or a stop.
     setup, listed = None, None
     try:
         if setup_is_owed(setup_state()):

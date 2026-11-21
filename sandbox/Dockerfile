@@ -2,9 +2,9 @@
 # clanker-learn's container the first time a project needs it (outer/core.py), on a network of
 # the inner daemon that the guard rules fence like a sandbox's.
 #
-# The base is pinned by digest; the packages come from that Debian release. The agents are not
-# here: they are distributed into running sandboxes (a later part). Nor is the editor's server
-# yet.
+# The base is pinned by digest; the packages come from that Debian release, the editor's
+# server (code-server) from its release on GitHub, pinned by version and checksum. The agents
+# are not here: they are distributed into running sandboxes (a later part).
 FROM debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2
 
 # What a learning environment starts from: a shell user's tools, Python and Node with their
@@ -20,6 +20,24 @@ RUN set -eux; \
         git curl less nano procps iproute2 iputils-ping tmux; \
     rm -rf /var/lib/apt/lists/*; \
     rm -f /etc/ssh/ssh_host_*
+
+# The Editor: code-server, the browser VS Code, which the init starts in every sandbox. Its
+# release's Debian package for this image's architecture (it depends on nothing), checked
+# against the SHA-256 pinned here before it is installed: a download that does not match ends
+# the build.
+RUN set -eux; \
+    version=4.126.0; \
+    arch="$(dpkg --print-architecture)"; \
+    case "$arch" in \
+        amd64) sum=2dd4c57443931123282e829ed4b514c50dcabb097704be22e600d1a591664da8 ;; \
+        arm64) sum=9bee520af84a2fbb98a3337110a782b343d3e822c105b4e6d723d8915f7725fb ;; \
+        *) echo "no code-server package is pinned for $arch" >&2; exit 1 ;; \
+    esac; \
+    deb="/tmp/code-server_${version}_${arch}.deb"; \
+    curl -fsSL -o "$deb" "https://github.com/coder/code-server/releases/download/v${version}/code-server_${version}_${arch}.deb"; \
+    echo "$sum  $deb" | sha256sum -c -; \
+    dpkg -i "$deb"; \
+    rm -f "$deb"
 
 # The sandbox user. It can become root: the tutor installs software, and the learner should be
 # able to do what it did. Root here is root in a plain container.
