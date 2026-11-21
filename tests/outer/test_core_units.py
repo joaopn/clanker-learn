@@ -138,6 +138,33 @@ def test_a_record_that_is_not_this_projects_is_unreadable_not_a_crash(monkeypatc
         core.read_record("kafka")
 
 
+def test_a_lock_is_taken_without_waiting_and_a_lock_in_hand_is_not_taken_again(monkeypatch, tmp_path):
+    """What the broker relies on: `try_lock` answers at once, and a process that was handed a
+    project's lock does the core's work without asking for it a second time (which would wait
+    for itself for ever)."""
+    monkeypatch.setattr(core, "LOCKS", str(tmp_path / "locks"))
+    monkeypatch.setattr(core, "HELD", set())
+    held = core.try_lock("kafka")
+    assert held is not None
+    assert core.try_lock("kafka") is None                 # taken: refused at once, not waited for
+    other = core.try_lock("other")
+    assert other is not None                              # another project is never in the way
+    other.close()
+    copy = os.dup(held.fileno())                          # as a child gets it
+    held.close()
+    assert core.try_lock("kafka") is None                 # the copy still holds it
+    core.HELD.add("kafka")
+    with core.locked("kafka"):                            # in hand: no second lock is asked for
+        assert core.try_lock("kafka") is None
+    os.close(copy)
+    again = core.try_lock("kafka")
+    assert again is not None                              # the last copy closed: free
+    again.close()
+    for bad in ("../x", "", None):
+        with pytest.raises(core.CoreError):
+            core.try_lock(bad)
+
+
 def test_start_wanted_starts_what_should_run_and_goes_on_past_a_failure(monkeypatch, tmp_path):
     monkeypatch.setattr(core, "DATA", str(tmp_path))
     for name, wanted in (("a-runs", "running"), ("b-broken", "running"), ("c-stopped", "stopped"), ("d-runs", "running"),
