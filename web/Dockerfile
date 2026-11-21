@@ -12,6 +12,8 @@ RUN set -eux; \
     rm -rf /var/lib/apt/lists/*
 
 COPY server.py services.py /opt/cl/
+# The page and its files (xterm.js among them, committed: nothing is fetched to build this).
+COPY static/ /opt/cl/static/
 
 WORKDIR /opt/cl
 STOPSIGNAL SIGTERM

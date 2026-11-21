@@ -12,8 +12,7 @@ terminal (a WebSocket relayed to the sandbox's sshd, where it runs tmux), a proj
 cookie (which its web-app tabs are opened with), a project's tabs (the files server, the web
 apps named by hand or detected, the raw TCP ports named by hand), opening a web app on an
 origin port of its own, and the ports named by hand. Every route on the page's port is refused
-without a login but the placeholder page, the login and the set-up. The page itself comes with
-a later part.
+without a login but the page and its files (static/), the login and the set-up.
 
 Besides the page's port it listens on every port of two ranges, on the same address: on an
 origin port (CL_ORIGIN_PORTS) the origin proxy serves one web app of one sandbox, HTTP and
@@ -852,6 +851,7 @@ async def session_handler(request: web.Request) -> web.Response:
 # ===========================================================================
 
 FILES_SERVER_PORT = 7070    # the sandbox's files server: always there in a running sandbox
+EDITOR_PORT = 8443          # the sandbox's editor (code-server): started with the sandbox, like the files server
 # project -> (monotonic time the broker was asked, the sandbox's address or None).
 SANDBOX_ADDRESSES: dict[str, tuple[float, str | None]] = {}
 ADDRESS_TTL_S = 5.0
@@ -1036,7 +1036,7 @@ def _detected_rows(reply: dict) -> list[dict] | None:
 
 def _assemble_services(project: str, entries: list[dict], detected: list[dict] | None) -> dict:
     """The project's tabs, in RS's shape (id -> row, in tab order). Of RS's rows only the
-    kinds clanker-learn has: the files server, web apps named by hand, detected apps, raw TCP
+    kinds clanker-learn has: the editor, the files server, web apps named by hand, detected apps, raw TCP
     ports. A web row carries its origin port once the app was opened (never allocated here)."""
     def web_row(port: int, label: str, **extra) -> dict:
         row = {"label": label, "kind": "http", "always_on": False, "renderer": "iframe",
@@ -1048,13 +1048,14 @@ def _assemble_services(project: str, entries: list[dict], detected: list[dict] |
 
     out: dict[str, dict] = {}
     if detected is not None:
+        out["editor"] = web_row(EDITOR_PORT, "Editor", always_on=True)
         out["files"] = web_row(FILES_SERVER_PORT, "Files", always_on=True)
     named = {e["port"] for e in entries}
     for e in entries:
         if not e.get("passthrough"):
             out[f"port-{e['port']}"] = web_row(e["port"], e["label"])
     for r in detected or []:
-        if r["port"] not in named and r["port"] != FILES_SERVER_PORT:
+        if r["port"] not in named and r["port"] not in (EDITOR_PORT, FILES_SERVER_PORT):
             label = r["label"] if isinstance(r.get("label"), str) else str(r["port"])
             out[f"port-{r['port']}"] = web_row(r["port"], label, detected=True)
     # Raw TCP: a launcher keyed on its host port, no origin port.
@@ -1087,7 +1088,7 @@ async def project_services_handler(request: web.Request) -> web.Response:
 async def project_origin_handler(request: web.Request) -> web.Response:
     """POST /broker/project/{name}/origin {port} — open a web app (gated, origin-checked):
     give (project, port) an origin port, the one it has or the lowest free one, and answer
-    {ok, origin_port}. The port must be the files server's, a web port named by hand or one
+    {ok, origin_port}. The port must be the editor's, the files server's, a web port named by hand or one
     listening now, as the broker says."""
     if not origin_ok(request):
         return web.Response(status=403, text="origin rejected")
@@ -1105,14 +1106,14 @@ async def project_origin_handler(request: web.Request) -> web.Response:
     _claims_take(project, entries)
     if not _is_port(port):
         return _refusal("validation", "port must be a port number from 1 to 65535")
-    allowed = port == FILES_SERVER_PORT or port in {e["port"] for e in entries if not e.get("passthrough")}
+    allowed = port in (EDITOR_PORT, FILES_SERVER_PORT) or port in {e["port"] for e in entries if not e.get("passthrough")}
     if not allowed:
         status, detected = await _relay(request, "port_detect", {"name": project})
         if status != 200:
             return web.json_response(detected, status=status)
         allowed = port in {r["port"] for r in _detected_rows(detected) or []}
     if not allowed:
-        return _refusal("validation", f"port {port} of {project} is not the files server, not named by hand and not listening")
+        return _refusal("validation", f"port {port} of {project} is not the editor, not the files server, not named by hand and not listening")
     origin = _origin_port_for(project, port)
     if origin is None:
         low, high = ORIGIN_RANGE
@@ -1418,24 +1419,94 @@ async def passthrough_conn_handler(reader: asyncio.StreamReader,
                          _pt_pump(up_reader, writer))
 
 
-PLACEHOLDER = """<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><title>clanker-learn</title>
-<style>body{font:16px/1.5 system-ui,sans-serif;max-width:40rem;margin:4rem auto;padding:0 1rem}</style>
-</head><body>
-<h1>clanker-learn</h1>
-<p>The web server is running. The page that belongs here is not built yet.</p>
-<p>Until it is, projects are driven from the machine clanker-learn runs on:
-<code>docker exec clanker-learn cl list</code>.</p>
-</body></html>
-"""
+# ---- the page and its files -----------------------------------------------------
+
+STATIC_DIR = Path(__file__).parent / "static"
+# Every answer of the page's files is checked again with the server (an ETag and the time it
+# changed): a changed file shows at the next reload, an unchanged one costs a 304.
+STATIC_HEADERS = {"X-Content-Type-Options": "nosniff", "Cache-Control": "no-cache"}
+# A host name the browser used: DNS labels of letters, digits and dashes, or an IPv4 address
+# (checked below), and an optional port. A bracketed IPv6 address is matched apart.
+_HOST_NAME = re.compile(r"(?=.{1,253}\Z)[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+                        r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*")
+_HOST_PORT = re.compile(r"[0-9]{1,5}")
+# The page's content-security header, but for the two directives that name the host. Styles
+# may be inline because xterm's renderer writes <style> elements into the terminal (its
+# colours, its font, the cell grid); with style-src 'self' alone the browser refuses them.
+PAGE_SOURCES = ("default-src 'none'", "script-src 'self'", "style-src 'self' 'unsafe-inline'", "img-src 'self'")
+PAGE_REFUSES = ("object-src 'none'", "base-uri 'none'", "form-action 'none'", "frame-ancestors 'none'")
 
 
-async def index_handler(request: web.Request) -> web.Response:
-    """GET / — a placeholder until the page exists. It loads nothing and runs nothing."""
-    return web.Response(
-        text=PLACEHOLDER, content_type="text/html",
-        headers={"Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'",
-                 "X-Content-Type-Options": "nosniff", "Cache-Control": "no-store"})
+def browser_host(header: str | None) -> tuple[str, str] | None:
+    """The Host header split into (host, port), the host as it goes into a URL (an IPv6
+    address bracketed), the port "" when none was given; None when the header is not a host
+    name, an IPv4 address or a bracketed IPv6 address, with an optional port. (RS's
+    `_request_host` takes the header as it comes; here it goes into the page's
+    content-security header, so nothing but those three forms passes.)"""
+    if not header or not header.isascii():
+        return None
+    if header.startswith("["):
+        inside, bracket, port = header[1:].partition("]")
+        if not bracket or "%" in inside or (port and (port == ":" or not port.startswith(":"))):
+            return None
+        try:
+            ipaddress.IPv6Address(inside)
+        except ValueError:
+            return None
+        host, port = f"[{inside}]", port[1:]
+    else:
+        host, colon, port = header.partition(":")
+        if (colon and not port) or not _HOST_NAME.fullmatch(host):
+            return None
+        if host.replace(".", "").isdigit():
+            try:
+                ipaddress.IPv4Address(host)
+            except ValueError:
+                return None
+    if port and not (_HOST_PORT.fullmatch(port) and 1 <= int(port) <= 65535):
+        return None
+    return host, port
+
+
+def content_security_policy(host_header: str | None) -> str:
+    """The page's content-security header for the host the browser used: its own scripts,
+    styles and images only, nothing inline but styles (RS allows them too), fetches and the
+    terminal's WebSocket to itself, frames from any port of that host (the web-app tabs) and
+    from nowhere when the Host header is not a plain host. No form is ever sent by the browser
+    itself (form-action 'none'): the page's forms are read by its script, so a password never
+    lands in an address even if the script did not load."""
+    found = browser_host(host_header)
+    if found is None:
+        frames, sockets = "frame-src 'none'", "connect-src 'self'"
+    else:
+        host, port = found
+        frames = f"frame-src https://{host}:*"
+        # 'self' admits wss: to the same host and port in browsers that follow CSP 3; the
+        # address is also named, for those that do not.
+        sockets = f"connect-src 'self' wss://{host}{':' + port if port else ''}"
+    return "; ".join((*PAGE_SOURCES, sockets, frames, *PAGE_REFUSES))
+
+
+async def index_handler(request: web.Request) -> web.StreamResponse:
+    """GET / — the page, open (the login screen is on it), with its content-security header
+    computed for the host the browser used (RS's index_handler, stricter)."""
+    return web.FileResponse(
+        STATIC_DIR / "index.html",
+        headers={"Content-Security-Policy": content_security_policy(request.headers.get("Host")), **STATIC_HEADERS})
+
+
+async def static_handler(request: web.Request) -> web.StreamResponse:
+    """GET /static/{path} — the page's files, open. A path that leads out of the folder (by
+    `..`, a link or anything else), a folder or a file that is not there is 404. (RS uses
+    aiohttp's add_static, which sends no nosniff and no cache header.)"""
+    root = STATIC_DIR.resolve()
+    try:
+        path = (root / request.match_info.get("path", "")).resolve()
+    except (OSError, ValueError, RuntimeError):
+        raise web.HTTPNotFound() from None
+    if not path.is_relative_to(root) or not path.is_file():
+        raise web.HTTPNotFound()
+    return web.FileResponse(path, headers=STATIC_HEADERS)
 
 
 # ---- the certificate ----------------------------------------------------------
@@ -1537,6 +1608,7 @@ def build_app() -> web.Application:
     nothing here takes a large one."""
     app = web.Application()
     app.router.add_get("/", index_handler)
+    app.router.add_get("/static/{path:.*}", static_handler)
     app.router.add_post("/broker/login", broker_login_handler)
     app.router.add_post("/broker/logout", broker_logout_handler)
     app.router.add_get("/broker/setup", broker_setup_state_handler)

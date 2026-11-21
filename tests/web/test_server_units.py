@@ -30,6 +30,7 @@ from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
+from yarl import URL
 
 RIGHT_PROOF = "right-proof"
 BROKER_TOKEN = "the-brokers-token-for-this-session"
@@ -761,16 +762,112 @@ def test_a_body_larger_than_a_mebibyte_is_413(fake, path, session):
     assert fake.calls == []
 
 
-def test_the_page_is_html_that_runs_nothing_and_is_not_kept(fake):
+def test_the_page_and_its_files_are_served_without_a_login_with_their_headers(fake):
     async def test(client):
-        answer = await client.get("/")
-        return answer.status, answer.headers, await answer.text()
-    status, headers, text = served(test)
-    assert status == 200 and headers["Content-Type"].startswith("text/html")
-    policy = [part.strip() for part in headers["Content-Security-Policy"].split(";")]
-    assert "default-src 'none'" in policy and not any(part.startswith("script-src") for part in policy)
-    assert headers["Cache-Control"] == "no-store" and headers["X-Content-Type-Options"] == "nosniff"
-    assert "<script" not in text.lower() and fake.calls == []
+        out = {}
+        for path in ("/", "/static/app.js", "/static/style.css", "/static/vendor/xterm.js"):
+            answer = await client.get(path)
+            out[path] = (answer.status, answer.headers, await answer.read())
+        return out
+    out = served(test)
+    static = server.STATIC_DIR
+    for path, file, kind in (("/", "index.html", "text/html"), ("/static/app.js", "app.js", "javascript"),
+                             ("/static/style.css", "style.css", "text/css"), ("/static/vendor/xterm.js", "vendor/xterm.js", "javascript")):
+        status, headers, body = out[path]
+        assert status == 200 and body == (static / file).read_bytes() and kind in headers["Content-Type"]
+        # Asked again at every load, so a changed file shows after a reload.
+        assert headers["X-Content-Type-Options"] == "nosniff" and headers["Cache-Control"] == "no-cache" and headers["ETag"]
+    assert "Content-Security-Policy" in out["/"][1] and b'src="/static/app.js"' in out["/"][2]
+    assert fake.calls == []
+
+
+def directives(policy):
+    """A content-security header as {directive: its sources}; a directive given twice fails."""
+    out = {}
+    for part in policy.split(";"):
+        name, *sources = part.split()
+        assert name not in out
+        out[name] = sources
+    return out
+
+
+def page_policy(host):
+    async def test(client):
+        answer = await client.get("/", headers={"Host": host})
+        return answer.status, answer.headers["Content-Security-Policy"]
+    status, policy = served(test)
+    assert status == 200
+    return policy
+
+
+THE_PAGES_OWN = {
+    "default-src": ["'none'"], "script-src": ["'self'"], "style-src": ["'self'", "'unsafe-inline'"], "img-src": ["'self'"],
+    "object-src": ["'none'"], "base-uri": ["'none'"], "form-action": ["'none'"], "frame-ancestors": ["'none'"]}
+
+
+@pytest.mark.parametrize("host, frames, sockets", [
+    ("127.0.0.1:7788", "https://127.0.0.1:*", "wss://127.0.0.1:7788"),
+    ("localhost:7788", "https://localhost:*", "wss://localhost:7788"),
+    ("learn.example", "https://learn.example:*", "wss://learn.example"),
+])
+def test_security_the_page_runs_its_own_scripts_only_and_frames_only_the_host_the_browser_used(fake, host, frames, sockets):
+    # No inline script, no eval, nothing from another origin; fetches and the terminal to itself;
+    # frames from any port of that host (the web-app tabs) and nowhere else.
+    assert directives(page_policy(host)) == {**THE_PAGES_OWN, "connect-src": ["'self'", sockets], "frame-src": [frames]}
+
+
+@pytest.mark.parametrize("host, frames, sockets", [
+    ("[::1]:7788", "https://[::1]:*", "wss://[::1]:7788"),
+    ("[2001:db8::7]", "https://[2001:db8::7]:*", "wss://[2001:db8::7]"),
+])
+def test_security_an_ipv6_host_is_framed_in_brackets(fake, host, frames, sockets):
+    assert directives(page_policy(host)) == {**THE_PAGES_OWN, "connect-src": ["'self'", sockets], "frame-src": [frames]}
+
+
+HOSTILE_HOSTS = [
+    "evil.example; script-src *", "127.0.0.1:7788 https://evil.example", "127.0.0.1:7788;frame-ancestors *",
+    "[::1]:7788; frame-src *", "[::1] evil.example", "[::1]:", "[fe80::1%25eth0]:7788", "[::1", "[1.2.3.4]",
+    "learn'example", "*", "*.example", "https://evil.example", "-bad.example", "bad-.example", "a..example",
+    "1.2.3.999", "999.1.1.1:7788", "127.0.0.1:99999", "127.0.0.1:", "127.0.0.1:7788:1", "ex ample", "lérn.example", "",
+]
+
+
+@pytest.mark.parametrize("host", HOSTILE_HOSTS)
+def test_security_a_host_that_is_not_a_plain_host_frames_nothing_and_adds_nothing_to_the_header(fake, host):
+    # Whatever the Host header holds, the header keeps the page's own directives and gains no
+    # source from it: no frame source at all, the sockets to 'self' only.
+    expected = {**THE_PAGES_OWN, "connect-src": ["'self'"], "frame-src": ["'none'"]}
+    assert directives(server.content_security_policy(host)) == expected
+    assert directives(server.content_security_policy(None)) == expected
+
+
+def test_security_a_hostile_host_header_on_the_wire_frames_nothing(fake):
+    assert directives(page_policy("evil.example; script-src *")) == {
+        **THE_PAGES_OWN, "connect-src": ["'self'"], "frame-src": ["'none'"]}
+
+
+def test_a_path_that_leaves_the_static_folder_is_404(fake, monkeypatch, tmp_path):
+    static = tmp_path / "static"
+    (static / "vendor").mkdir(parents=True)
+    (static / "index.html").write_text("<!doctype html>")
+    (static / "app.js").write_text("// the page")
+    (tmp_path / "secret.txt").write_text("not for the browser")
+    (static / "link.js").symlink_to(tmp_path / "secret.txt")
+    monkeypatch.setattr(server, "STATIC_DIR", static)
+
+    async def test(client):
+        out = []
+        for path in ("/static/..%2fsecret.txt", "/static/%2e%2e/secret.txt", "/static/../secret.txt",
+                     "/static/vendor/..%2f..%2fsecret.txt", "/static/%2ftmp", "/static/link.js", "/static/vendor",
+                     "/static/", "/static/missing.js"):
+            answer = await client.get(URL(path, encoded=True))
+            out.append((path, answer.status, await answer.text()))
+        answer = await client.get("/static/app.js")
+        return out, answer.status
+    out, fine = served(test)
+    assert fine == 200
+    for path, status, text in out:
+        assert status == 404 and "not for the browser" not in text, path
 
 
 # --- the real broker_call, against a stand-in on a unix socket ------------------------------------------
@@ -1472,8 +1569,9 @@ def ports_known(fake, named=NAMED, detected=DETECTED):
     fake.replies["port_detect"] = lambda args: broker.ok({"project": args["name"], "running": True, "ports": detected})
 
 
-def test_the_service_list_holds_the_files_server_the_named_and_detected_apps_and_raw_tcp(fake):
-    ports_known(fake)
+def test_the_service_list_holds_the_editor_the_files_server_the_named_and_detected_apps_and_raw_tcp(fake):
+    # The editor and the files server listen in the sandbox; neither is a detected app.
+    ports_known(fake, detected=[*DETECTED, {"port": 8443, "inodes": [204], "label": "8443"}, {"port": 7070, "inodes": [205], "label": "7070"}])
     server.ORIGIN_PORTS[11104] = {"project": "p1", "port": 3000}
 
     async def test(client):
@@ -1486,11 +1584,12 @@ def test_the_service_list_holds_the_files_server_the_named_and_detected_apps_and
     raw = {"label": "kafka", "kind": "http", "always_on": False, "renderer": "launcher", "default_port": 11200,
            "passthrough_port": 11200, "sandbox_port": 9092}
     assert running == {"ok": True, "services": {
+        "editor": {**web_row, "label": "Editor", "default_port": 8443, "always_on": True},
         "files": {**web_row, "label": "Files", "default_port": 7070, "always_on": True},
         "port-8000": {**web_row, "label": "notebook", "default_port": 8000},
         "port-3000": {**web_row, "label": "3000", "default_port": 3000, "detected": True, "origin_port": 11104},
         "pass-11200": raw}}
-    assert list(running["services"]) == ["files", "port-8000", "port-3000", "pass-11200"]
+    assert list(running["services"]) == ["editor", "files", "port-8000", "port-3000", "pass-11200"]
     assert stopped == {"ok": True, "services": {"port-8000": {**web_row, "label": "notebook", "default_port": 8000}, "pass-11200": raw}}
     assert fake.calls[:2] == [("port_list", {"name": "p1"}, BROKER_TOKEN, None), ("port_detect", {"name": "p1"}, BROKER_TOKEN, None)]
     assert server.PASSTHROUGH_CLAIMS == {11200: {"project": "p1", "port": 9092}}
@@ -1519,6 +1618,16 @@ def test_an_app_keeps_its_origin_port_two_apps_get_two_and_the_table_survives_a_
     # The named port and the files server need no detection.
     assert [verb for verb in fake.verbs()] == ["port_list", "port_detect", "port_list", "port_detect", "port_list", "port_list",
                                                "port_list", "port_detect", "port_list"]
+
+
+def test_the_editors_port_opens_like_the_files_servers_without_detection(fake):
+    ports_known(fake, detected=[])
+
+    async def test(client):
+        answer = await client.post("/broker/project/p1/origin", json={"port": 8443}, headers=with_session(client))
+        return await answer.json()
+    assert served(test) == {"ok": True, "origin_port": 11100}
+    assert fake.verbs() == ["port_list"] and server.ORIGIN_PORTS == {11100: {"project": "p1", "port": 8443}}
 
 
 def test_the_port_routes_relay_their_verbs_with_their_fields_only_and_the_claims_follow(fake):
