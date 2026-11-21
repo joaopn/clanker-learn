@@ -1625,7 +1625,8 @@ def test_the_pass_through_range_comes_from_the_setting_and_can_run_out(registry,
 
 
 @pytest.mark.parametrize("args, why", [
-    (("kafka", 22, "ssh"), "the sandbox's own"), (("kafka", 7070, "files"), "the sandbox's own"), (("kafka", 0, "p"), "port must be"),
+    (("kafka", 22, "ssh"), "the sandbox's own"), (("kafka", 7070, "files"), "the sandbox's own"), (("kafka", 8443, "editor"), "the sandbox's own"),
+    (("kafka", 0, "p"), "port must be"),
     (("kafka", 65536, "p"), "port must be"), (("kafka", True, "p"), "port must be"), (("kafka", "80", "p"), "port must be"),
     (("kafka", 80, ""), "label must be"), (("kafka", 80, "x" * 65), "label must be"), (("kafka", 80, "a\nb"), "label must be"),
     (("kafka", 80, None), "label must be"), (("kafka", 80, "p", "yes"), "passthrough must be"),

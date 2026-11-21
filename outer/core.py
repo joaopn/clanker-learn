@@ -95,6 +95,7 @@ SHELL_PASSWORD_LENGTH = 32
 CRYPT_HASH = re.compile(r"\$6\$[./A-Za-z0-9]{1,16}\$[./A-Za-z0-9]{86}")   # SHA-512 crypt, as /etc/shadow holds it
 SSH_PORT = 22
 FILES_SERVER_PORT = 7070      # sandbox/files_server.py
+EDITOR_PORT = 8443            # code-server, started by sandbox/sandbox_init.py
 PROC = "/proc"
 PROC_NET_BYTES = 1024 * 1024  # of each socket table: a sandbox can open sockets without end
 LABEL_CHARS = 64
@@ -781,8 +782,9 @@ def port_add(name, port, label, passthrough=False, host_port=None, env=None):
     label, and the project's entries after the change."""
     valid_name(name)
     port = port_number(port, "port")
-    if port in (SSH_PORT, FILES_SERVER_PORT):
-        raise CoreError(f"Port {port} is the sandbox's own ({'sshd' if port == SSH_PORT else 'the files server'}).")
+    own = {SSH_PORT: "sshd", FILES_SERVER_PORT: "the files server", EDITOR_PORT: "the editor"}
+    if port in own:
+        raise CoreError(f"Port {port} is the sandbox's own ({own[port]}).")
     if not isinstance(label, str) or not label.strip() or len(label.strip()) > LABEL_CHARS or not label.strip().isprintable():
         raise CoreError(f"label must be a name of 1 to {LABEL_CHARS} printable characters.")
     label = label.strip()
