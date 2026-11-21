@@ -25,7 +25,6 @@
     --pane-bg: #000;
     --tab-type-cli: #2e7d32;
     --tab-type-editor: #17a2b8;
-    --tab-type-files: #6c9;
     --tab-type-other: #8a8a8a;
     --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "DejaVu Sans Mono", "Liberation Mono", monospace;
 }
@@ -120,7 +119,6 @@ a { color: var(--fg-accent); }
 .tabbar .tb.on { background: var(--bg-base); color: var(--fg-base); }
 .tabbar .tb.t-cli { border-top-color: var(--tab-type-cli); }
 .tabbar .tb.t-editor { border-top-color: var(--tab-type-editor); }
-.tabbar .tb.t-files { border-top-color: var(--tab-type-files); }
 .tabbar .tb.t-other { border-top-color: var(--tab-type-other); }
 .tabbar .tb.t-ports { border-left: 1px solid #333; }
 .tabbar .tb.gone { text-decoration: line-through; color: var(--fg-faint); border-top-color: var(--error-fg); }

@@ -138,6 +138,7 @@ const S = {
     projects: [],          // the broker's list rows
     ops: [],               // operations in flight: {op_id, project, verb}
     current: null,         // the project shown
+    creating: null,        // a project being created: shown before the broker lists it
     tabs: {},              // project -> tab id shown
     services: {},          // project -> {id: row}, as the service list last said
     panes: {},             // "project|tab" -> pane record
@@ -186,9 +187,9 @@ function formRow(label, input, note) {
     return h("label", { class: "field" }, h("span", {}, label), input, note ? h("span", { class: "note" }, note) : null);
 }
 
-function loginScreen(message) {
+function loginScreen(message, plain) {
     const pw = h("input", { type: "password", autocomplete: "current-password", required: true });
-    const said = h("p", { class: message ? "bad" : "muted" }, message || "");
+    const said = h("p", { class: message && !plain ? "bad" : "muted" }, message || "");
     const go = h("button", { class: "primary", type: "submit" }, "Log in");
     const form = h("form", { method: "post", action: "#", onsubmit: async (ev) => {
         ev.preventDefault();
@@ -270,13 +271,13 @@ function firstPasswordScreen() {
 
 async function logout() {
     await api("POST", "/broker/logout");
-    loggedOut("You are logged out.");
+    loggedOut("You are logged out.", true);
 }
 
 // The login ended (a logout, or a 401 on the way): every terminal and frame goes.
-function loggedOut(message) {
+function loggedOut(message, plain) {
     if (!S.loggedIn) return;
-    loginScreen(message);
+    loginScreen(message, plain);
 }
 
 // ---- the app: rail, tab strip, panes ------------------------------------------------------
@@ -321,7 +322,7 @@ function teardownApp() {
     for (const key of Object.keys(S.panes)) dropPane(key);
     closeModal();
     window.removeEventListener("resize", refitVisible);
-    Object.assign(S, { loggedIn: false, projects: [], ops: [], current: null, tabs: {}, services: {}, panes: {}, shell: null, listError: null });
+    Object.assign(S, { loggedIn: false, projects: [], ops: [], current: null, creating: null, tabs: {}, services: {}, panes: {}, shell: null, listError: null });
 }
 
 async function refreshProjects() {
@@ -341,7 +342,7 @@ async function refreshProjects() {
         for (const key of Object.keys(S.panes)) {
             if (!projectRow(key.split("|")[0])) dropPane(key);
         }
-        if (S.current && !projectRow(S.current) && list.body.ok) {
+        if (S.current && S.current !== S.creating && !projectRow(S.current) && list.body.ok) {
             S.current = S.projects.length ? S.projects[0].name : null;
             if (S.current) refreshServices(S.current);
         }
@@ -423,8 +424,11 @@ function tabsOf(name) {
         if (!row || typeof row !== "object") continue;
         if (row.renderer === "launcher") { raw.push({ id, row }); continue; }
         if (row.renderer !== "iframe" || !Number.isInteger(row.default_port)) continue;
-        const label = id === "editor" ? "Editor" : id === "files" ? "Files" : String(row.label || row.default_port);
-        tabs.push({ id, label, type: id === "editor" ? "editor" : id === "files" ? "files" : "other", row });
+        // The files server serves single files (for what a lesson shows), not folders: it
+        // gets no tab. The workspace is browsed in the Editor.
+        if (id === "files") continue;
+        const label = id === "editor" ? "Editor" : String(row.label || row.default_port);
+        tabs.push({ id, label, type: id === "editor" ? "editor" : "other", row });
     }
     for (const [key, pane] of Object.entries(S.panes)) {
         const [project, id] = key.split("|");
@@ -542,7 +546,7 @@ function makeShellPane(name) {
         bar.className = `appbar termbar s-${state}`;
         said.textContent = text;
         again.hidden = !(state === "closed" || state === "failed") || !isRunning(name);
-        startBtn.hidden = !(state === "idle" || state === "closed" || state === "failed") || isRunning(name) || !!opOf(name);
+        startBtn.hidden = !(state === "idle" || state === "closed" || state === "failed") || isRunning(name) || !!opOf(name) || S.creating === name;
     };
 
     function connect() {
@@ -555,14 +559,19 @@ function makeShellPane(name) {
     }
 
     pane.update = () => {
-        if (pane.ws || pane.state === "closed" || pane.state === "failed") {
-            if (pane.state === "closed" || pane.state === "failed") set(pane.state, said.textContent);
+        if (pane.state === "closed" || pane.state === "failed") {
+            // The sandbox went down (a stop, a recreate) and is back: connect again by itself.
+            if (!isRunning(name)) pane.wasDown = true;
+            else if (pane.wasDown) { pane.wasDown = false; return connect(); }
+            set(pane.state, said.textContent);
             return;
         }
+        if (pane.ws) return;
         if (isRunning(name)) return connect();
         const op = opOf(name);
         const p = projectRow(name);
         set("idle", op ? `The sandbox is ${OP_WORDS[op.verb] || op.verb}.`
+                       : S.creating === name ? "The sandbox is being made."
                        : p && p.state === "missing" ? "This project has no sandbox. Start it to make one."
                        : "The sandbox is not running.");
     };
@@ -687,13 +696,13 @@ function refitVisible() {
     if (pane && pane.refit) requestAnimationFrame(() => pane.refit());
 }
 
-// ---- a web tab: the editor, the files server, an app ---------------------------------------
+// ---- a web tab: the editor, an app -----------------------------------------------------------
 
 // The address the browser used, as it goes into a URL (an IPv6 address keeps its brackets).
 const appUrl = (originPort) => `https://${location.hostname}:${originPort}/`;
 
 function makeWebPane(name, id, row) {
-    const label = id === "editor" ? "Editor" : id === "files" ? "Files" : String(row.label || row.default_port);
+    const label = id === "editor" ? "Editor" : String(row.label || row.default_port);
     const said = h("span", { class: "grow" }, "Opening…");
     const link = h("a", { class: "newtab", target: "_blank", rel: "noopener noreferrer", hidden: true }, "open in a new tab ↗");
     const reload = h("button", { hidden: true, title: "Load the frame again" }, "Reload");
@@ -882,10 +891,12 @@ function newProjectDialog() {
             return;
         }
         const project = name.value.trim();
-        S.current = project;
+        S.current = S.creating = project;
         saveLayout();
+        render();
         refreshProjects();
-        followOp(r.body.op_id, `Creating ${project}`);
+        await followOp(r.body.op_id, `Creating ${project}`);
+        if (S.creating === project) S.creating = null;
     } }, formRow("Name", name), h("details", { class: "more" }, h("summary", {}, "Limits (optional)"), limits.rows), said,
     h("div", { class: "btns" }, h("button", { type: "button", onclick: closeModal }, "Cancel"), go));
     openModal("New project", form, []);
@@ -946,7 +957,10 @@ async function runAction(name, verb) {
     const r = await api("POST", projectPath(name, `/${verb}`));
     if (!r.body.ok) { toast(`${name}: ${errText(r.body)}`, true); refreshProjects(); return; }
     refreshProjects();
-    followOp(r.body.op_id, `${name}: ${OP_WORDS[verb] || verb}`);
+    await followOp(r.body.op_id, `${name}: ${OP_WORDS[verb] || verb}`);
+    // A Shell the stop or recreate closed connects again once the sandbox runs (see its update).
+    const shell = S.panes[paneKey(name, "shell")];
+    if (shell && (shell.state === "closed" || shell.state === "failed")) { shell.wasDown = true; shell.update(); }
 }
 
 // Follow an operation: its log as it grows, then its result. The dialog can be closed; the
