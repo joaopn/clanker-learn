@@ -69,10 +69,10 @@ def fake_tools(tmp_path, scripts):
 # --- a good start --------------------------------------------------------------------------
 
 def test_comes_up_ready_and_says_so_on_its_port(ready, peer):
-    state = ready.state()
+    state = ready.wait_sandboxes()
     assert daemon_runs(ready)
     assert len(state.pop("boot")) == 32
-    assert state == {"state": "ready", "mode": "privileged", "reason": "", "limits": True}
+    assert state == {"state": "ready", "mode": "privileged", "reason": "", "limits": True, "sandboxes": "started"}
     status, body = fetch_from(peer["name"], f"http://{ready.address()}:8080/")
     assert (status, body.strip()) == (200, "clanker-learn: ready")
     status, body = fetch_from(peer["name"], f"http://{ready.address()}:8080/state.json")

@@ -1,4 +1,6 @@
 """The parts of the outer container that are decided without a daemon."""
+import os
+
 import guard
 import init
 import pytest
@@ -218,6 +220,91 @@ def test_a_network_that_cannot_be_listed_is_refused_without_a_port(monkeypatch, 
     calls.clear()
     init.main()
     assert calls == ["end while refused"] and "could not be listed" in init.state["reason"]
+
+
+def test_the_child_that_starts_sandboxes_is_ended_before_they_are_stopped(monkeypatch, tmp_path):
+    """Ready, then a stop: the projects are started by a child, never inside the steps whose
+    failure is a refusal, and at the stop that child is ended before the inner containers are
+    stopped, so that it starts none behind the stop's back."""
+    class StopAtTheFirstWait:
+        def __init__(self):
+            self.asked = False
+
+        def is_set(self):
+            return self.asked
+
+        def wait(self, seconds):
+            self.asked = True
+            return True
+
+    class Running:
+        returncode = None
+
+        def poll(self):
+            return None
+
+    calls = []
+    net = tmp_path / "net"
+    net.mkdir()
+    daemon, child = Running(), Running()
+    monkeypatch.setattr(init, "Stop", StopAtTheFirstWait)
+    monkeypatch.setattr(init, "serve_status", lambda: None)
+    monkeypatch.setattr(init, "own_process_namespace", lambda parent, pid1: True)
+    monkeypatch.setattr(init, "bring_up", lambda stop: calls.append("bring up") or (daemon, ()))
+    monkeypatch.setattr(init, "start_wanted_sandboxes", lambda: calls.append("start the projects") or child)
+    monkeypatch.setattr(init, "end_child", lambda c, wait_s=5: calls.append("end the child" if c is child else "end something else"))
+    monkeypatch.setattr(init, "stop_inner_containers", lambda timeout=0: calls.append("stop the containers"))
+    monkeypatch.setattr(init, "stop_daemon", lambda d, wait_s=0: calls.append("stop the daemon"))
+    monkeypatch.setattr(init, "end_everything_else", lambda: calls.append("end the rest") or True)
+    monkeypatch.setattr(init, "watch", lambda d, dns: calls.append("watch"))   # never the real one: it would write rules here
+    monkeypatch.setattr(init, "STATE_FILE", str(tmp_path / "state.json"))
+    monkeypatch.setattr(init, "NET_DIR", str(net))
+    init.main()
+    assert calls == ["bring up", "start the projects", "end the child", "stop the containers", "stop the daemon", "end the rest"]
+    assert init.state["sandboxes"] == "starting"
+
+
+def test_ending_the_child_ends_the_command_it_is_waiting_on(tmp_path):
+    """The child that starts sandboxes waits on a `docker start`; ended alone, it would leave
+    that command to go on. A stand-in child with a command of its own, in a group of its own."""
+    import subprocess
+    import time
+    mark = tmp_path / "grandchild.pid"
+    # The command ignores the first signal, as a `docker` waiting on the daemon may.
+    child = subprocess.Popen(["sh", "-c", f"(trap '' TERM; exec sleep 300) & echo $! > {mark}; wait"], start_new_session=True)
+    deadline = time.monotonic() + 10
+    while not mark.exists() or not mark.read_text().strip():
+        assert time.monotonic() < deadline
+        time.sleep(0.05)
+    grandchild = int(mark.read_text())
+    assert os.path.exists(f"/proc/{grandchild}")
+    init.end_child(child)
+    assert child.poll() is not None
+    def still_runs(pid):
+        try:
+            with open(f"/proc/{pid}/stat") as fh:
+                return fh.read().split(")")[-1].split()[0] != "Z"   # a zombie is ended, only not reaped
+        except OSError:
+            return False
+
+    deadline = time.monotonic() + 10
+    while still_runs(grandchild):
+        assert time.monotonic() < deadline, "the command the child was waiting on is still running"
+        time.sleep(0.05)
+    init.end_child(child)   # already ended: nothing to do
+    init.end_child(None)
+    alone = subprocess.Popen(["sleep", "300"])   # not in a group of its own: ended all the same
+    init.end_child(alone)
+    assert alone.poll() is not None
+
+
+def test_the_child_that_starts_sandboxes_is_given_a_group_of_its_own(monkeypatch):
+    """What end_child relies on to end the child's `docker` commands with it."""
+    seen = []
+    monkeypatch.setattr(init.subprocess, "Popen", lambda *args, **kwargs: seen.append((args, kwargs)) or "the child")
+    assert init.start_wanted_sandboxes() == "the child"
+    (args, kwargs), = seen
+    assert args[0] == ["python3", init.CORE, "start-wanted"] and kwargs["start_new_session"] is True
 
 
 @pytest.mark.parametrize("name, inner", [

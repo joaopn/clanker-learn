@@ -14,16 +14,21 @@ Order of a start, and nothing is skipped:
      policy, so this finds nothing unless something went wrong);
   5. one container is run from the self-test image.
 
-Only then is the container "ready". If any step fails the start is refused: every other
-process in the container is ended, the daemon and anything it ran included, so nothing runs
-unfenced, and the interface's port answers 503 with the reason until the container is
-stopped. A fault nobody foresaw is refused the same way, not left as a traceback. Two
-refusals differ, both made before anything is started. Where the process namespace is not the
-container's own, or tini is not pid 1, nothing is ended. Where the network is not the
-container's own, nothing is ended and the port is not opened either: it would be opened on
-someone else's network, so the reason is only in the log and the state file. While ready, the rules are checked again every few seconds and restored when they
-are gone. If they cannot be restored, or the daemon has died, the container goes to
-"refused" in the same way: everything else in it is ended at once.
+Only then is the container "ready". Once it is, the projects that should be running are
+started by the core, in a child process, while this init goes on watching: a project that
+cannot be started is that project's trouble and never a refusal. The state says "sandboxes:
+starting" until that child is done, then "started" or "some failed".
+
+If any step fails the start is refused: every other process in the container is ended, the
+daemon and anything it ran included, so nothing runs unfenced, and the interface's port answers
+503 with the reason until the container is stopped. A fault nobody foresaw is refused the same
+way, not left as a traceback. Two refusals differ, both made before anything is started. Where
+the process namespace is not the container's own, or tini is not pid 1, nothing is ended. Where
+the network is not the container's own, nothing is ended and the port is not opened either: it
+would be opened on someone else's network, so the reason is only in the log and the state file.
+While ready, the rules are checked again every few seconds and restored when they are gone. If
+they cannot be restored, or the daemon has died, the container goes to "refused" in the same
+way: everything else in it is ended at once.
 
 The state is also in /run/cl/state.json, with a "boot" value that is new at every start.
 """
@@ -46,6 +51,7 @@ NET_DIR = "/sys/class/net"
 DAEMON_LOG = "/var/log/dockerd.log"
 DAEMON_LOG_MAX = 5 * 1024 * 1024
 DAEMON_JSON = "/etc/docker/daemon.json"
+CORE = "/opt/cl/core.py"
 SELFTEST_ROOT = "/opt/cl/selftest"
 SELFTEST_IMAGE = "cl-selftest"
 UI_PORT = int(os.environ.get("CL_UI_PORT", "8080"))
@@ -467,6 +473,38 @@ def bring_up(stop):
     return daemon, dns
 
 
+def start_wanted_sandboxes():
+    """The core, in a child, starting the projects that should be running. None when it
+    cannot be run; then nothing is started and the state says so."""
+    try:
+        return subprocess.Popen(["python3", CORE, "start-wanted"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                start_new_session=True)  # a group of its own: end_child ends its docker commands with it
+    except OSError as exc:
+        log(f"the projects could not be started: {exc}")
+        return None
+
+
+def end_child(child, wait_s=5):
+    """End the child that starts sandboxes, and the command it is waiting on, so that it asks
+    the daemon for no more starts while the inner containers are stopped."""
+    if child is None or child.poll() is not None:
+        return
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(child.pid, sig)
+        except ProcessLookupError:
+            child.send_signal(sig)  # not the leader of a group of its own: the child alone
+        try:
+            child.wait(wait_s)
+            break
+        except subprocess.TimeoutExpired:
+            pass
+    try:
+        os.killpg(child.pid, signal.SIGKILL)  # what of its group did not end at the first signal
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
 def watch(daemon, dns):
     """One pass while ready. Raises Refused when the container can no longer be trusted."""
     if daemon.poll() is not None:
@@ -503,7 +541,7 @@ def main():
             mine = own_process_namespace(os.getppid(), fh.read())
     except OSError:
         mine = False
-    daemon = dns = None
+    daemon = dns = starting = None
     ready = False
     if not mine:
         refuse("This container does not have its own process namespace and init. Start it without --pid=host, without --init and without another entrypoint. " + HOW_TO_RUN, mine=False)
@@ -517,16 +555,25 @@ def main():
             refuse(str(exc))
         except Exception as exc:  # noqa: BLE001 - anything unforeseen is a refusal, not a crash
             refuse(unforeseen(exc))
-    while not stop.wait(WATCH_S):
+    if ready:
+        starting = start_wanted_sandboxes()
+        set_state("ready", sandboxes="starting" if starting else "some failed")
+    while not stop.wait(min(WATCH_S, 1) if starting else WATCH_S):
         if not ready:
             continue
+        if starting is not None and starting.poll() is not None:
+            set_state("ready", sandboxes="started" if starting.returncode == 0 else "some failed")
+            starting = None
         try:
             watch(daemon, dns)
         except Exception as exc:  # noqa: BLE001 - as at the start
             ready = False
-            daemon = None  # ended, and reaped, by refuse()
+            daemon = starting = None  # ended, and reaped, by refuse()
+            with state_lock:
+                state.pop("sandboxes", None)  # nothing is starting or started any more
             refuse(str(exc) if isinstance(exc, Refused) else unforeseen(exc))
     if mine:
+        end_child(starting)
         if daemon is not None and daemon.poll() is None:
             log("stopping the inner containers and the daemon")
             try:
