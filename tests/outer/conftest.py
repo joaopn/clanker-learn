@@ -4,8 +4,9 @@ The integration tests need a Docker daemon that can run a privileged container (
 container's is one). They publish no port on the machine: everything is asked through
 `docker exec`, or from a peer container on a test network. Every container, network and
 named volume they create starts with `cl-test-` and is removed afterwards, each container
-with the unnamed volumes the image gives it; the images they build, `cl-outer:test` and the
-sandbox image `cl-sandbox:<hash>`, are kept as a build cache.
+with the unnamed volumes the image gives it; the images they build, `cl-outer:test`, the
+sandbox image `cl-sandbox:<hash>` and the web server's `cl-web:<hash>`, are kept as a build
+cache.
 """
 import json
 import pathlib
@@ -102,6 +103,28 @@ def sandbox_image(image):
 
 
 @pytest.fixture(scope="session")
+def web_image(image):
+    """The web server's image, built once on the test daemon under the tag the core computes."""
+    tag = core.image_tag(str(REPO / "web"), core.WEB_REPO)
+    run("docker", "build", "-q", "-t", tag, str(REPO / "web"), timeout=2400)
+    return tag
+
+
+@pytest.fixture(scope="session")
+def preload(web_image, sandbox_image, tmp_path_factory):
+    """A folder to mount at an outer container's /opt/cl/preload, where the core loads an
+    image from instead of building it. It holds both images: once the web server is up, its
+    keeper gets the sandbox's image too, and would build it if it were not there."""
+    folder = tmp_path_factory.mktemp("preload")
+    folder.chmod(0o755)
+    for tag in (web_image, sandbox_image):
+        saved = folder / f"{tag.partition(':')[0]}.tar"
+        run("docker", "save", "-o", str(saved), tag, timeout=900)
+        saved.chmod(0o644)
+    return folder
+
+
+@pytest.fixture(scope="session")
 def peer(image):
     """A network of the test daemon and a neighbour on it at a private address, which a sandbox
     must not reach. It listens on PEER_PORT and on 53, the port of a resolver, over TCP and
@@ -134,11 +157,17 @@ class Outer:
         self.sandbox_gateway = None
         self.sandbox_image = None
 
-    def start(self, env=None, privileged=True, extra=(), command=()):
-        """`docker run` the outer container. env=None declares the privileged mode."""
+    def start(self, env=None, privileged=True, extra=(), command=(), preload=None):
+        """`docker run` the outer container. env=None declares the privileged mode. The web
+        server is off unless `env` names CL_WEB: building its image needs the internet and
+        minutes. `preload`, a folder of saved images (the `preload` fixture's), is mounted
+        where the core loads images from before it builds one."""
         env = {"CL_MODE": "privileged", "CL_WATCH_S": "1"} if env is None else env
+        env = {"CL_WEB": "off", **env}
         args = ["docker", "run", "-d", "--name", self.name, "--network", NET, "--stop-timeout", "60",
                 "-v", f"{self.volume}:/var/lib/docker", "-v", f"{self.data}:/data"]
+        if preload is not None:
+            args += ["-v", f"{preload}:/opt/cl/preload:ro"]
         if privileged:
             args.append("--privileged")
         for key, value in env.items():
@@ -235,6 +264,16 @@ class Outer:
                 return state
             time.sleep(0.3)
         raise AssertionError(f"the broker of {self.name} did not become {wanted} in {timeout}s; state {self.state()}")
+
+    def wait_web(self, wanted="off", timeout=60):
+        """The state once it says the web server is `wanted`."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            state = self.state()
+            if state.get("web") == wanted:
+                return state
+            time.sleep(0.3)
+        raise AssertionError(f"the web server of {self.name} did not become {wanted} in {timeout}s; state {self.state()}")
 
     def cl(self, *args, check=True, timeout=300):
         """The core's command in the outer container: the JSON it prints, or, when it fails

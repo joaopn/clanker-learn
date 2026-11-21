@@ -19,11 +19,19 @@ started by the core, in a child process, while this init goes on watching: a pro
 cannot be started is that project's trouble and never a refusal. The state says "sandboxes:
 starting" until that child is done, then "started" or "some failed".
 
-The broker (broker.py), the door the web server will use, is started then too, in a process
+The broker (broker.py), the door the web server uses, is started then too, in a process
 group of its own in which its operations stay. If it ends it is started again, a few seconds
 apart at most; the state says "broker: up" once its socket accepts a connection. A broker that
-cannot run is never a refusal either. At a stop every broker group is ended, operations
-included, before the inner containers are stopped.
+cannot run is never a refusal either. When no password is set yet, the init makes a set-up code
+once per start, says it in the log, and hands it to every broker it starts on its standard
+input; it is kept nowhere else.
+
+The web server's keeper (`core.py web-keep`) is started then too, in a group of its own. It
+brings the web server's container up (or removes it, with CL_WEB=off) and keeps it up, and
+says how it stands, a line of JSON at a time, which the init puts in the state ("web",
+"sandbox_image"). A wrong web setting is "web: down" with its reason, never a refusal. At a
+stop every broker group and the keeper's are ended, operations included, before the inner
+containers are stopped.
 
 If any step fails the start is refused: every other process in the container is ended, the
 daemon and anything it ran included, so nothing runs unfenced, and the interface's port answers
@@ -40,6 +48,8 @@ The state is also in /run/cl/state.json, with a "boot" value that is new at ever
 """
 import json
 import os
+import re
+import secrets
 import select
 import shutil
 import signal
@@ -52,6 +62,7 @@ import traceback
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import broker_auth  # its own standard library only: where the password is kept
 import guard
 
 STATE_FILE = "/run/cl/state.json"
@@ -65,9 +76,15 @@ BROKER_SOCKET = "/run/cl/broker/broker.sock"
 BROKER_FOLDERS = ("/run/cl/broker", "/run/cl/broker-ops")  # the socket and progress logs; the markers of operations
 BROKER_RESTART_S = 5
 BROKER_HURRY_S = 30
+SETUP_CODE_ALPHABET = "abcdefghijklmnopqrstuvwxyz0123456789"
+SETUP_CODE_LENGTH = 20
+KEEPER_RESTART_S = 5
+KEEPER_KEYS = ("web", "sandbox_image")
+KEEPER_LINE_MAX = 4096       # a longer line from the keeper is not one of its reports
+KEEPER_VALUE_MAX = 600
 SELFTEST_ROOT = "/opt/cl/selftest"
 SELFTEST_IMAGE = "cl-selftest"
-UI_PORT = int(os.environ.get("CL_UI_PORT", "8080"))
+DEFAULT_STATUS_PORT = 8080
 DAEMON_WAIT_S = float(os.environ.get("CL_DAEMON_WAIT_S", "90"))
 WATCH_S = float(os.environ.get("CL_WATCH_S", "10"))
 STOP_GRACE_S = 10
@@ -100,6 +117,20 @@ class Refused(Exception):
     """The start cannot go on; the message is what the learner is shown."""
 
 
+def status_port_setting(env):
+    """(port, problem): CL_STATUS_PORT, or the default; a value that is not a port is a
+    problem, which the start refuses with, and meanwhile the default port says so."""
+    text = env.get("CL_STATUS_PORT", str(DEFAULT_STATUS_PORT))
+    if re.fullmatch(r"[0-9]{1,5}", text.strip()) and 1 <= int(text) <= 65535:
+        return int(text), ""
+    return DEFAULT_STATUS_PORT, (f"CL_STATUS_PORT is {text!r}: it must be a whole number from 1 to 65535. "
+                                 f"Until it is, this page is served on {DEFAULT_STATUS_PORT}.")
+
+
+# Read here, never crashing: the port is needed before anything else is done.
+STATUS_PORT, STATUS_PORT_PROBLEM = status_port_setting(os.environ)
+
+
 # "boot" changes at every start of the container: the file outlives a stop and start, so a
 # reader tells a fresh state from the last run's by it.
 state = {"state": "starting", "mode": None, "reason": "", "boot": uuid.uuid4().hex}
@@ -110,7 +141,9 @@ def log(message):
     print(f"clanker-learn: {message}", file=sys.stderr, flush=True)
 
 
-def set_state(name, reason="", **extra):
+def set_state(name, reason="", said=None, **extra):
+    """Write the state, and say it in the log: `said` when given, else the state's name and
+    reason."""
     with state_lock:
         state.update(state=name, reason=reason, **extra)
         os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
@@ -118,7 +151,7 @@ def set_state(name, reason="", **extra):
         with open(tmp, "w") as fh:
             json.dump(state, fh)
         os.replace(tmp, STATE_FILE)
-    log(f"{name}{': ' + reason if reason else ''}")
+    log(said if said is not None else f"{name}{': ' + reason if reason else ''}")
 
 
 class Stop:
@@ -191,7 +224,7 @@ class Status(BaseHTTPRequestHandler):
 
 
 def serve_status():
-    server = ThreadingHTTPServer(("0.0.0.0", UI_PORT), Status)
+    server = ThreadingHTTPServer(("0.0.0.0", STATUS_PORT), Status)
     threading.Thread(target=server.serve_forever, daemon=True).start()
 
 
@@ -465,6 +498,8 @@ def refuse(reason, mine=True):
 
 def bring_up(stop):
     """Steps 1 to 5. Returns (daemon, resolvers the rules except); raises Refused."""
+    if STATUS_PORT_PROBLEM:
+        raise Refused(STATUS_PORT_PROBLEM)
     with open("/proc/self/uid_map") as fh:
         uid_map_text = fh.read()
     with open("/proc/self/status") as fh:
@@ -521,21 +556,62 @@ def end_child(child, wait_s=5):
 def clear_broker_folders():
     """Once per start of the container, before any broker runs: /run outlives a stop and
     start, and what an earlier run left there (logs of operations that were cut off, markers)
-    describes nothing that still exists."""
+    describes nothing that still exists. The socket's folder is made again at once, as the
+    broker makes it: the web server's container mounts it, and a missing source fails that."""
     for folder in BROKER_FOLDERS:
         shutil.rmtree(folder, ignore_errors=True)
-
-
-def start_broker():
-    """The broker, in a process group of its own. None when it cannot be run."""
     try:
-        return subprocess.Popen(["python3", BROKER, "serve"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, start_new_session=True)
+        os.makedirs(BROKER_FOLDERS[0], mode=0o755, exist_ok=True)
+        os.chmod(BROKER_FOLDERS[0], 0o755)
+    except OSError as exc:
+        log(f"the broker's folder could not be made: {exc}")
+
+
+def password_is_set():
+    return os.path.exists(broker_auth.PASSWD_FILE)
+
+
+def new_setup_code():
+    return "".join(secrets.choice(SETUP_CODE_ALPHABET) for _ in range(SETUP_CODE_LENGTH))
+
+
+def setup_code(env=os.environ):
+    """A set-up code when no password is set yet, else None. Made once per start, said once
+    in the log, and handed to each broker on its standard input: never in the environment, the
+    state, a file, or a command line. None too with the web server off (CL_WEB=off): there is
+    no page to enter it on, and the broker says how to set the password instead."""
+    if password_is_set() or env.get("CL_WEB", "on").strip().lower() == "off":
+        return None
+    code = new_setup_code()
+    log(f"No password is set yet. The set-up code is {code}. The web page asks for it to set the first password; "
+        "it is good until this container stops or a password is set. "
+        "Or set the password from a shell: docker exec -i clanker-learn cl passwd")
+    return code
+
+
+def start_broker(code=None):
+    """The broker, in a process group of its own, with the set-up code on its standard input
+    when there is one. None when it cannot be run."""
+    try:
+        broker = subprocess.Popen(["python3", BROKER, "serve"], stdin=subprocess.PIPE if code else subprocess.DEVNULL,
+                                  stdout=subprocess.DEVNULL, start_new_session=True)
     except OSError as exc:
         log(f"the broker could not be started: {exc}")
         return None
+    if code:
+        try:
+            broker.stdin.write((code + "\n").encode())
+            broker.stdin.close()
+        except OSError:  # it ended before it read: it is started again, and given the code again
+            log("the broker ended before it took the set-up code")
+            try:
+                broker.stdin.close()
+            except OSError:
+                pass
+    return broker
 
 
-def keep_broker(brokers, tried, now=time.monotonic):
+def keep_broker(brokers, tried, now=time.monotonic, code=None):
     """Start the broker if none runs, not more often than every BROKER_RESTART_S seconds.
     `brokers` holds the running one, and each ended one whose operations still run in its
     group. Returns when it was last tried."""
@@ -549,17 +625,134 @@ def keep_broker(brokers, tried, now=time.monotonic):
         return tried
     if tried != float("-inf"):
         log("the broker is not running; starting it again")
-    new = start_broker()
+    new = start_broker(code)
     if new is not None:
         brokers.append(new)
     return now()
 
 
-def loop_wait(starting, ready, broker, hurry_until, now):
-    """How long the init's loop sleeps. A second while the projects are being started, and
-    while it is in a hurry to see the broker answer; WATCH_S otherwise, which is also the pace
-    of the guard check."""
-    return min(WATCH_S, 1) if starting or (ready and broker != "up" and now < hurry_until) else WATCH_S
+class WebKeeper:
+    """The child that brings the web server up and keeps it up (`core.py web-keep`), and what
+    it has said so far. Its output is read without waiting: the init's loop never blocks on it."""
+
+    def __init__(self, process):
+        self.process = process
+        self.pid = process.pid
+        self.pending = b""
+        self.skipping = False      # in the middle of a line that was too long
+        self.reported = False      # it said something of the web server
+        self.ended = False         # its end was seen and dealt with
+        os.set_blocking(process.stdout.fileno(), False)
+
+    def poll(self):
+        return self.process.poll()
+
+    def read(self):
+        """The reports in what it wrote since the last read, in order: [(key, value)]. A last
+        line cut short by its end is dropped."""
+        reports = []
+        while True:
+            try:
+                chunk = os.read(self.process.stdout.fileno(), 65536)
+            except BlockingIOError:
+                break
+            except (OSError, ValueError):
+                chunk = b""
+            if not chunk:
+                self.pending, self.skipping = b"", False
+                break
+            *lines, self.pending = (self.pending + chunk).split(b"\n")
+            for line in lines:
+                if self.skipping:
+                    self.skipping = False   # the end of the line that was too long
+                    continue
+                report = keeper_report(line)
+                if report is not None:
+                    reports.append(report)
+            if len(self.pending) > KEEPER_LINE_MAX:
+                self.pending, self.skipping = b"", True
+        self.reported = self.reported or any(key == "web" for key, _ in reports)
+        return reports
+
+    def close(self):
+        try:
+            self.process.stdout.close()
+        except OSError:
+            pass
+
+
+def keeper_report(line):
+    """(key, value) when `line` is one of the keeper's reports: a JSON object with exactly one
+    of KEEPER_KEYS and a string value, which is cut to KEEPER_VALUE_MAX. Anything else is None."""
+    if len(line) > KEEPER_LINE_MAX:
+        return None
+    try:
+        said = json.loads(line.decode())
+    except (ValueError, RecursionError):
+        return None
+    if not isinstance(said, dict) or len(said) != 1:
+        return None
+    (key, value), = said.items()
+    if key not in KEEPER_KEYS or not isinstance(value, str):
+        return None
+    return key, value[:KEEPER_VALUE_MAX]
+
+
+def web_is(value):
+    """What the init itself has to say of the web server: in the state, and in the log as
+    the keeper's own reports are."""
+    set_state("ready", web=value, said=f"web: {value}")
+
+
+def start_web_keeper():
+    """The web server's keeper, in a process group of its own; None when it cannot be run.
+    It inherits the environment, which holds the web server's settings."""
+    try:
+        process = subprocess.Popen(["python3", CORE, "web-keep", str(STATUS_PORT)], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                   start_new_session=True)
+    except OSError as exc:
+        web_is(f"down: the web server's keeper could not be started ({exc})")
+        return None
+    return WebKeeper(process)
+
+
+def keep_web_keeper(keepers, tried, now=time.monotonic):
+    """Put what the web keeper said in the state, and start it again if it ended unexpectedly,
+    not more often than every KEEPER_RESTART_S seconds. One that ended with 0 (the web server
+    is off) or 3 (it said why it is down) is not started again. `keepers` holds the running
+    one, and each ended one whose group still has a member; `tried` is when one was last
+    started, or None once none is to be started any more. Returns the new `tried`."""
+    current = keepers[-1] if keepers else None
+    if current is not None and not current.ended:
+        code = current.poll()
+        for key, value in current.read():   # all of it, when it has ended
+            set_state("ready", said=f"{key}: {value}", **{key: value})   # in the log too: why the web server is down
+        if code is not None:
+            current.ended = True
+            current.close()
+            if code in (0, 3):
+                if code == 3 and not current.reported:
+                    web_is("down: the web server's keeper ended without saying why")
+                tried = None
+            else:
+                web_is(f"down: the web server's keeper ended unexpectedly (exit {code})")
+    running = current is not None and not current.ended
+    keepers[:] = [k for i, k in enumerate(keepers) if (running and i == len(keepers) - 1) or not group_is_gone(k.pid)]
+    if tried is None or running or now() - tried < KEEPER_RESTART_S:
+        return tried
+    new = start_web_keeper()
+    if new is not None:
+        keepers.append(new)
+    return now()
+
+
+def loop_wait(starting, ready, broker, hurry_until, now, web):
+    """How long the init's loop sleeps. A second while the projects are being started, while
+    the web server is being prepared (or has not been heard of yet), and while it is in a hurry
+    to see the broker answer; WATCH_S otherwise, which is also the pace of the guard check."""
+    web_preparing = web is None or web.startswith("preparing")
+    hurried = starting or (ready and (web_preparing or (broker != "up" and now < hurry_until)))
+    return min(WATCH_S, 1) if hurried else WATCH_S
 
 
 def hurry_after(was, broker, hurry_until, now):
@@ -643,9 +836,10 @@ def main():
             mine = own_process_namespace(os.getppid(), fh.read())
     except OSError:
         mine = False
-    daemon = dns = starting = None
+    daemon = dns = starting = code = None
     ready = False
     brokers, broker_tried, hurry_until = [], float("-inf"), 0.0
+    keepers, keeper_tried = [], float("-inf")
     if not mine:
         refuse("This container does not have its own process namespace and init. Start it without --pid=host, without --init and without another entrypoint. " + HOW_TO_RUN, mine=False)
     elif not_my_network:
@@ -660,17 +854,20 @@ def main():
             refuse(unforeseen(exc))
     if ready:
         clear_broker_folders()
+        code = setup_code()
         starting = start_wanted_sandboxes()
-        broker_tried = keep_broker(brokers, broker_tried)
+        broker_tried = keep_broker(brokers, broker_tried, code=code)
         hurry_until = time.monotonic() + BROKER_HURRY_S
         set_state("ready", sandboxes="starting" if starting else "some failed", broker="down")
-    while not stop.wait(loop_wait(starting, ready, state.get("broker"), hurry_until, time.monotonic())):
+        keeper_tried = keep_web_keeper(keepers, keeper_tried)
+    while not stop.wait(loop_wait(starting, ready, state.get("broker"), hurry_until, time.monotonic(), state.get("web"))):
         if not ready:
             continue
         if starting is not None and starting.poll() is not None:
             set_state("ready", sandboxes="started" if starting.returncode == 0 else "some failed")
             starting = None
-        broker_tried = keep_broker(brokers, broker_tried)
+        broker_tried = keep_broker(brokers, broker_tried, code=code)
+        keeper_tried = keep_web_keeper(keepers, keeper_tried)
         broker = "up" if brokers and brokers[-1].poll() is None and broker_answers() else "down"
         hurry_until = hurry_after(state.get("broker"), broker, hurry_until, time.monotonic())
         if broker != state.get("broker"):
@@ -681,14 +878,17 @@ def main():
             ready = False
             daemon = starting = None  # ended, and reaped, by refuse()
             brokers.clear()
+            for keeper in keepers:
+                keeper.close()
+            keepers.clear()  # ended by refuse(); its group number may be someone else's by the stop
             with state_lock:
-                state.pop("sandboxes", None)  # nothing is starting or started any more
-                state.pop("broker", None)
+                for key in ("sandboxes", "broker", "web", "sandbox_image"):
+                    state.pop(key, None)  # nothing is starting, started or kept any more
             refuse(str(exc) if isinstance(exc, Refused) else unforeseen(exc))
     if mine:
         end_child(starting)
-        for broker in brokers:
-            end_group(broker)  # the broker and its operations: they ask the daemon for nothing more
+        for leader in (*brokers, *keepers):
+            end_group(leader)  # brokers and their operations, the web keeper: they ask the daemon for nothing more
         if daemon is not None and daemon.poll() is None:
             log("stopping the inner containers and the daemon")
             try:

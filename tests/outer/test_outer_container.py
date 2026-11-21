@@ -70,10 +70,11 @@ def fake_tools(tmp_path, scripts):
 
 def test_comes_up_ready_and_says_so_on_its_port(ready, peer):
     ready.wait_sandboxes()
-    state = ready.wait_broker()
+    ready.wait_broker()
+    state = ready.wait_web("off")   # the tests start it with CL_WEB=off
     assert daemon_runs(ready)
     assert len(state.pop("boot")) == 32
-    assert state == {"state": "ready", "mode": "privileged", "reason": "", "limits": True, "sandboxes": "started", "broker": "up"}
+    assert state == {"state": "ready", "mode": "privileged", "reason": "", "limits": True, "sandboxes": "started", "broker": "up", "web": "off"}
     status, body = fetch_from(peer["name"], f"http://{ready.address()}:8080/")
     assert (status, body.strip()) == (200, "clanker-learn: ready")
     status, body = fetch_from(peer["name"], f"http://{ready.address()}:8080/state.json")
@@ -280,16 +281,17 @@ CANDIDATE = "candidate"
 
 
 def machine_with_candidate(outer, *flags):
-    """A ready outer container as the machine, and inside it the image started with `flags`.
-    Every tool by which the candidate could act on a network or start a daemon is replaced by
-    one that writes its name to the machine's /cl-ran/log first."""
+    """A ready outer container as the machine, and inside it the image started with `flags`
+    (with the web server off, unless a flag names CL_WEB). Every tool by which the candidate
+    could act on a network or start a daemon is replaced by one that writes its name to the
+    machine's /cl-ran/log first."""
     machine = outer().start()
     assert machine.wait()["state"] == "ready", machine.state()
     machine.load_probe()
     stub = base64.b64encode(RECORDING_TOOL.encode()).decode()
     machine.sh("mkdir -p /cl-fake /cl-ran && " + " && ".join(
         f"echo {stub} | base64 -d > /cl-fake/{tool} && chmod 755 /cl-fake/{tool}" for tool in TOOLS_THAT_ACT))
-    machine.inner("run", "-d", "--name", CANDIDATE, "--privileged", *flags, "-e", "CL_MODE=privileged",
+    machine.inner("run", "-d", "--name", CANDIDATE, "--privileged", "-e", "CL_WEB=off", *flags, "-e", "CL_MODE=privileged",
                   "-e", f"PATH={PATH_WITH_FAKES}", "-v", "/cl-fake:/fake:ro", "-v", "/cl-ran:/ran", IMAGE)
     return machine
 
@@ -323,7 +325,7 @@ def assert_the_recording_works(machine):
 def test_refuses_the_machines_network_and_touches_nothing(outer):
     """--network=host: nothing is run that could change a rule or start a daemon, and no port
     is opened on the machine. The container stays up and its log says why."""
-    machine = machine_with_candidate(outer, "--network=host", "-e", "CL_UI_PORT=8081")
+    machine = machine_with_candidate(outer, "--network=host", "-e", "CL_STATUS_PORT=8081")
     state = candidate_state(machine)
     assert state["state"] == "refused", state
     assert "--network=host" in state["reason"] and "docker0" in state["reason"]

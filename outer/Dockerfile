@@ -45,6 +45,10 @@ COPY outer/guard.py outer/init.py outer/core.py outer/broker.py outer/broker_aut
 # a project needs it, and tags it by a hash of these files.
 COPY sandbox/ /opt/cl/sandbox/
 
+# The definition of the web server's image, built (or loaded from /opt/cl/preload) the same way
+# when the container is first ready.
+COPY web/ /opt/cl/web/
+
 # `cl`: the core as a command, for someone with a shell in this container.
 RUN printf '#!/bin/sh\nexec python3 /opt/cl/core.py "$@"\n' > /usr/local/bin/cl && chmod 0755 /usr/local/bin/cl
 
