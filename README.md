@@ -2,7 +2,7 @@
 
 A self-hosted tutor: you learn a technical subject by doing it in a real environment, with a tutor that knows what you already know. One container, no tool on the host.
 
-It is being built. What exists so far is the outer container and, inside it, projects with their sandboxes; there is no web interface yet.
+It is being built. What exists so far is the outer container and, inside it, projects with their sandboxes and the broker that the web interface will talk to; there is no web interface yet.
 
 ## The outer container
 
@@ -69,6 +69,25 @@ notebook-tab: cl-expose 8888
 ```
 
 Use it only for a server that listens on loopback. Listed for a server that listens on all addresses, it takes the port on the sandbox's address first and the server then fails to start there.
+
+## The broker
+
+The broker is the door through which the web interface will ask for anything that touches projects. It is a process of clanker-learn's container, started once the container is ready, and it listens on a unix socket (`/run/cl/broker/broker.sock`) that no sandbox has. Nothing uses it yet; it is here so that the web server, when it comes, has one narrow place to ask.
+
+- It knows a short, closed list of things to do (list, status, create, start, stop, recreate, limits, destroy, and how an operation stands). There is no way through it to the inner Docker itself.
+- Listing the projects, one project's status and how an operation stands need nothing. Everything else needs a session, which a login with the password gives; destroying a project needs the password again.
+- Set the password from the machine clanker-learn runs on. It is read from standard input, or asked for twice without echo at a terminal, and must have at least eight characters:
+
+  ```
+  docker exec -it clanker-learn cl passwd
+  ```
+
+  Setting it ends every session. What is stored is a hash, in the `/data` volume.
+- Create, start, stop, recreate and destroy run in the background, one per project at a time; a second request for a project that is being worked on is answered "busy" at once. The `cl` command and the broker never work on one project at the same time.
+- If the broker ends, clanker-learn starts it again; operations that were running go on. `http://127.0.0.1:8080/state.json` says `broker: up`.
+- The `cl` command inside the container asks for no password: whoever can run it is root in the container already.
+
+It speaks the protocol of RS's broker, so that RS's web server can be brought over with little change.
 
 ## Tests
 
