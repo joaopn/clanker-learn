@@ -35,12 +35,16 @@ import contextlib
 import datetime
 import fcntl
 import hashlib
+import io
 import json
 import os
 import re
+import select
 import shutil
 import subprocess
 import sys
+import tarfile
+import time
 
 DATA = "/data"
 LOCKS = "/run/cl/locks"
@@ -51,6 +55,8 @@ BUILD_TIMEOUT_S = 3600
 SANDBOX_UID = 1000
 SANDBOX_USER = "learner"
 STOP_GRACE_S = 10
+SETUP_STATE = "/var/lib/cl/setup"   # in the sandbox: where its init says how the setup recipe went
+SETUP_STATES = re.compile(r"none|running|done|failed \(exit -?[0-9]{1,3}\)")
 CPU_PERIOD = 100000
 DEFAULT_LIMITS = {"pids": 16384, "memory": None, "cpus": None}
 MIN_PIDS = 64
@@ -441,17 +447,52 @@ def leftovers(name):
     return found
 
 
+def setup_state(container):
+    """How the setup recipe went in this container, as its init wrote it: none, running, done,
+    failed (exit N); "" when it has not said, or said something else. The file is copied out
+    by the daemon (nothing is run in the sandbox) and at most a few kilobytes of it are read:
+    it is the sandbox's to write."""
+    try:
+        archive = first_bytes(["docker", "cp", f"{container}:{SETUP_STATE}", "-"], 8192, 20)
+        with tarfile.open(fileobj=io.BytesIO(archive), mode="r:") as tar:  # a plain archive: no decompressor sees these bytes
+            member = tar.next()
+        if member is None:
+            return ""
+        # A link or a folder has no content, and a long file fails the match below.
+        text = archive[member.offset_data:member.offset_data + member.size].decode(errors="replace").strip()
+    except (OSError, EOFError, tarfile.TarError):
+        return ""
+    return text if SETUP_STATES.fullmatch(text) else ""
+
+
+def first_bytes(command, limit, timeout):
+    """At most `limit` bytes of a command's output, read for at most `timeout` seconds; the
+    command is ended whatever it still had to say."""
+    with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL) as process:
+        try:
+            got, deadline = b"", time.monotonic() + timeout
+            while len(got) < limit and select.select([process.stdout], [], [], max(0, deadline - time.monotonic()))[0]:
+                chunk = os.read(process.stdout.fileno(), limit - len(got))
+                if not chunk:
+                    break
+                got += chunk
+            return got
+        finally:
+            process.kill()
+
+
 def status(name):
     record = read_record(name)
     p = paths(name)
     container = inspect_container(p["container"])
     out = {"name": name, "created": record["created"], "wanted": record["wanted"], "limits": record["limits"],
-           "state": "missing", "address": "", "image": "", "container": ""}
+           "state": "missing", "address": "", "image": "", "container": "", "setup": ""}
     if container:
         out["state"] = "running" if container["State"].get("Running") else "stopped"
         out["address"] = container["NetworkSettings"]["Networks"].get(p["network"], {}).get("IPAddress", "")
         out["image"] = container["Config"].get("Image", "")
         out["container"] = container["Id"][:12]
+        out["setup"] = setup_state(p["container"])
     return out
 
 
@@ -467,7 +508,7 @@ def list_projects():
             out.append(status(name))
         except CoreError as exc:  # the record is fine; the daemon could not say how the sandbox is
             out.append({"name": name, "created": record["created"], "wanted": record["wanted"], "limits": record["limits"],
-                        "state": "unknown", "address": "", "image": "", "container": "", "problem": str(exc)})
+                        "state": "unknown", "address": "", "image": "", "container": "", "setup": "", "problem": str(exc)})
     return out
 
 
@@ -518,6 +559,27 @@ def stop(name):
         if there_is("container", container):
             docker("stop", "-t", str(STOP_GRACE_S), container, timeout=STOP_GRACE_S + 120)
         record["wanted"] = "stopped"
+        write_record(record)
+        return status(name)
+
+
+def recreate(name, say=say_nothing):
+    """A new container for the project, from the current sandbox image, with the same
+    workspace, home folder and network. Its own filesystem is new, so its init runs the setup
+    recipe again, which is how what was installed comes back. The image is made sure of before
+    anything is touched: a recreate that cannot get its image removes nothing."""
+    with locked(name):
+        record = not_being_destroyed(read_record(name))
+        ensure_image(say)
+        container = paths(name)["container"]
+        if there_is("container", container):
+            docker("stop", "-t", str(STOP_GRACE_S), container, timeout=STOP_GRACE_S + 120, check=False)
+            docker("rm", "-f", "-v", container, timeout=STOP_GRACE_S + 120)
+        # From here to the start, a call that is cut short leaves a record without a
+        # container, which the next start (or this command again) completes.
+        ensure(record, say)
+        docker("start", container)
+        record["wanted"] = "running"
         write_record(record)
         return status(name)
 
@@ -609,7 +671,7 @@ def main(argv=None):
     verbs = parser.add_subparsers(dest="verb", required=True)
     verbs.add_parser("list")
     verbs.add_parser("start-wanted")
-    for verb in ("status", "create", "start", "stop", "destroy", "limits"):
+    for verb in ("status", "create", "start", "stop", "recreate", "destroy", "limits"):
         one = verbs.add_parser(verb)
         one.add_argument("name")
         if verb in ("create", "limits"):
@@ -637,6 +699,8 @@ def main(argv=None):
             out = start(args.name, say)
         elif args.verb == "stop":
             out = stop(args.name)
+        elif args.verb == "recreate":
+            out = recreate(args.name, say)
         else:
             out = destroy(args.name)
     except (CoreError, OSError) as exc:
