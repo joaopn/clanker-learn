@@ -13,7 +13,7 @@
   5. The Editor's server, code-server, is started as the sandbox user, with a login's
      environment, on port 8443 of every address, as the files server listens, so that the web
      server, on the project's network, reaches it. It asks for no password of its own (the
-     gate is the web server's project session), sends no telemetry, looks for no update, opens
+     gate is the web server's project session), sends no telemetry, looks for no update, asks no question about trusting the workspace, opens
      /workspace, and keeps its user data in the sandbox user's home, which persists.
   6. The setup recipe, /workspace/.learn/setup.sh, is run as the sandbox user if this
      container has not run it: once per container, so never after a plain stop and start
@@ -126,7 +126,7 @@ def start_files_server(user):
 
 def start_editor(user):
     return as_user(user, ["code-server", "--bind-addr", f"0.0.0.0:{EDITOR_PORT}", "--auth", "none", "--disable-telemetry",
-                          "--disable-update-check", "--user-data-dir", os.path.join(user.pw_dir, ".local/share/code-server"),
+                          "--disable-update-check", "--disable-workspace-trust", "--user-data-dir", os.path.join(user.pw_dir, ".local/share/code-server"),
                           "/workspace"])
 
 
