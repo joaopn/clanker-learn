@@ -13,6 +13,8 @@ creation was cut short is finished by its next start.
     /data/core/provision/<name>       the tutor's public key, the sandbox's SSH host key,
                                       sshd's settings      -> /etc/cl-provision, read-only
     /data/core/keys/<name>            the sandbox's host key pair (what provisioning copies)
+                                      and the Shell password (provisioning gets its hash)
+    /data/core/ports/<name>.json      the project's ports named by hand
     /data/tutor/keys/<name>           the key the tutor logs in with, and known_hosts
     cl-sb-<name>, cl-net-<name>       the container and its network
 
@@ -31,6 +33,7 @@ running destroy again finishes it.
 This module is also the `cl` command: `cl create <name>`, `cl list`, and so on.
 """
 import argparse
+import base64
 import contextlib
 import datetime
 import fcntl
@@ -40,9 +43,11 @@ import ipaddress
 import json
 import os
 import re
+import secrets
 import select
 import shutil
 import ssl
+import string
 import subprocess
 import sys
 import tarfile
@@ -85,10 +90,18 @@ NAME = re.compile(r"[a-z0-9]([a-z0-9-]{0,29}[a-z0-9])?")
 WANTED = ("running", "stopped", "destroying")
 NOT_THERE = re.compile(r"No such (container|image|network|object)|network \S+ not found", re.IGNORECASE)
 UNCHANGED = object()
+SHELL_PASSWORD_CHARS = string.ascii_letters + string.digits
+SHELL_PASSWORD_LENGTH = 32
+CRYPT_HASH = re.compile(r"\$6\$[./A-Za-z0-9]{1,16}\$[./A-Za-z0-9]{86}")   # SHA-512 crypt, as /etc/shadow holds it
+SSH_PORT = 22
+FILES_SERVER_PORT = 7070      # sandbox/files_server.py
+PROC = "/proc"
+PROC_NET_BYTES = 1024 * 1024  # of each socket table: a sandbox can open sockets without end
+LABEL_CHARS = 64
 SSHD_SETTINGS = """\
 # Written by clanker-learn at every start of the sandbox.
 HostKey /etc/cl-provision/ssh_host_ed25519_key
-PasswordAuthentication no
+PasswordAuthentication yes
 KbdInteractiveAuthentication no
 PermitRootLogin no
 AllowUsers learner
@@ -121,6 +134,8 @@ def paths(name):
         "provision": f"{DATA}/core/provision/{name}",
         "host_keys": f"{DATA}/core/keys/{name}",
         "tutor_keys": f"{DATA}/tutor/keys/{name}",
+        "shell_password": f"{DATA}/core/keys/{name}/shell_password",
+        "ports": f"{DATA}/core/ports/{name}.json",
         "container": f"cl-sb-{name}",
         "network": f"cl-net-{name}",
     }
@@ -221,11 +236,14 @@ def new_record(name, limits=None):
 
 
 def write_record(record):
-    path = paths(record["name"])["record"]
+    write_json(paths(record["name"])["record"], record)
+
+
+def write_json(path, data):
     os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
     tmp = path + ".tmp"
     with open(tmp, "w") as fh:
-        json.dump(record, fh, indent=2)
+        json.dump(data, fh, indent=2)
         fh.flush()
         os.fsync(fh.fileno())
     os.replace(tmp, path)
@@ -420,6 +438,48 @@ def read_text(path):
         return fh.read()
 
 
+def shell_password(name, make=False):
+    """The project's Shell password: the sandbox user's, which the web server's terminal logs
+    in with. Made once, with the core's keys for the project (not the tutor's), and kept;
+    "" when there is none and `make` is false."""
+    path = paths(name)["shell_password"]
+    with contextlib.suppress(FileNotFoundError):
+        password = read_text(path).strip()
+        if password or not make:
+            return password
+    if not make:
+        return ""
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    password = "".join(secrets.choice(SHELL_PASSWORD_CHARS) for _ in range(SHELL_PASSWORD_LENGTH))
+    write_file(path, password + "\n", 0o600)
+    return password
+
+
+def crypt_hash(password):
+    """The password's SHA-512 crypt hash, as /etc/shadow holds it. The password reaches openssl
+    on its standard input: a command line can be read by every process of this container. No
+    error text here repeats what openssl said or was given."""
+    try:
+        done = subprocess.run(["openssl", "passwd", "-6", "-stdin"], input=password + "\n",
+                              capture_output=True, text=True, timeout=30, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        raise CoreError("The Shell password could not be hashed: openssl did not run.") from None
+    hashed = done.stdout.strip()
+    if done.returncode != 0 or not CRYPT_HASH.fullmatch(hashed):
+        raise CoreError("The Shell password could not be hashed: openssl did not give a SHA-512 crypt hash.")
+    return hashed
+
+
+def host_fingerprint(name):
+    """The SHA-256 fingerprint of the sandbox's host key, in the form asyncssh gives it
+    (`SHA256:` and the unpadded base64 of the key blob's hash), from the public key file."""
+    try:
+        blob = base64.b64decode(read_text(f"{paths(name)['host_keys']}/ssh_host_ed25519_key.pub").split()[1], validate=True)
+    except (OSError, IndexError, ValueError) as exc:
+        raise CoreError(f"The host key of {name} cannot be read ({type(exc).__name__}); starting the project makes it again.") from exc
+    return "SHA256:" + base64.b64encode(hashlib.sha256(blob).digest()).decode("ascii").rstrip("=")
+
+
 def write_provisioning(name):
     """The provisioning folder, written afresh from what the core holds. Files are replaced in
     place, never the folder: a running sandbox has it mounted."""
@@ -428,6 +488,7 @@ def write_provisioning(name):
     keygen(tutor_key, f"cl-tutor-{name}")
     keygen(host_key, f"cl-sb-{name}")
     host_public = read_text(host_key + ".pub")
+    password = shell_password(name, make=True)
     write_file(f"{p['tutor_keys']}/known_hosts", f"{p['container']} {' '.join(host_public.split()[:2])}\n", 0o644)
     os.makedirs(p["provision"], mode=0o755, exist_ok=True)
     wanted = {
@@ -435,6 +496,7 @@ def write_provisioning(name):
         "sshd_config": (SSHD_SETTINGS, 0o644),
         "ssh_host_ed25519_key": (read_text(host_key), 0o600),
         "ssh_host_ed25519_key.pub": (host_public, 0o644),
+        "shell_password_hash": (crypt_hash(password) + "\n", 0o600),
     }
     for filename, (text, mode) in wanted.items():
         write_file(os.path.join(p["provision"], filename), text, mode)
@@ -498,7 +560,7 @@ def cpu_limit_in_force(container_id, root="/sys/fs/cgroup"):
 def leftovers(name):
     """What exists under a project's name, the record aside."""
     p = paths(name)
-    found = [key for key in FOLDERS if os.path.lexists(p[key])]
+    found = [key for key in (*FOLDERS, "ports") if os.path.lexists(p[key])]
     found += [kind for kind, key in (("container", "container"), ("network", "network")) if there_is(kind, p[key])]
     return found
 
@@ -566,6 +628,215 @@ def list_projects():
             out.append({"name": name, "created": record["created"], "wanted": record["wanted"], "limits": record["limits"],
                         "state": "unknown", "address": "", "image": "", "container": "", "setup": "", "problem": str(exc)})
     return out
+
+
+def running_sandbox(name):
+    """What the daemon says of a project's sandbox, which must be running."""
+    not_being_destroyed(read_record(name))
+    container = inspect_container(paths(name)["container"])
+    if container is None or not container["State"].get("Running"):
+        raise CoreError(f"The sandbox of {name} is not running; start the project first.")
+    return container
+
+
+def attach(name):
+    """Where and how the web server's terminal logs in to a running sandbox: its address on
+    the project's network, sshd's port, the sandbox user, the Shell password, and the host
+    key's fingerprint to hold the connection to. The password is in the result only."""
+    p = paths(name)
+    container = running_sandbox(name)
+    host = (container["NetworkSettings"]["Networks"].get(p["network"]) or {}).get("IPAddress", "")
+    if not host:
+        raise CoreError(f"The sandbox of {name} has no address on {p['network']}; stop and start the project.")
+    password = shell_password(name)
+    if not password:
+        raise CoreError(f"Project {name} has no Shell password yet; stop and start the project to make one.")
+    return {"name": name, "host": host, "port": SSH_PORT, "username": SANDBOX_USER, "password": password,
+            "fingerprint": host_fingerprint(name)}
+
+
+def listening_sockets(text, v6):
+    """(address, port, inode) of each listening socket in a /proc/net/tcp or tcp6 table. The
+    kernel prints each 32-bit word of the address in the host's order (little-endian here).
+    A line that does not parse is passed over: the sandbox's sockets are its own to make."""
+    found, width = [], 32 if v6 else 8
+    for line in text.splitlines()[1:]:
+        fields = line.split()
+        if len(fields) < 10 or fields[3] != "0A":   # 0A: LISTEN
+            continue
+        address, _, port = fields[1].partition(":")
+        try:
+            raw = bytes.fromhex(address)
+            port, inode = int(port, 16), int(fields[9])
+        except ValueError:
+            continue
+        if len(address) != width or not 1 <= port <= 65535:
+            continue
+        raw = b"".join(raw[i:i + 4][::-1] for i in range(0, len(raw), 4))
+        found.append((ipaddress.IPv6Address(raw) if v6 else ipaddress.IPv4Address(raw), port, inode))
+    return found
+
+
+def detected_ports(tcp_text, tcp6_text):
+    """The rows of `port_detect`, from the two tables: one per port something listens on other
+    than on loopback, the sandbox's own services (sshd, the files server) left out."""
+    inodes = {}
+    for text, v6 in ((tcp_text, False), (tcp6_text, True)):
+        for address, port, inode in listening_sockets(text, v6):
+            mapped = getattr(address, "ipv4_mapped", None) or address
+            if mapped.is_loopback or port in (SSH_PORT, FILES_SERVER_PORT):
+                continue
+            inodes.setdefault(port, set()).add(inode)
+    return [{"port": port, "inodes": sorted(inodes[port]), "label": str(port)} for port in sorted(inodes)]
+
+
+def read_bounded(path, limit=PROC_NET_BYTES):
+    """At most `limit` bytes of a file, without a last line the limit cut."""
+    with open(path, errors="replace") as fh:
+        text = fh.read(limit)
+    return text if len(text) < limit else text[:text.rfind("\n") + 1]
+
+
+def port_detect(name):
+    """What listens in a running sandbox, read from this container's side: the socket tables
+    of the network namespace of the sandbox's first process. Nothing is run in the sandbox."""
+    pid = running_sandbox(name)["State"].get("Pid") or 0
+    try:
+        tcp = read_bounded(f"{PROC}/{pid}/net/tcp") if pid > 0 else None
+        tcp6 = ""
+        with contextlib.suppress(FileNotFoundError):  # a kernel without IPv6
+            tcp6 = read_bounded(f"{PROC}/{pid}/net/tcp6")
+    except OSError:
+        tcp = None
+    if tcp is None:
+        raise CoreError(f"The sandbox of {name} is not running; start the project first.")
+    return {"project": name, "running": True, "ports": detected_ports(tcp, tcp6)}
+
+
+# --- ports named by hand -------------------------------------------------------------------
+#
+# A project's registry holds the ports of its sandbox that were named by hand, of two kinds,
+# in RS's entry shape: a web app the detection does not see, {port, label}, to which the web
+# server gives an origin port; and raw TCP, {port, label, passthrough: true, host_port}, which
+# the web server relays from host_port, a port of CL_PASSTHROUGH_PORTS that no other entry
+# of any project holds.
+
+def port_number(value, called):
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 65535:
+        raise CoreError(f"{called} must be a port number from 1 to 65535.")
+    return value
+
+
+def entry_is_sound(entry):
+    if not isinstance(entry, dict) or not isinstance(entry.get("label"), str):
+        return False
+    try:
+        port_number(entry.get("port"), "port")
+        if entry.get("passthrough") is True:
+            return set(entry) == {"port", "label", "passthrough", "host_port"} and bool(port_number(entry["host_port"], "host_port"))
+    except CoreError:
+        return False
+    return set(entry) == {"port", "label"}
+
+
+def read_ports(name):
+    """A project's registry: its entries, [] when it has none."""
+    path = paths(name)["ports"]
+    try:
+        with open(path) as fh:
+            entries = json.load(fh).get("ports")
+    except FileNotFoundError:
+        return []
+    except (OSError, ValueError, AttributeError) as exc:
+        raise CoreError(f"The port registry of {name} cannot be read ({type(exc).__name__}).") from exc
+    if not isinstance(entries, list) or not all(entry_is_sound(entry) for entry in entries):
+        raise CoreError(f"The port registry of {name} cannot be read (an entry is not one).")
+    return entries
+
+
+def claimed_host_ports():
+    """{host port: project} over every project's registry. A registry that cannot be read is
+    an error: a port it may hold must not be given out again."""
+    try:
+        files = os.listdir(f"{DATA}/core/ports")
+    except FileNotFoundError:
+        return {}
+    claimed = {}
+    for filename in sorted(files):
+        name = filename.removesuffix(".json")
+        if filename.endswith(".json") and NAME.fullmatch(name):
+            claimed.update({entry["host_port"]: name for entry in read_ports(name) if entry.get("passthrough")})
+    return claimed
+
+
+def passthrough_range(env=None):
+    env = os.environ if env is None else env
+    return range_setting(env.get("CL_PASSTHROUGH_PORTS", WEB_DEFAULTS["CL_PASSTHROUGH_PORTS"]), "CL_PASSTHROUGH_PORTS")
+
+
+def port_add(name, port, label, passthrough=False, host_port=None, env=None):
+    """Name a port of the sandbox by hand: a web app (passthrough false) or raw TCP on a host
+    port of the pass-through range, the lowest free one unless one is asked for. The sandbox
+    need not run. The result is RS's: the entry's key (host_port for raw TCP, else port), its
+    label, and the project's entries after the change."""
+    valid_name(name)
+    port = port_number(port, "port")
+    if port in (SSH_PORT, FILES_SERVER_PORT):
+        raise CoreError(f"Port {port} is the sandbox's own ({'sshd' if port == SSH_PORT else 'the files server'}).")
+    if not isinstance(label, str) or not label.strip() or len(label.strip()) > LABEL_CHARS or not label.strip().isprintable():
+        raise CoreError(f"label must be a name of 1 to {LABEL_CHARS} printable characters.")
+    label = label.strip()
+    if not isinstance(passthrough, bool):
+        raise CoreError("passthrough must be true or false.")
+    if host_port is not None and not passthrough:
+        raise CoreError("A host port is given only for raw TCP (passthrough).")
+    with locked(name), flocked("ports.lock"):   # the second: a host port is claimed across every project
+        not_being_destroyed(read_record(name))
+        entries = read_ports(name)
+        if any(entry["port"] == port and entry.get("passthrough", False) == passthrough for entry in entries):
+            raise CoreError(f"Port {port} of {name} is named already{' for raw TCP' if passthrough else ''}.")
+        entry = {"port": port, "label": label}
+        if passthrough:
+            low, high = passthrough_range(env)
+            claimed = claimed_host_ports()
+            if host_port is None:
+                host_port = next((candidate for candidate in range(low, high + 1) if candidate not in claimed), None)
+                if host_port is None:
+                    raise CoreError(f"Every port of the pass-through range {low}-{high} is taken.")
+            else:
+                host_port = port_number(host_port, "host_port")
+                if not low <= host_port <= high:
+                    raise CoreError(f"Host port {host_port} is not in the pass-through range {low}-{high}.")
+                if host_port in claimed:
+                    raise CoreError(f"Host port {host_port} is taken by project {claimed[host_port]}.")
+            entry.update(passthrough=True, host_port=host_port)
+        entries = sorted([*entries, entry], key=lambda one: (one["port"], one.get("host_port", 0)))
+        write_json(paths(name)["ports"], {"ports": entries})
+    return {"project": name, "port": host_port if passthrough else port, "label": label, "ports": entries}
+
+
+def port_remove(name, port, passthrough=False):
+    """Take an entry out: for raw TCP `port` is its host port, else the sandbox's port. An
+    entry that is not there is gone already."""
+    valid_name(name)
+    port = port_number(port, "port")
+    if not isinstance(passthrough, bool):
+        raise CoreError("passthrough must be true or false.")
+
+    def matches(entry):
+        return entry.get("host_port") == port if passthrough else entry["port"] == port and not entry.get("passthrough")
+    with locked(name), flocked("ports.lock"):
+        not_being_destroyed(read_record(name))
+        entries = read_ports(name)
+        kept = [entry for entry in entries if not matches(entry)]
+        if kept != entries:
+            write_json(paths(name)["ports"], {"ports": kept})
+    return {"project": name, "port": port, "ports": kept}
+
+
+def port_list(name):
+    read_record(name)
+    return {"project": name, "ports": read_ports(name)}
 
 
 def create(name, limits=None, say=say_nothing):
@@ -669,7 +940,7 @@ def remove_everything(name):
                 break
         if done.returncode != 0:
             problems.append(f"the network ({done.stderr.strip()[-200:]})")
-    for key in FOLDERS:
+    for key in (*FOLDERS, "ports"):
         try:
             if os.path.isdir(p[key]) and not os.path.islink(p[key]):
                 shutil.rmtree(p[key])  # does not follow a link found inside
@@ -677,6 +948,8 @@ def remove_everything(name):
                 os.remove(p[key])
         except OSError as exc:
             problems.append(f"{p[key]} ({exc})")
+    with contextlib.suppress(OSError):
+        os.remove(p["ports"] + ".tmp")
     if problems:
         raise CoreError(f"Not everything of {name} could be removed: " + "; ".join(problems) + f". Run `destroy {name}` again.")
     for record in (p["record"] + ".tmp", p["record"]):
@@ -758,20 +1031,23 @@ def web_settings(env, status_port):
 
 def web_args(settings, image):
     """What `docker create` is given for the web server's container: no capability and no
-    way to gain one, the front network pinned as the one its published port lives on, the
+    way to gain one, the front network pinned as the one its published ports live on (the
+    page's, and the two ranges: web apps' origin ports and raw TCP's pass-through ports), the
     broker's socket folder read-only, its own folder of the data volume, and nothing of a
     project. The label is a hash of all of it: a container made from another image or with
     other settings is told by it and made again."""
     port = settings["port"]
+    origin, passthrough = ("{}-{}".format(*settings[key]) for key in ("origin", "passthrough"))
     args = [
         "--name", WEB_CONTAINER, "--hostname", WEB_CONTAINER, "--network", f"name={FRONT_NET},gw-priority=1",
         "--label", "cl.role=web",
         "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--pids-limit", str(WEB_PIDS),
         "--log-opt", "max-size=10m", "--log-opt", "max-file=3",
-        "-p", f"{port}:{port}",
+        "-p", f"{port}:{port}", "-p", f"{origin}:{origin}", "-p", f"{passthrough}:{passthrough}",
         "--mount", f"type=bind,source={BROKER_RUN},target=/run/cl-broker,readonly",
         "--mount", f"type=bind,source={DATA}/web,target=/data",
         "-e", f"CL_WEB_PORT={port}", "-e", f"CL_LISTEN_SUBNET={FRONT_SUBNET}",
+        "-e", f"CL_ORIGIN_PORTS={origin}", "-e", f"CL_PASSTHROUGH_PORTS={passthrough}",
     ]
     made_from = hashlib.sha256(json.dumps([args, image]).encode()).hexdigest()[:16]
     return [*args, "--label", f"cl.made-from={made_from}", image]

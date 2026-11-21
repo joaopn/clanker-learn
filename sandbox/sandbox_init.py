@@ -4,10 +4,11 @@
   1. An empty home folder is filled from the system's skeleton (the home is a folder of
      clanker-learn's data volume, empty when the project is new).
   2. What the provisioning folder holds is installed: the tutor's public key as the sandbox
-     user's authorized_keys, and the sshd settings. The core rewrites that folder before every
-     start and mounts it read-only, so a project made by an earlier version gains what a later
-     one adds without being recreated.
-  3. sshd is started: the tutor's way in. Its host key is the one in the provisioning folder.
+     user's authorized_keys, the sshd settings, and the Shell password (its hash) as the
+     sandbox user's password, which the web server's terminal logs in with. The core rewrites
+     that folder before every start and mounts it read-only, so a project made by an earlier
+     version gains what a later one adds without being recreated.
+  3. sshd is started: the tutor's way in, and the Shell's. Its host key is the one in the provisioning folder.
   4. The files server is started as the sandbox user.
   5. The setup recipe, /workspace/.learn/setup.sh, is run as the sandbox user if this
      container has not run it: once per container, so never after a plain stop and start
@@ -46,6 +47,7 @@ SETUP_LOG = "/var/log/cl/setup.log"
 SERVICE_NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,31}")
 MAX_SERVICES = 64
 SERVICES_BYTES = 64 * 1024
+CRYPT_HASH = re.compile(r"\$6\$[./A-Za-z0-9]{1,16}\$[./A-Za-z0-9]{86}")   # as the core writes it
 
 
 def log(message):
@@ -85,6 +87,24 @@ def install_provisioning(provision, home, uid, gid, sshd_config=SSHD_CONFIG):
         os.makedirs(os.path.dirname(sshd_config), exist_ok=True)
         shutil.copyfile(settings, sshd_config)
         os.chmod(sshd_config, 0o644)
+
+
+def set_password(provision=PROVISION, user=USER, run=subprocess.run):
+    """Set the sandbox user's password from the hash in the provisioning folder, on chpasswd's
+    standard input. Without the file the account is left as it is. True when it was set."""
+    try:
+        with open(os.path.join(provision, "shell_password_hash")) as fh:
+            hashed = fh.read(4096).strip()
+    except FileNotFoundError:
+        return False
+    if not CRYPT_HASH.fullmatch(hashed):
+        log("the Shell password's hash is not one; the account's password is left as it is")
+        return False
+    done = run(["chpasswd", "-e"], input=f"{user}:{hashed}\n".encode(), capture_output=True, timeout=30, check=False)
+    if done.returncode != 0:
+        log(f"the Shell password could not be set: {done.stderr.decode(errors='replace').strip()[-200:]}")
+        return False
+    return True
 
 
 def start_sshd():
@@ -267,6 +287,10 @@ def main():
         install_provisioning(PROVISION, user.pw_dir, user.pw_uid, user.pw_gid)
     except OSError as exc:
         log(f"the provisioning could not be installed: {exc}")
+    try:
+        set_password()   # before sshd starts
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        log(f"the Shell password could not be set: {exc}")
     services = {"sshd": start_sshd, "the files server": lambda: start_files_server(user)}
     running, tried = {}, {}
     # The recipe first, then what the services file lists, which may need what it installed.

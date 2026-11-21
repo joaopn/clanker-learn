@@ -1,5 +1,6 @@
 """The parts of the core and of the sandbox's own programs that are decided without a daemon."""
 import io
+import json
 import os
 import subprocess
 import tarfile
@@ -45,6 +46,8 @@ def test_every_path_and_docker_name_of_a_project_is_built_from_its_name(monkeypa
         "provision": "/data/core/provision/kafka",
         "host_keys": "/data/core/keys/kafka",
         "tutor_keys": "/data/tutor/keys/kafka",
+        "shell_password": "/data/core/keys/kafka/shell_password",
+        "ports": "/data/core/ports/kafka.json",
         "container": "cl-sb-kafka",
         "network": "cl-net-kafka",
     }
@@ -777,16 +780,17 @@ def test_the_web_servers_container_is_created_fenced_and_with_its_two_mounts(mon
     monkeypatch.setattr(core, "DATA", "/data")
     args = core.web_args({"port": 7788, "origin": (11100, 11164), "passthrough": (11200, 11299)}, "cl-web:abc")
     # The whole list, so that nothing can be added to it unseen: no capability, no privilege,
-    # no restart policy, nothing of a project, one published port.
+    # no restart policy, nothing of a project, the page's port and the two ranges published.
     assert args[:-3] == [
         "--name", "cl-web", "--hostname", "cl-web", "--network", "name=cl-front,gw-priority=1",
         "--label", "cl.role=web",
         "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--pids-limit", "512",
         "--log-opt", "max-size=10m", "--log-opt", "max-file=3",
-        "-p", "7788:7788",
+        "-p", "7788:7788", "-p", "11100-11164:11100-11164", "-p", "11200-11299:11200-11299",
         "--mount", "type=bind,source=/run/cl/broker,target=/run/cl-broker,readonly",
         "--mount", "type=bind,source=/data/web,target=/data",
         "-e", "CL_WEB_PORT=7788", "-e", "CL_LISTEN_SUBNET=10.209.0.0/24",
+        "-e", "CL_ORIGIN_PORTS=11100-11164", "-e", "CL_PASSTHROUGH_PORTS=11200-11299",
     ]
     assert args[-3] == "--label" and args[-2].startswith("cl.made-from=") and len(args[-2]) == len("cl.made-from=") + 16
     assert args[-1] == "cl-web:abc"
@@ -1431,3 +1435,226 @@ def test_a_sandbox_image_that_fails_leaves_the_web_server_up_and_is_not_tried_ag
     _, reports, _, _, images = keep_web_with(monkeypatch, [ABSENT, UP, UP, UP], sandbox_image=failed)
     assert reports[-1] == ("sandbox_image", "failed: The sandbox image could not be built: no network")
     assert [r for r in reports if r[0] == "web"][-1] == ("web", "up") and images == ["sandbox"]
+
+
+# --- the Shell's password and login ----------------------------------------------------------
+
+HOST_PUBLIC = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFuQY96dMIi969HDZQuBi0c3I/01XhZ9te8rSEQfKPZD cl-sb-kafka\n"
+HOST_FINGERPRINT = "SHA256:R0lwxQigpMClG95RC9zlQ/nOXa23/2N1ZIPc6EJpBAw"   # what `ssh-keygen -lf` says of HOST_PUBLIC
+A_HASH = "$6$saltsalt$" + "a" * 86
+
+
+def test_the_shell_password_is_made_once_kept_and_handed_over_as_its_hash(monkeypatch, tmp_path):
+    """Real ssh-keygen and openssl: the password is 32 letters and digits, 0600 with the
+    core's keys, the same after a second provisioning; the provisioning folder holds its
+    hash (which openssl gives back for the same salt) and not the password."""
+    monkeypatch.setattr(core, "DATA", str(tmp_path))
+    core.write_provisioning("kafka")
+    p = core.paths("kafka")
+    password = core.shell_password("kafka")
+    assert len(password) == 32 and password.isalnum() and os.path.dirname(p["shell_password"]) == p["host_keys"]
+    assert oct(os.stat(p["shell_password"]).st_mode & 0o777) == "0o600"
+    core.write_provisioning("kafka")
+    assert core.shell_password("kafka") == password
+    hashed = (tmp_path / "core" / "provision" / "kafka" / "shell_password_hash").read_text().strip()
+    assert core.CRYPT_HASH.fullmatch(hashed) and oct(os.stat(f"{p['provision']}/shell_password_hash").st_mode & 0o777) == "0o600"
+    salt = hashed.split("$")[2]
+    again = subprocess.run(["openssl", "passwd", "-6", "-salt", salt, "-stdin"], input=password + "\n", capture_output=True, text=True, check=True)
+    assert again.stdout.strip() == hashed
+    assert not any(password in f.read_text(errors="replace") for f in tmp_path.rglob("*") if f.is_file() and str(f) != p["shell_password"])
+    assert "PasswordAuthentication yes" in (tmp_path / "core" / "provision" / "kafka" / "sshd_config").read_text()
+
+
+def stand_in_openssl(tmp_path, monkeypatch, prints, status=0):
+    """An `openssl` first on the PATH that writes down its arguments and standard input."""
+    folder = tmp_path / "bin"
+    folder.mkdir()
+    script = folder / "openssl"
+    script.write_text(f'#!/bin/sh\nprintf "%s\\n" "$@" > "{tmp_path}/args"\ncat > "{tmp_path}/stdin"\necho \'{prints}\'\nexit {status}\n')
+    script.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{folder}:{os.environ['PATH']}")
+
+
+def test_openssl_gets_the_password_on_standard_input_and_never_in_its_arguments(monkeypatch, tmp_path):
+    stand_in_openssl(tmp_path, monkeypatch, A_HASH)
+    assert core.crypt_hash("TheShellPassword") == A_HASH
+    assert (tmp_path / "args").read_text() == "passwd\n-6\n-stdin\n"
+    assert (tmp_path / "stdin").read_text() == "TheShellPassword\n"
+
+
+def test_an_openssl_that_fails_is_an_error_that_does_not_repeat_the_password(monkeypatch, tmp_path):
+    stand_in_openssl(tmp_path, monkeypatch, "TheShellPassword", status=1)
+    with pytest.raises(core.CoreError) as refused:
+        core.crypt_hash("TheShellPassword")
+    assert "TheShellPassword" not in str(refused.value)
+
+
+def test_the_host_keys_fingerprint_is_the_one_ssh_keygen_gives(monkeypatch, tmp_path):
+    monkeypatch.setattr(core, "DATA", str(tmp_path))
+    keys = tmp_path / "core" / "keys" / "kafka"
+    keys.mkdir(parents=True)
+    (keys / "ssh_host_ed25519_key.pub").write_text(HOST_PUBLIC)
+    assert core.host_fingerprint("kafka") == HOST_FINGERPRINT
+
+
+def sandbox_of(running, address="172.18.0.2", pid=4242):
+    return {"Id": "c" * 64, "State": {"Running": running, "Pid": pid if running else 0},
+            "NetworkSettings": {"Networks": {"cl-net-kafka": {"IPAddress": address}}}}
+
+
+@pytest.fixture
+def project(monkeypatch, tmp_path):
+    """A recorded project kafka with its host key and Shell password, and a sandbox the test says is running or not."""
+    monkeypatch.setattr(core, "DATA", str(tmp_path))
+    monkeypatch.setattr(core, "LOCKS", str(tmp_path / "locks"))
+    core.write_record(core.new_record("kafka"))
+    keys = tmp_path / "core" / "keys" / "kafka"
+    keys.mkdir(parents=True)
+    (keys / "ssh_host_ed25519_key.pub").write_text(HOST_PUBLIC)
+    (keys / "shell_password").write_text("TheShellPassword\n")
+    sandbox = {"now": sandbox_of(True)}
+    monkeypatch.setattr(core, "inspect_container", lambda name: sandbox["now"] if name == "cl-sb-kafka" else None)
+    return sandbox
+
+
+def test_attach_gives_a_running_sandboxs_login_and_refuses_any_other(project):
+    assert core.attach("kafka") == {"name": "kafka", "host": "172.18.0.2", "port": 22, "username": "learner",
+                                    "password": "TheShellPassword", "fingerprint": HOST_FINGERPRINT}
+    for sandbox, why in ((sandbox_of(False), "is not running"), (None, "is not running"), (sandbox_of(True, address=""), "has no address")):
+        project["now"] = sandbox
+        with pytest.raises(core.CoreError, match=why) as refused:
+            core.attach("kafka")
+        assert "TheShellPassword" not in str(refused.value)
+    with pytest.raises(core.CoreError, match="There is no project named other"):
+        core.attach("other")
+
+
+# --- what listens in a sandbox ---------------------------------------------------------------
+
+TCP = """\
+  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 00000000:1F40 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 101 1 0000000000000000 100 0 0 10 0
+   1: 0100007F:22B8 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 102 1 0000000000000000 100 0 0 10 0
+   2: 020012AC:1388 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 103 1 0000000000000000 100 0 0 10 0
+   3: 020012AC:1F41 0A0012AC:C350 01 00000000:00000000 00:00000000 00000000  1000        0 104 1 0000000000000000 100 0 0 10 0
+   4: 00000000:0016 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 105 1 0000000000000000 100 0 0 10 0
+   5: 00000000:1B9E 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 106 1 0000000000000000 100 0 0 10 0
+   6: not a line at all
+"""
+TCP6 = """\
+  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 00000000000000000000000000000000:0BB8 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 201 1 0000000000000000 100 0 0 10 0
+   1: 00000000000000000000000001000000:2328 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 202 1 0000000000000000 100 0 0 10 0
+   2: 0000000000000000FFFF00000100007F:2329 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 203 1 0000000000000000 100 0 0 10 0
+   3: 00000000000000000000000000000000:1F40 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 204 1 0000000000000000 100 0 0 10 0
+"""
+
+
+def test_the_socket_tables_are_read_as_the_kernel_writes_them():
+    assert [(str(a), port, inode) for a, port, inode in core.listening_sockets(TCP, False)] == [
+        ("0.0.0.0", 8000, 101), ("127.0.0.1", 8888, 102), ("172.18.0.2", 5000, 103), ("0.0.0.0", 22, 105), ("0.0.0.0", 7070, 106)]
+    assert [(str(a), port) for a, port, _ in core.listening_sockets(TCP6, True)] == [("::", 3000), ("::1", 9000), ("::ffff:127.0.0.1", 9001), ("::", 8000)]
+
+
+def test_detection_leaves_out_loopback_and_the_sandboxs_own_services():
+    assert core.detected_ports(TCP, TCP6) == [{"port": 3000, "inodes": [201], "label": "3000"},
+                                              {"port": 5000, "inodes": [103], "label": "5000"},
+                                              {"port": 8000, "inodes": [101, 204], "label": "8000"}]
+
+
+def test_detection_reads_the_sandboxs_tables_from_this_side_and_refuses_a_stopped_one(project, monkeypatch, tmp_path):
+    monkeypatch.setattr(core, "PROC", str(tmp_path / "proc"))
+    (tmp_path / "proc" / "4242" / "net").mkdir(parents=True)
+    (tmp_path / "proc" / "4242" / "net" / "tcp").write_text(TCP)
+    assert core.port_detect("kafka") == {"project": "kafka", "running": True, "ports": core.detected_ports(TCP, "")}
+    project["now"] = sandbox_of(False)
+    with pytest.raises(core.CoreError, match="is not running"):
+        core.port_detect("kafka")
+
+
+# --- ports named by hand ---------------------------------------------------------------------
+
+@pytest.fixture
+def registry(monkeypatch, tmp_path):
+    monkeypatch.setattr(core, "DATA", str(tmp_path))
+    monkeypatch.setattr(core, "LOCKS", str(tmp_path / "locks"))
+    monkeypatch.delenv("CL_PASSTHROUGH_PORTS", raising=False)
+    for name in ("kafka", "pg"):
+        core.write_record(core.new_record(name))
+    return tmp_path
+
+
+def test_a_web_port_is_named_listed_refused_twice_and_removed(registry):
+    assert core.port_add("kafka", 8000, " notebook ") == {"project": "kafka", "port": 8000, "label": "notebook",
+                                                          "ports": [{"port": 8000, "label": "notebook"}]}
+    with pytest.raises(core.CoreError, match="named already"):
+        core.port_add("kafka", 8000, "again")
+    assert core.port_list("kafka") == {"project": "kafka", "ports": [{"port": 8000, "label": "notebook"}]}
+    assert core.port_list("pg") == {"project": "pg", "ports": []}
+    assert core.port_remove("kafka", 8000) == {"project": "kafka", "port": 8000, "ports": []}
+    assert core.port_remove("kafka", 8000) == {"project": "kafka", "port": 8000, "ports": []}   # gone already
+
+
+def test_raw_tcp_gets_the_lowest_free_host_port_or_the_one_asked_for(registry):
+    assert core.port_add("kafka", 9092, "kafka", passthrough=True)["port"] == 11200
+    assert core.port_add("kafka", 9093, "kafka 2", passthrough=True, host_port=11205)["port"] == 11205
+    assert core.port_add("pg", 5432, "postgres", passthrough=True)["port"] == 11201
+    added = core.port_add("kafka", 9092, "the same port, as a web app")
+    web, first, second = ({"port": 9092, "label": "the same port, as a web app"}, {"port": 9092, "label": "kafka", "passthrough": True, "host_port": 11200},
+                          {"port": 9093, "label": "kafka 2", "passthrough": True, "host_port": 11205})
+    assert added["ports"] == [web, first, second]
+    assert core.port_remove("kafka", 11200, passthrough=True)["ports"] == [web, second]
+    assert json.loads((registry / "core" / "ports" / "kafka.json").read_text()) == {"ports": [web, second]}
+
+
+def test_a_host_port_held_by_another_project_is_not_given_out(registry):
+    core.port_add("pg", 5432, "postgres", passthrough=True, host_port=11200)
+    with pytest.raises(core.CoreError, match="Host port 11200 is taken by project pg"):
+        core.port_add("kafka", 9092, "kafka", passthrough=True, host_port=11200)
+    assert core.port_add("kafka", 9092, "kafka", passthrough=True)["port"] == 11201
+    assert core.port_list("kafka")["ports"] == [{"port": 9092, "label": "kafka", "passthrough": True, "host_port": 11201}]
+
+
+def test_the_pass_through_range_comes_from_the_setting_and_can_run_out(registry, monkeypatch):
+    monkeypatch.setenv("CL_PASSTHROUGH_PORTS", "12000-12001")
+    assert [core.port_add("kafka", port, "p", passthrough=True)["port"] for port in (1, 2)] == [12000, 12001]
+    with pytest.raises(core.CoreError, match="Every port of the pass-through range 12000-12001 is taken"):
+        core.port_add("pg", 3, "p", passthrough=True)
+    with pytest.raises(core.CoreError, match="not in the pass-through range 12000-12001"):
+        core.port_add("pg", 3, "p", passthrough=True, host_port=11200)
+
+
+@pytest.mark.parametrize("args, why", [
+    (("kafka", 22, "ssh"), "the sandbox's own"), (("kafka", 7070, "files"), "the sandbox's own"), (("kafka", 0, "p"), "port must be"),
+    (("kafka", 65536, "p"), "port must be"), (("kafka", True, "p"), "port must be"), (("kafka", "80", "p"), "port must be"),
+    (("kafka", 80, ""), "label must be"), (("kafka", 80, "x" * 65), "label must be"), (("kafka", 80, "a\nb"), "label must be"),
+    (("kafka", 80, None), "label must be"), (("kafka", 80, "p", "yes"), "passthrough must be"),
+    (("kafka", 80, "p", False, 11200), "only for raw TCP"), (("kafka", 80, "p", True, "11200"), "host_port must be"),
+    (("other", 80, "p"), "There is no project named other")])
+def test_a_port_that_cannot_be_named_is_refused_and_nothing_is_written(registry, args, why):
+    with pytest.raises(core.CoreError, match=why):
+        core.port_add(*args)
+    assert not (registry / "core" / "ports").exists()
+
+
+def test_the_registry_goes_with_the_project(registry, monkeypatch):
+    core.port_add("kafka", 8000, "notebook")
+    monkeypatch.setattr(core, "docker", lambda *args, **kwargs: answer(1, "Error response from daemon: No such container: x"))
+    core.destroy("kafka")
+    assert not (registry / "core" / "ports" / "kafka.json").exists()
+
+
+# --- the sandbox's init: the Shell password ----------------------------------------------------
+
+def test_the_sandbox_user_gets_the_password_from_its_hash_and_keeps_its_own_without_one(tmp_path):
+    ran = []
+
+    def run(command, **given):
+        ran.append((command, given["input"]))
+        return subprocess.CompletedProcess(command, 0, b"", b"")
+    assert sandbox_init.set_password(str(tmp_path), run=run) is False and ran == []       # no file: left as it is
+    (tmp_path / "shell_password_hash").write_text("not a hash\n")
+    assert sandbox_init.set_password(str(tmp_path), run=run) is False and ran == []
+    (tmp_path / "shell_password_hash").write_text(A_HASH + "\n")
+    assert sandbox_init.set_password(str(tmp_path), run=run) is True
+    assert ran == [(["chpasswd", "-e"], f"learner:{A_HASH}\n".encode())]

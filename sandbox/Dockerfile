@@ -8,7 +8,8 @@
 FROM debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2
 
 # What a learning environment starts from: a shell user's tools, Python and Node with their
-# package managers, a compiler, and sshd for the tutor's way in. Recommended packages are left
+# package managers, a compiler, sshd for the tutor's way in and the Shell's, and tmux, which
+# keeps the Shell's session when its page is closed. Recommended packages are left
 # out. The host keys the package makes at install are removed: every sandbox gets its own from
 # its provisioning folder.
 RUN set -eux; \
@@ -16,7 +17,7 @@ RUN set -eux; \
     apt-get install -y --no-install-recommends \
         ca-certificates tini sudo openssh-server openssh-client \
         python3 python3-venv python3-pip nodejs npm build-essential \
-        git curl less nano procps iproute2 iputils-ping; \
+        git curl less nano procps iproute2 iputils-ping tmux; \
     rm -rf /var/lib/apt/lists/*; \
     rm -f /etc/ssh/ssh_host_*
 

@@ -27,13 +27,25 @@ One request per connection, handled one at a time. Containment, by construction:
     whether a first password can be set now; `first_password` sets it, never over an existing
     one, and ten wrong codes within a minute shut it for a minute. Its code and proof reach no
     log, no audit line and no child.
+  * `attach` hands out what the web server's terminal logs in to a running sandbox with,
+    the project's Shell password among it. It needs a token, is audited (the outcome only)
+    and is answered at once, without the project's lock; the password is in the reply and
+    nowhere else: no log, no audit line, no error text.
   * Step-up: `destroy` needs the proof again in the request. It is checked after the token,
     so a caller without a token never learns that it exists, and it is taken out of the
     request there: it reaches no log and no child.
   * Each verb takes only its own fields; any other is refused.
+  * The ports: `port_detect` reads what listens in a running sandbox from this container's
+    side (nothing is run in the sandbox) and is not audited, since the page polls it.
+    `port_add`, `port_remove` and `port_list` keep the core's registry of the ports named by
+    hand; the first two are audited. All four need a token. Like `limits`, `port_add` and
+    `port_remove` are answered at once under the project's lock, taken without waiting.
   * The gates come in this order: a changed password's end of sessions, auth verbs, unknown verb, args an object, the set-up verbs,
-    token, step-up, the verb's fields and name, op_id, the project's lock. A caller without a
-    token learns nothing beyond the three open reads and whether a first password can be set.
+    token, step-up, the verb's fields and name, then the verb's own: op_id and the project's
+    lock for an operation, the project's lock for limits, port_add and port_remove, nothing
+    more for attach, port_detect and port_list (the core checks the rest of every verb's
+    fields). A caller without a token learns nothing beyond the three open reads and whether
+    a first password can be set.
   * The socket is 0600 and the peer must be this process's own user.
   * A request larger than MAX_REQUEST_BYTES is refused before its body is read, and a
     request that has not arrived whole within READ_TIMEOUT_S is dropped.
@@ -97,6 +109,10 @@ SETUP_VERBS = frozenset({"setup_needed", "first_password"})
 OPEN_VERBS = frozenset({"list", "status", "op"})
 STEP_UP_VERBS = frozenset({"destroy"})
 OP_VERBS = frozenset({"create", "start", "stop", "recreate", "destroy"})
+# Audited like the operations: `attach` hands out a credential, the others change something.
+AUDITED_VERBS = OP_VERBS | {"limits", "attach", "port_add", "port_remove"}
+# Answered by this process at once, under the project's lock taken without waiting.
+LOCKED_VERBS = frozenset({"limits", "port_add", "port_remove"})
 LIMITS = ("pids", "memory", "cpus")
 FIELDS = {
     "list": frozenset(),
@@ -110,6 +126,11 @@ FIELDS = {
     "recreate": frozenset({"name"}),
     "limits": frozenset({"name", *LIMITS}),
     "destroy": frozenset({"name"}),
+    "attach": frozenset({"name"}),
+    "port_detect": frozenset({"name"}),
+    "port_add": frozenset({"name", "port", "label", "passthrough", "host_port"}),
+    "port_remove": frozenset({"name", "port", "passthrough"}),
+    "port_list": frozenset({"name"}),
     "setup_needed": frozenset(),
     "first_password": frozenset({"code", "proof"}),
 }
@@ -517,7 +538,7 @@ def dispatch(verb, args, token=None, tokens=None, *, op_id=None, audit=None, spa
         principal = tokens.principal_for(token) if tokens is not None else None
         if principal is None:
             return audited(None, "unauthorized", err("unauthorized", "a valid session token is required; call login"))
-    write = verb in OP_VERBS or verb == "limits"
+    write = verb in AUDITED_VERBS
 
     def answered(outcome, reply):
         return audited(principal, outcome, reply) if write else reply
@@ -552,14 +573,25 @@ def dispatch(verb, args, token=None, tokens=None, *, op_id=None, audit=None, spa
         if verb == "lifecycle_active":
             return ok({"ops": ops_in_flight()})
 
-        if verb == "limits":
-            changed = limits_named(args)
+        if verb == "attach":
+            return answered("ok", ok(core.attach(name)))
+        if verb == "port_detect":
+            return ok(core.port_detect(name))
+        if verb == "port_list":
+            return ok(core.port_list(name))
+
+        if verb in LOCKED_VERBS:
+            changed = limits_named(args) if verb == "limits" else None
             held = core.try_lock(name)
             if held is None:
                 raise Refuse("busy", f"Something else is being done with {name}; try again when it is over.")
             core.HELD.add(name)
             try:
-                return answered("ok", ok(core.set_limits(name, **changed)))
+                if verb == "limits":
+                    return answered("ok", ok(core.set_limits(name, **changed)))
+                if verb == "port_add":
+                    return answered("ok", ok(core.port_add(name, args.get("port"), args.get("label"), args.get("passthrough", False), args.get("host_port"))))
+                return answered("ok", ok(core.port_remove(name, args.get("port"), args.get("passthrough", False))))
             finally:
                 core.HELD.discard(name)
                 held.close()
@@ -640,8 +672,9 @@ class Handler(socketserver.StreamRequestHandler):
                              spawn=lambda spec: spawn_child(spec, server.children), sync_tokens=server.sync_tokens,
                              setup=server.setup)
         except Exception as exc:  # noqa: BLE001 - one request's fault is that request's failure, not the broker's end
-            if message.get("verb") == "first_password":
-                log(f"a first_password request failed in a way it does not know ({type(exc).__name__})")  # its text may hold the code or the proof
+            if message.get("verb") in ("first_password", "attach"):
+                # Its text may hold the set-up code, the proof or the Shell password.
+                log(f"a {message.get('verb')} request failed in a way it does not know ({type(exc).__name__})")
             else:
                 traceback.print_exc()
             reply = err("failed", f"the broker failed in a way it does not know ({type(exc).__name__})")

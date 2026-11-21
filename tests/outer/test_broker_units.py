@@ -38,6 +38,9 @@ def world(monkeypatch, tmp_path):
     monkeypatch.setattr(core, "status", lambda name: {"name": name, "state": "running"})
     limits_set = []
     monkeypatch.setattr(core, "set_limits", lambda name, **changed: limits_set.append((name, changed, set(core.HELD))) or {"name": name, "notes": []})
+    ports_asked = []   # (what, the arguments, the locks held then)
+    for what in ("attach", "port_detect", "port_add", "port_remove", "port_list"):
+        monkeypatch.setattr(core, what, lambda *given, what=what: ports_asked.append((what, given, set(core.HELD))) or {"asked": what})
 
     class World:
         clock = Clock()
@@ -54,6 +57,7 @@ def world(monkeypatch, tmp_path):
 
     one = World()
     one.limits_set = limits_set
+    one.ports_asked = ports_asked
     return one
 
 
@@ -71,8 +75,8 @@ def read(path):
 def test_a_verb_that_is_not_in_the_table_is_unknown_and_nothing_passes_through(world):
     for verb in ("docker", "exec", "update", "passwd", "", None, 7, "__run-op"):
         assert kind(world.call(verb)) == "unknown_verb"
-    assert sorted(broker.FIELDS) == ["build_alive", "create", "destroy", "first_password", "lifecycle_active", "limits", "list", "op", "recreate",
-                                     "setup_needed", "start", "status", "stop"]
+    assert sorted(broker.FIELDS) == ["attach", "build_alive", "create", "destroy", "first_password", "lifecycle_active", "limits", "list", "op",
+                                     "port_add", "port_detect", "port_list", "port_remove", "recreate", "setup_needed", "start", "status", "stop"]
 
 
 def test_arguments_that_are_not_an_object_are_a_bad_request(world):
@@ -106,12 +110,14 @@ def test_with_no_password_set_login_fails_like_a_wrong_one(monkeypatch, tmp_path
 
 @pytest.mark.parametrize("verb, args", [("create", {"name": "kafka"}), ("start", {"name": "kafka"}), ("stop", {"name": "kafka"}),
                                         ("recreate", {"name": "kafka"}), ("limits", {"name": "kafka", "pids": 100}),
-                                        ("destroy", {"name": "kafka", "proof": PROOF}), ("build_alive", {"op_id": "a"}), ("lifecycle_active", {})])
+                                        ("destroy", {"name": "kafka", "proof": PROOF}), ("build_alive", {"op_id": "a"}), ("lifecycle_active", {}),
+                                        ("attach", {"name": "kafka"}), ("port_detect", {"name": "kafka"}), ("port_list", {"name": "kafka"}),
+                                        ("port_add", {"name": "kafka", "port": 8000, "label": "app"}), ("port_remove", {"name": "kafka", "port": 8000})])
 def test_everything_but_the_open_reads_needs_a_token(world, verb, args):
     for token in (None, "", "made-up", 7):
         reply = world.call(verb, args, token=token, op_id="op-1")
         assert kind(reply) == "unauthorized" and world.audited[-1] == (None, verb, "unauthorized")
-    assert world.spawned == [] and world.limits_set == []
+    assert world.spawned == [] and world.limits_set == [] and world.ports_asked == []
     assert kind(world.call(verb, args, token=world.login(), op_id="op-1")) == "ok"
 
 
@@ -192,12 +198,15 @@ def test_no_other_verb_takes_a_proof(world):
 # --- fields, names, limits -------------------------------------------------------------------
 
 @pytest.mark.parametrize("verb, args", [("list", {"name": "kafka"}), ("status", {"name": "kafka", "verbose": True}), ("create", {"name": "kafka", "image": "evil"}),
-                                        ("start", {"name": "kafka", "all": True}), ("limits", {"name": "kafka", "disk": 5}), ("op", {"op_id": "a", "name": "kafka"})])
+                                        ("start", {"name": "kafka", "all": True}), ("limits", {"name": "kafka", "disk": 5}), ("op", {"op_id": "a", "name": "kafka"}),
+                                        ("attach", {"name": "kafka", "host": "203.0.113.9"}), ("port_detect", {"name": "kafka", "deadline": 5}),
+                                        ("port_add", {"name": "kafka", "port": 8000, "label": "app", "count": 2}),
+                                        ("port_remove", {"name": "kafka", "port": 8000, "label": "app"})])
 def test_a_field_that_is_not_the_verbs_is_refused_not_dropped(world, verb, args):
     reply = world.call(verb, args, token=world.login(), op_id="op-1")
     assert kind(reply) == "validation" and "not [" in reply["error"]["message"]
-    assert world.spawned == [] and world.limits_set == []
-    if verb in ("create", "start", "limits"):
+    assert world.spawned == [] and world.limits_set == [] and world.ports_asked == []
+    if verb in ("create", "start", "limits", "attach", "port_add", "port_remove"):
         assert world.audited[-1] == ("operator", verb, "validation")   # a refused write is on record; a refused read is not
     else:
         assert world.audited[-1] == ("operator", "login", "ok")
@@ -226,6 +235,28 @@ def test_limits_reach_the_core_as_numbers_and_only_the_ones_named(world):
     assert kind(world.call("create", {"name": "kafka", "memory": "1g", "pids": 200}, token=token, op_id="op-1")) == "ok"
     assert world.spawned[0]["limits"] == {"memory": 1024 ** 3, "pids": 200}
     assert kind(world.call("create", {"name": "other", "memory": 5}, token=token, op_id="op-2")) == "validation"
+
+
+def test_the_shell_login_and_the_port_verbs_reach_the_core_with_their_fields_and_are_audited_as_writes(world):
+    token = world.login()
+    calls = [("attach", {"name": "kafka"}), ("port_detect", {"name": "kafka"}), ("port_list", {"name": "kafka"}),
+             ("port_add", {"name": "kafka", "port": 5432, "label": "pg", "passthrough": True, "host_port": 11200}),
+             ("port_add", {"name": "kafka", "port": 8000, "label": "app"}),
+             ("port_remove", {"name": "kafka", "port": 11200, "passthrough": True}), ("port_remove", {"name": "kafka", "port": 8000})]
+    for verb, args in calls:
+        assert world.call(verb, args, token=token) == {"ok": True, "result": {"asked": verb}}
+    assert world.ports_asked == [("attach", ("kafka",), set()), ("port_detect", ("kafka",), set()), ("port_list", ("kafka",), set()),
+                                 ("port_add", ("kafka", 5432, "pg", True, 11200), {"kafka"}), ("port_add", ("kafka", 8000, "app", False, None), {"kafka"}),
+                                 ("port_remove", ("kafka", 11200, True), {"kafka"}), ("port_remove", ("kafka", 8000, False), {"kafka"})]
+    assert world.audited[1:] == [("operator", "attach", "ok"), ("operator", "port_add", "ok"), ("operator", "port_add", "ok"),
+                                 ("operator", "port_remove", "ok"), ("operator", "port_remove", "ok")]
+    assert core.HELD == set()
+    held = core.try_lock("kafka")
+    try:
+        assert kind(world.call("port_add", {"name": "kafka", "port": 8001, "label": "app"}, token=token)) == "busy"
+        assert kind(world.call("attach", {"name": "kafka"}, token=token)) == "ok"   # answered without the lock
+    finally:
+        held.close()
 
 
 def test_what_the_core_refuses_is_a_failure_with_its_message(world, monkeypatch):
@@ -757,3 +788,44 @@ def test_the_start_says_how_a_first_password_can_be_set(monkeypatch, tmp_path, c
     assert said == [("clanker-learn broker: no password is set: set the first one on the page with the set-up code printed in this container's log,"
                      " or with `docker exec -i clanker-learn cl passwd`"),
                     "clanker-learn broker: no password is set, so nobody can log in: `docker exec -i clanker-learn cl passwd` sets one"]
+
+
+def test_the_shell_password_reaches_no_log_and_no_audit_line(monkeypatch, tmp_path, capfd):
+    """attach through a real request, to the real core with the daemon stood in for: a success,
+    a sandbox that is not running, and a failure the broker does not know whose text holds the
+    password. The password is in the first reply and nowhere else."""
+    password = "TheShellPasswordOf32Characters00"
+    monkeypatch.setattr(broker_auth, "PASSWD_FILE", tmp_path / "broker" / "passwd.json")
+    audit_file = tmp_path / "broker" / "audit.log"
+    really_audit = broker_auth.audit_event
+    monkeypatch.setattr(broker_auth, "audit_event", lambda principal, verb, outcome: really_audit(principal, verb, outcome, path=audit_file))
+    monkeypatch.setattr(core, "DATA", str(tmp_path / "data"))
+    broker_auth.set_password(GOOD, path=broker_auth.PASSWD_FILE)
+    core.write_record(core.new_record("kafka"))
+    keys = tmp_path / "data" / "core" / "keys" / "kafka"
+    keys.mkdir(parents=True)
+    (keys / "shell_password").write_text(password + "\n")
+    (keys / "ssh_host_ed25519_key.pub").write_text("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFuQY96dMIi969HDZQuBi0c3I/01XhZ9te8rSEQfKPZD cl-sb-kafka\n")
+    sandbox = {"State": {"Running": True}, "NetworkSettings": {"Networks": {"cl-net-kafka": {"IPAddress": "172.18.0.2"}}}}
+    monkeypatch.setattr(core, "inspect_container", lambda name: sandbox)
+    replies = []
+    with running(tmp_path, None) as call:
+        token = call("login", {"proof": GOOD})["result"]["token"]
+        replies.append(call("attach", {"name": "kafka"}, token=token))
+        sandbox["State"]["Running"] = False
+        replies.append(call("attach", {"name": "kafka"}, token=token))
+        sandbox["State"]["Running"] = True
+
+        def fails_saying_what_it_read(name):
+            raise RuntimeError(f"could not read the key beside {core.shell_password(name)}")
+        monkeypatch.setattr(core, "host_fingerprint", fails_saying_what_it_read)
+        replies.append(call("attach", {"name": "kafka"}, token=token))
+    assert [kind(reply) for reply in replies] == ["ok", "failed", "failed"]
+    assert replies[0]["result"]["password"] == password
+    said = capfd.readouterr()
+    assert "RuntimeError" in said.err
+    audited = [json.loads(line) for line in audit_file.read_text().splitlines()]
+    assert [(line["verb"], line["outcome"]) for line in audited] == [("login", "ok"), ("attach", "ok"), ("attach", "failed")]
+    everything = said.out + said.err + json.dumps(replies[1:]) + "".join(
+        p.read_text(errors="replace") for p in tmp_path.rglob("*") if p.is_file() and p.name != "shell_password")
+    assert password not in everything
