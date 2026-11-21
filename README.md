@@ -43,14 +43,32 @@ docker exec clanker-learn cl list
 docker exec clanker-learn cl stop kafka
 docker exec clanker-learn cl start kafka
 docker exec clanker-learn cl limits kafka --memory 8g --pids none
+docker exec clanker-learn cl recreate kafka
 docker exec clanker-learn cl destroy kafka
 ```
 
 - The first project on a new installation takes a few minutes: the sandbox image (`sandbox/`) is built then, once, and needs the internet.
 - What you install in a sandbox is still there after `stop` and `start`, and after clanker-learn itself is stopped and started; the projects that were running come back by themselves.
 - Limits apply at once. Two changes wait: removing a memory limit waits for the sandbox to be recreated, and on sysbox removing a processor limit waits for its next start. The command says so when it happens.
+- `recreate` gives the project a new container from the current sandbox image. The workspace and the home folder stay; what was installed elsewhere in the old container is gone, and the setup recipe (below) brings it back. A stopped project is running afterwards.
 - `destroy` removes the sandbox, its workspace and its home folder. If it is interrupted, run it again: a project being destroyed is never started.
 - Everything of a project but its container is in the `/data` volume: workspaces under `projects/`, home folders under `homes/`.
+
+### What a sandbox brings back by itself
+
+Two files in the workspace, which the tutor will keep current and you can edit, say what a sandbox needs beyond its files:
+
+- `/workspace/.learn/setup.sh`, the setup recipe: what was installed. It runs once in every new container, as the sandbox user (who can `sudo`), so after a `recreate` the software is back. It does not run at a plain stop and start, where nothing was lost. `cl status` says how it went (`setup`: none, running, done, failed), and its output is in `/var/log/cl/setup.log` in the sandbox. If the sandbox is stopped while it runs, it runs again from the top at the next start, so it must be safe to run twice. A recipe that failed is not tried again until the next `recreate`, and one that never ends holds the services back: there is no time limit on it.
+- `/workspace/.learn/services`, what should be running: one line each, `name: command`. A name is lower-case letters, digits and dashes, starts with a letter or a digit and has at most 32 characters; other lines are skipped, with a line in the sandbox's log (`docker logs` of its container). At most 64 services and 64 KiB are read. They are started at every start of the sandbox, after the recipe, as the sandbox user, with their output in `/workspace/.learn/logs/<name>.log`. They are started, not watched: one that ends stays down until the next start. At a stop they are asked to end before they are killed.
+
+A server that listens only on the sandbox's loopback address (many development and notebook servers do by default) cannot be reached from outside the sandbox, so the interface will show no tab for it. Inside the sandbox, `cl-expose 8888` puts it on the sandbox's own address; listed in the services file, that comes back too:
+
+```
+notebook: jupyter lab --port 8888
+notebook-tab: cl-expose 8888
+```
+
+Use it only for a server that listens on loopback. Listed for a server that listens on all addresses, it takes the port on the sandbox's address first and the server then fails to start there.
 
 ## Tests
 
