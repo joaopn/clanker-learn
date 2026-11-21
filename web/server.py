@@ -4,12 +4,27 @@ RS's webui/server.py (RS commit 62788a8), stripped. It runs in a container of th
 daemon, `cl-web`, with no Docker socket, no project folder and no capability; all it has is
 the broker's socket folder, read-only, and a folder for its certificate.
 
-So far it carries: the login (the proof the browser derives from the password is relayed to
-the broker, which authenticates; the broker's session token stays here, server-side, under a
+It carries: the login (the proof the browser derives from the password is relayed to the
+broker, which authenticates; the broker's session token stays here, server-side, under a
 cookie scoped to /broker), the first password (a set-up code from the container's log), the
-project list and status, the project actions, and the progress of an operation. Every route
-is refused without a login but the placeholder page, the login and the set-up. The page itself,
-terminals and web-app tabs come with later parts.
+project list and status, the project actions, the progress of an operation, a project's
+terminal (a WebSocket relayed to the sandbox's sshd, where it runs tmux), a project's session
+cookie (which its web-app tabs are opened with), a project's tabs (the files server, the web
+apps named by hand or detected, the raw TCP ports named by hand), opening a web app on an
+origin port of its own, and the ports named by hand. Every route on the page's port is refused
+without a login but the placeholder page, the login and the set-up. The page itself comes with
+a later part.
+
+Besides the page's port it listens on every port of two ranges, on the same address: on an
+origin port (CL_ORIGIN_PORTS) the origin proxy serves one web app of one sandbox, HTTP and
+WebSocket, to a browser holding that project's session cookie; on a pass-through port
+(CL_PASSTHROUGH_PORTS) raw TCP is relayed to a sandbox's port named by hand, with no login in
+front of it. Which app or port each one serves is this server's own state, in its data folder.
+
+Nothing connects where the browser says: the broker's `attach` names the sandbox's address, its
+user, its Shell password and its host key's fingerprint, and the password stays in this
+process; the origin proxy and the relay connect to the address the broker's `status` gives and
+the port in their own table.
 
 What is kept from RS is kept as RS has it (names, shapes, comments' substance); where the two
 differ it is said at the place.
@@ -30,12 +45,15 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlparse
 
+import asyncssh
 import services
-from aiohttp import web
+from aiohttp import ClientConnectorError, ClientSession, ClientTimeout, WSMsgType, web
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
+from multidict import CIMultiDict
+from yarl import URL
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("cl-web")
@@ -49,6 +67,16 @@ WEB_PORT = int(os.environ.get("CL_WEB_PORT", "7788"))
 # The address the browser reaches the page at, for the certificate. The run command
 # publishes on the machine's loopback.
 HOST_BIND = os.environ.get("CL_WEB_BIND", "127.0.0.1")
+# The two ranges, (first, last): a web app of a sandbox is served on an origin port of its
+# own, and a raw TCP port named by hand is relayed from a pass-through port. Read from the
+# environment by main (a range given wrongly stops the server there); these are the defaults.
+ORIGIN_RANGE = (11100, 11164)
+PASSTHROUGH_RANGE = (11200, 11299)
+# This server's own folder (the certificate is in it): the origin table and the pass-through
+# claims are kept here, so that a tab keeps its address and a claim its relay across restarts.
+DATA_DIR = Path(os.environ.get("CL_DATA_DIR", "/data"))
+ORIGIN_PORTS_FILE = DATA_DIR / "origin-ports.json"
+PASSTHROUGH_FILE = DATA_DIR / "passthrough-claims.json"
 
 # ===========================================================================
 # Broker relay — everything that touches projects goes through the broker.
@@ -65,6 +93,13 @@ BROKER_CALL_TIMEOUT_S = 30
 # cookie token -> {"broker_token": str, "expires": float}
 BROKER_SESSIONS: dict[str, dict] = {}
 BROKER_COOKIE = services.broker_cookie_name(WEB_PORT)
+# Project sessions: cookie token -> {"project", "expires", "login": the login cookie it was
+# minted under}. Ended with that login.
+SESSIONS: dict[str, dict] = {}
+SESSION_TTL_SECONDS = 8 * 60 * 60
+# The open terminals of each login (keyed by its cookie), closed when the login ends.
+TERMINALS: dict[str, set[web.WebSocketResponse]] = {}
+_CLOSING: set[asyncio.Task] = set()   # close() tasks in flight, held so they are not collected
 # The progress logs of operations, beside the socket (read-only here).
 BROKER_OPLOG_DIR = str(Path(BROKER_SOCKET).parent / "oplogs")
 # Mirror of the broker's own rule: an op_id names a file there. Matched whole (fullmatch):
@@ -76,6 +111,8 @@ _OP_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 BROKER_FIELDS = {
     "create": ("name", "pids", "memory", "cpus"),
     "limits": ("pids", "memory", "cpus"),
+    "port_add": ("port", "label", "passthrough", "host_port"),
+    "port_remove": ("port", "passthrough"),
 }
 PROJECT_ACTIONS = ("start", "stop", "recreate", "destroy")
 
@@ -192,6 +229,20 @@ def _broker_session(request: web.Request) -> dict | None:
     return s
 
 
+def _drop_login(cookie: str | None) -> None:
+    """End a login here: its session, the project sessions minted under it, and its open
+    terminals (closed in the background, so the caller answers at once)."""
+    if not cookie:
+        return
+    BROKER_SESSIONS.pop(cookie, None)
+    for token in [t for t, s in SESSIONS.items() if s.get("login") == cookie]:
+        SESSIONS.pop(token, None)
+    for ws in TERMINALS.pop(cookie, set()):
+        task = asyncio.get_running_loop().create_task(ws.close(message=b"logged out"))
+        _CLOSING.add(task)
+        task.add_done_callback(_CLOSING.discard)
+
+
 def _unauthorized() -> web.Response:
     return web.json_response({"ok": False, "error": {"kind": "unauthorized"}}, status=401)
 
@@ -217,7 +268,7 @@ async def _relay(request: web.Request, verb: str,
     if (not reply.get("ok")
             and reply.get("error", {}).get("kind") == "unauthorized"):
         # Broker token expired/invalid → drop the session here too.
-        BROKER_SESSIONS.pop(request.cookies.get(BROKER_COOKIE), None)
+        _drop_login(request.cookies.get(BROKER_COOKIE))
         return 401, {"ok": False, "error": {"kind": "unauthorized"}}
     return 200, reply
 
@@ -283,9 +334,10 @@ async def broker_login_handler(request: web.Request) -> web.Response:
 
 
 async def broker_logout_handler(request: web.Request) -> web.Response:
-    """POST /broker/logout — revoke the broker token, drop the session, clear
-    the cookie. Always 200 (idempotent). Origin-checked like every POST: SameSite=Strict
-    still sends the cookie from another port of the same host."""
+    """POST /broker/logout — revoke the broker token, drop the session (with its project
+    sessions and its terminals), clear the cookie. Always 200 (idempotent). Origin-checked
+    like every POST: SameSite=Strict still sends the cookie from another port of the same
+    host."""
     if not origin_ok(request):
         return web.Response(status=403, text="origin rejected")
     s = _broker_session(request)
@@ -294,9 +346,7 @@ async def broker_logout_handler(request: web.Request) -> web.Response:
             await broker_call("logout", token=s["broker_token"])
         except (BrokerUnavailable, BrokerForbidden):
             pass
-    tok = request.cookies.get(BROKER_COOKIE)
-    if tok:
-        BROKER_SESSIONS.pop(tok, None)
+    _drop_login(request.cookies.get(BROKER_COOKIE))
     response = web.json_response({"ok": True})
     response.del_cookie(BROKER_COOKIE, path="/broker")
     return response
@@ -410,7 +460,7 @@ async def _lane_relay(request: web.Request, verb: str, args: dict,
             {"ok": False, "error": {"kind": "forbidden"}}, status=403)
     if (not reply.get("ok")
             and reply.get("error", {}).get("kind") == "unauthorized"):
-        BROKER_SESSIONS.pop(request.cookies.get(BROKER_COOKIE), None)
+        _drop_login(request.cookies.get(BROKER_COOKIE))
         return _unauthorized()
     if not reply.get("ok"):
         return web.json_response(reply, status=200)   # busy / validation / step-up → app error
@@ -532,6 +582,840 @@ async def broker_op_alive_handler(request: web.Request) -> web.Response:
         return web.json_response(body, status=status)
     return web.json_response(
         {"ok": True, "alive": bool(body.get("result", {}).get("alive", False))})
+
+
+# ---- the terminal: a WebSocket relayed to the sandbox's sshd ---------------------
+
+# One tmux session per project: a second tab, or a reload, picks up the same shell.
+TERMINAL_COMMAND = "tmux new-session -A -s main"
+TERM_MIN, TERM_MAX = 1, 500
+# No trusted keys at all, so asyncssh asks the validator about every host key. RS passes
+# `known_hosts=None`, which makes asyncssh skip host-key checking altogether: the validator is
+# then never called and nothing is pinned.
+PINNED_ONLY = ([], [], [])
+
+
+class HostKeyValidator(asyncssh.SSHClient):
+    """Capture host key during handshake; reject if it doesn't match expected.
+    Unlike RS, no expected fingerprint rejects the key: never trust on first use."""
+
+    def __init__(self, expected_fp: str | None):
+        super().__init__()
+        self.expected_fp = expected_fp
+        self.actual_fp: str | None = None
+
+    def validate_host_public_key(self, host, addr, port, key) -> bool:
+        self.actual_fp = key.get_fingerprint("sha256")
+        if not self.expected_fp:
+            return False
+        return self.actual_fp == self.expected_fp
+
+
+async def ssh_connect(target: dict) -> asyncssh.SSHClientConnection:
+    """Connect to the sandbox `attach` named, as it said, its host key pinned to the
+    fingerprint it gave."""
+    validator = HostKeyValidator(target["fingerprint"])
+    return await asyncssh.connect(
+        host=target["host"], port=int(target["port"]),
+        username=target["username"], password=target["password"],
+        client_factory=lambda: validator,
+        known_hosts=PINNED_ONLY,
+        client_keys=None,
+        connect_timeout=10,
+    )
+
+
+def _term_dim(value, default: int) -> int:
+    """A row or column count from the browser, as an int within TERM_MIN..TERM_MAX."""
+    try:
+        n = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return max(TERM_MIN, min(TERM_MAX, n))
+
+
+async def _ws_say(ws: web.WebSocketResponse, message: dict) -> None:
+    """Send one control message; a socket a logout closed meanwhile takes none."""
+    with contextlib.suppress(ConnectionResetError, RuntimeError):
+        await ws.send_json(message)
+
+
+async def ws_handler(request: web.Request) -> web.WebSocketResponse | web.Response:
+    """GET /broker/project/{name}/terminal — a terminal in the project's sandbox (RS's
+    /ws/<project>/<service>, under /broker so the login cookie comes with it).
+
+    The browser's first frame is {type: "connect", rows, cols}; only the size is read from it.
+    Where to connect, as whom, with which password and which host key come from the broker's
+    `attach`, asked with this login's token. Then {type: "connected"} and RS's relay: binary
+    frames both ways, {type: "resize", rows, cols} from the browser."""
+    if not origin_ok(request):
+        return web.Response(status=403, text="origin rejected")
+    s = _broker_session(request)
+    if s is None:
+        return _unauthorized()
+    login = request.cookies.get(BROKER_COOKIE)
+    name = request.match_info.get("name", "")
+
+    ws = web.WebSocketResponse(heartbeat=30)
+    await ws.prepare(request)
+    # Remembered under its login, which closes it when it ends.
+    TERMINALS.setdefault(login, set()).add(ws)
+    try:
+        if login in BROKER_SESSIONS:
+            await _terminal(ws, name, s["broker_token"], login)
+    finally:
+        mine = TERMINALS.get(login)
+        if mine is not None:
+            mine.discard(ws)
+            if not mine:
+                TERMINALS.pop(login, None)
+        if not ws.closed:
+            await ws.close()
+    return ws
+
+
+async def _terminal(ws: web.WebSocketResponse, name: str, broker_token: str, login: str) -> None:
+    """The terminal's life after the upgrade; the caller closes the socket."""
+    try:
+        first = await asyncio.wait_for(ws.receive(), timeout=10)
+    except TimeoutError:
+        return
+    if first.type in (WSMsgType.CLOSE, WSMsgType.CLOSING, WSMsgType.CLOSED):
+        return
+    if first.type != WSMsgType.TEXT:
+        await _ws_say(ws, {"type": "error", "msg": "expected JSON connect message"})
+        return
+    try:
+        connect = json.loads(first.data)
+    except json.JSONDecodeError:
+        await _ws_say(ws, {"type": "error", "msg": "invalid JSON"})
+        return
+    if not isinstance(connect, dict) or connect.get("type") != "connect":
+        await _ws_say(ws, {"type": "error", "msg": "first message must be type=connect"})
+        return
+    # The size is all the browser says here: a host, user, password or fingerprint it sends
+    # is not read.
+    rows = _term_dim(connect.get("rows"), 24)
+    cols = _term_dim(connect.get("cols"), 80)
+
+    try:
+        reply = await broker_call("attach", {"name": name}, token=broker_token)
+    except BrokerUnavailable:
+        await _ws_say(ws, {"type": "error", "msg": "broker unavailable"})
+        return
+    except BrokerForbidden:
+        await _ws_say(ws, {"type": "error", "msg": "the broker refused this server"})
+        return
+    if not reply.get("ok"):
+        error = reply.get("error") or {}
+        if error.get("kind") == "unauthorized":
+            _drop_login(login)
+        await _ws_say(ws, {"type": "error", "msg": error.get("message") or error.get("kind") or "refused"})
+        return
+    target = reply.get("result") or {}
+    password = target.get("password")
+    if not target.get("fingerprint"):
+        # Nothing to hold the host key to: no connection at all, rather than trust what answers.
+        await _ws_say(ws, {"type": "error", "msg": "the sandbox's host key is not known"})
+        return
+    if not target.get("host") or not isinstance(password, str) or not password:
+        await _ws_say(ws, {"type": "error", "msg": "the broker named no sandbox to connect to"})
+        return
+    if ws.closed:   # the login ended while the broker answered
+        return
+
+    try:
+        conn = await ssh_connect(target)
+    except asyncssh.HostKeyNotVerifiable:
+        # The actual fingerprint stays here (RS sends it): the browser has no use for it.
+        await _ws_say(ws, {"type": "fingerprint_mismatch"})
+        return
+    except asyncssh.PermissionDenied:
+        await _ws_say(ws, {"type": "auth_failed"})
+        return
+    except Exception as e:  # noqa: BLE001 - any failure reads the same to the browser
+        detail = f"{type(e).__name__}: {e}".replace(password, "<password>")
+        log.warning(f"terminal of {name}: SSH connect to {target.get('host')}:{target.get('port')} failed: {detail}")
+        await _ws_say(ws, {"type": "error", "msg": "connect failed"})
+        return
+    if ws.closed:   # the login ended while connecting
+        conn.close()
+        return
+
+    await _ws_say(ws, {"type": "connected"})
+
+    async with conn:
+        proc = await conn.create_process(
+            term_type="xterm-256color",
+            term_size=(cols, rows),
+            command=TERMINAL_COMMAND,
+            encoding=None,
+        )
+
+        async def from_browser():
+            async for msg in ws:
+                if msg.type == WSMsgType.BINARY:
+                    proc.stdin.write(msg.data)
+                elif msg.type == WSMsgType.TEXT:
+                    try:
+                        ctrl = json.loads(msg.data)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(ctrl, dict) and ctrl.get("type") == "resize":
+                        proc.change_terminal_size(
+                            width=_term_dim(ctrl.get("cols"), cols),
+                            height=_term_dim(ctrl.get("rows"), rows),
+                        )
+
+        async def to_browser():
+            while True:
+                chunk = await proc.stdout.read(65536)
+                if not chunk:
+                    break
+                if isinstance(chunk, str):
+                    chunk = chunk.encode()
+                await ws.send_bytes(chunk)
+
+        _done, pending = await asyncio.wait(
+            [asyncio.create_task(from_browser()),
+             asyncio.create_task(to_browser())],
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for t in pending:
+            t.cancel()
+        try:
+            proc.terminate()
+        except OSError:
+            pass
+
+
+# ---- the project session: the cookie the web-app tabs will be opened with ---------
+
+def _session_valid(token: str, project: str) -> bool:
+    """Look up `token` in SESSIONS, validate project + TTL. Garbage-collects
+    expired entries on lookup."""
+    s = SESSIONS.get(token)
+    if not s:
+        return False
+    if s["project"] != project:
+        return False
+    if time.time() > s["expires"]:
+        SESSIONS.pop(token, None)
+        return False
+    return True
+
+
+async def session_handler(request: web.Request) -> web.Response:
+    """POST /broker/project/{name}/session — issue the project's session cookie (gated,
+    origin-checked). RS proves here that the browser holds the project's SSH password; in
+    clanker-learn the login is the credential, and the broker's `status`, asked with its
+    token, says the project exists.
+
+    The cookie is host-only with Path=/ : cookies ignore the port, so the one cookie reaches
+    every port the project's web apps will be served on. It lives at most 8 hours, and no
+    longer than the login it was minted under, which ends it too. Answers {ok: true}, or the
+    broker's refusal as it said it."""
+    if not origin_ok(request):
+        return web.Response(status=403, text="origin rejected")
+    project = request.match_info.get("name", "")
+    status, reply = await _relay(request, "status", {"name": project})
+    if status != 200 or not reply.get("ok"):
+        return web.json_response(reply, status=status)
+    login = request.cookies.get(BROKER_COOKIE)
+    s = BROKER_SESSIONS.get(login)
+    ttl = int(min(SESSION_TTL_SECONDS, s["expires"] - time.time())) if s else 0
+    if ttl <= 0:   # the login ended, or is ending, while the broker answered
+        return _unauthorized()
+
+    token = secrets.token_urlsafe(32)
+    SESSIONS[token] = {
+        "project": project,
+        "expires": time.time() + ttl,
+        "login": login,
+    }
+    response = web.json_response({"ok": True})
+    response.set_cookie(
+        services.session_cookie_name(WEB_PORT, project), token,
+        path="/",
+        httponly=True, secure=True, samesite="Strict",
+        max_age=ttl,
+    )
+    return response
+
+
+# ===========================================================================
+# Web apps of the sandboxes (origin ports) and ports named by hand (pass-through)
+#
+# Both tables are this server's own state, kept in its data folder: no request or
+# connection path asks the broker for them. Only where a sandbox is comes from the broker,
+# remembered a few seconds.
+# ===========================================================================
+
+FILES_SERVER_PORT = 7070    # the sandbox's files server: always there in a running sandbox
+# project -> (monotonic time the broker was asked, the sandbox's address or None).
+SANDBOX_ADDRESSES: dict[str, tuple[float, str | None]] = {}
+ADDRESS_TTL_S = 5.0
+# A connect that fails at a remembered address asks the broker again, but at most once a
+# second per project: an app that is down must not turn every request into a broker call.
+ADDRESS_RECHECK_S = 1.0
+PASSTHROUGH_CONNECT_TIMEOUT_S = 10
+# origin port -> {"project", "port": the sandbox's port}. (RS keys an entry by service id
+# and re-derives the port per request from files it reads; here the port is checked when
+# the tab is opened, by the broker, and kept.)
+ORIGIN_PORTS: dict[int, dict] = {}
+# host port -> {"project", "port": the sandbox's port}: the raw TCP ports named by hand.
+PASSTHROUGH_CLAIMS: dict[int, dict] = {}
+
+HOP_BY_HOP_HEADERS = frozenset({
+    "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+    "te", "trailers", "transfer-encoding", "upgrade", "host",
+    "content-length",
+})
+# Response-direction drop set: hop-by-hop PLUS X-Frame-Options. A per-app origin port is
+# cross-origin to the page, which frames it; the proxied content is session-gated and framed
+# only by our own page, so the clickjacking protection XFO provided has no meaning inside
+# that boundary.
+RESPONSE_DROP_HEADERS = HOP_BY_HOP_HEADERS | frozenset({"x-frame-options"})
+# clanker-learn's own cookies (services.broker_cookie_name, services.session_cookie_name).
+# They never go upstream and upstream cannot set them: the login cookie has Path=/broker,
+# and a page served from a sandbox can make the browser ask /broker/... on its origin port.
+OWN_COOKIE_PREFIXES = ("cl_broker_", "cl_session_")
+
+
+def _is_port(value) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and 1 <= value <= 65535
+
+
+def _save_json(path: Path, data: dict) -> None:
+    """Write atomically (a temporary file, then a rename). A failure is logged: the table
+    still works in memory, but is lost at the next start."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps({str(p): e for p, e in sorted(data.items())}, indent=2))
+        tmp.replace(path)
+    except OSError as e:
+        log.error(f"cannot keep {path.name}: {e}")
+
+
+def _load_table(path: Path, low: int, high: int) -> dict[int, dict]:
+    """{port: {"project", "port"}} from `path`, the sound entries on a port of low..high only.
+    A missing or unreadable file is an empty table."""
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return {}
+    out: dict[int, dict] = {}
+    for key, entry in (data.items() if isinstance(data, dict) else ()):
+        if (key.isascii() and key.isdigit() and low <= int(key) <= high and isinstance(entry, dict)
+                and isinstance(entry.get("project"), str) and entry["project"] and _is_port(entry.get("port"))):
+            out[int(key)] = {"project": entry["project"], "port": entry["port"]}
+    return out
+
+
+def _origin_table_load() -> None:
+    ORIGIN_PORTS.clear()
+    ORIGIN_PORTS.update(_load_table(ORIGIN_PORTS_FILE, *ORIGIN_RANGE))
+
+
+def _claims_load() -> None:
+    PASSTHROUGH_CLAIMS.clear()
+    PASSTHROUGH_CLAIMS.update(_load_table(PASSTHROUGH_FILE, *PASSTHROUGH_RANGE))
+
+
+def _origin_port_lookup(project: str, port: int) -> int | None:
+    """The origin port ALREADY given to (project, port), or None. Never allocates."""
+    for origin, entry in ORIGIN_PORTS.items():
+        if entry["project"] == project and entry["port"] == port:
+            return origin
+    return None
+
+
+def _origin_port_for(project: str, port: int) -> int | None:
+    """The stable origin port for (project, port), the lowest free one on first sight; None
+    when the range is exhausted. MUST stay synchronous (no awaits): a read-modify-write that
+    spans one would give one port twice under concurrent requests."""
+    held = _origin_port_lookup(project, port)
+    if held is not None:
+        return held
+    low, high = ORIGIN_RANGE
+    for origin in range(low, high + 1):
+        if origin not in ORIGIN_PORTS:
+            ORIGIN_PORTS[origin] = {"project": project, "port": port}
+            _save_json(ORIGIN_PORTS_FILE, ORIGIN_PORTS)
+            return origin
+    log.error(f"origin-port range {low}-{high} exhausted ({project}:{port} gets no origin)")
+    return None
+
+
+def _claims_take(project: str, entries: list[dict]) -> None:
+    """Make `project`'s claims the raw TCP entries of its port list as the broker just gave
+    it. The broker gives a host port to one project at most, so another project's claim on
+    the same host port is stale and is replaced."""
+    claims = {hp: c for hp, c in PASSTHROUGH_CLAIMS.items() if c["project"] != project}
+    for e in entries:
+        if e.get("passthrough") is True and _is_port(e.get("host_port")):
+            claims[e["host_port"]] = {"project": project, "port": e["port"]}
+    if claims != PASSTHROUGH_CLAIMS:
+        PASSTHROUGH_CLAIMS.clear()
+        PASSTHROUGH_CLAIMS.update(claims)
+        _save_json(PASSTHROUGH_FILE, PASSTHROUGH_CLAIMS)
+
+
+def _forget_project(project: str) -> None:
+    """Drop the origin ports and the claims of a project the broker no longer knows."""
+    for table, path in ((ORIGIN_PORTS, ORIGIN_PORTS_FILE), (PASSTHROUGH_CLAIMS, PASSTHROUGH_FILE)):
+        stale = [p for p, e in table.items() if e["project"] == project]
+        for p in stale:
+            del table[p]
+        if stale:
+            _save_json(path, table)
+
+
+async def _project_gone(project: str) -> bool:
+    """Whether the broker's open `list` no longer names the project. Not knowing is not gone."""
+    try:
+        reply = await broker_call("list")
+    except (BrokerUnavailable, BrokerForbidden):
+        return False
+    if not reply.get("ok") or not isinstance(reply.get("result"), list):
+        return False
+    return project not in {p.get("name") for p in reply["result"] if isinstance(p, dict)}
+
+
+async def sandbox_address(project: str, failed: str | None = None) -> str | None:
+    """Where the project's sandbox is: its address on the project's network as the broker's
+    OPEN `status` says it (no token: the proxy and the relay have no login in hand), or None
+    when the project does not exist or does not run. Remembered ADDRESS_TTL_S seconds, since
+    the broker serves one request at a time. `failed` is an address a connect just failed
+    at: the broker is asked again unless it said that address within ADDRESS_RECHECK_S. The
+    address comes from the broker only, never from a request."""
+    held = SANDBOX_ADDRESSES.get(project)
+    if held is not None:
+        age = time.monotonic() - held[0]
+        if failed is None and age < ADDRESS_TTL_S:
+            return held[1]
+        if failed is not None and (held[1] != failed or age < ADDRESS_RECHECK_S):
+            return held[1]
+    address = None
+    try:
+        reply = await broker_call("status", {"name": project})
+    except (BrokerUnavailable, BrokerForbidden):
+        reply = None
+    if reply is not None and reply.get("ok"):
+        result = reply.get("result") or {}
+        if result.get("state") == "running" and isinstance(result.get("address"), str):
+            with contextlib.suppress(ValueError):
+                address = str(ipaddress.ip_address(result["address"]))
+    elif reply is not None and await _project_gone(project):
+        _forget_project(project)
+    SANDBOX_ADDRESSES[project] = (time.monotonic(), address)
+    return address
+
+
+def _refusal(kind: str, message: str) -> web.Response:
+    """A refusal in the broker's shape, answered like the broker's own (200)."""
+    return web.json_response({"ok": False, "error": {"kind": kind, "message": message}})
+
+
+def _port_entries(reply: dict) -> list[dict]:
+    """The sound entries of a port_list / port_add / port_remove reply."""
+    entries = (reply.get("result") or {}).get("ports")
+    return [e for e in (entries if isinstance(entries, list) else [])
+            if isinstance(e, dict) and _is_port(e.get("port")) and isinstance(e.get("label"), str)]
+
+
+def _detected_rows(reply: dict) -> list[dict] | None:
+    """The rows of a port_detect reply, or None when the broker refused (the sandbox does not
+    run)."""
+    if not reply.get("ok"):
+        return None
+    rows = (reply.get("result") or {}).get("ports")
+    return [r for r in (rows if isinstance(rows, list) else []) if isinstance(r, dict) and _is_port(r.get("port"))]
+
+
+def _assemble_services(project: str, entries: list[dict], detected: list[dict] | None) -> dict:
+    """The project's tabs, in RS's shape (id -> row, in tab order). Of RS's rows only the
+    kinds clanker-learn has: the files server, web apps named by hand, detected apps, raw TCP
+    ports. A web row carries its origin port once the app was opened (never allocated here)."""
+    def web_row(port: int, label: str, **extra) -> dict:
+        row = {"label": label, "kind": "http", "always_on": False, "renderer": "iframe",
+               "default_port": port, "upstream_path": "/", **extra}
+        origin = _origin_port_lookup(project, port)
+        if origin is not None:
+            row["origin_port"] = origin
+        return row
+
+    out: dict[str, dict] = {}
+    if detected is not None:
+        out["files"] = web_row(FILES_SERVER_PORT, "Files", always_on=True)
+    named = {e["port"] for e in entries}
+    for e in entries:
+        if not e.get("passthrough"):
+            out[f"port-{e['port']}"] = web_row(e["port"], e["label"])
+    for r in detected or []:
+        if r["port"] not in named and r["port"] != FILES_SERVER_PORT:
+            label = r["label"] if isinstance(r.get("label"), str) else str(r["port"])
+            out[f"port-{r['port']}"] = web_row(r["port"], label, detected=True)
+    # Raw TCP: a launcher keyed on its host port, no origin port.
+    for e in entries:
+        if e.get("passthrough") is True and _is_port(e.get("host_port")):
+            out[f"pass-{e['host_port']}"] = {
+                "label": e["label"], "kind": "http", "always_on": False, "renderer": "launcher",
+                "default_port": e["host_port"], "passthrough_port": e["host_port"], "sandbox_port": e["port"]}
+    return out
+
+
+async def project_services_handler(request: web.Request) -> web.Response:
+    """GET /broker/project/{name}/services — the project's tabs (gated): {ok, services: {id:
+    row}}. The ports named by hand from `port_list`, what listens now from `port_detect`, both
+    asked with the login's token when the list is asked for (RS's probing, caching, sweeps and
+    switches are not kept). A project that does not run has its named entries only."""
+    project = request.match_info.get("name", "")
+    status, listed = await _relay(request, "port_list", {"name": project})
+    if status != 200 or not listed.get("ok"):
+        return web.json_response(listed, status=status)
+    entries = _port_entries(listed)
+    _claims_take(project, entries)
+    status, detected = await _relay(request, "port_detect", {"name": project})
+    if status != 200:
+        return web.json_response(detected, status=status)
+    return web.json_response(
+        {"ok": True, "services": _assemble_services(project, entries, _detected_rows(detected))})
+
+
+async def project_origin_handler(request: web.Request) -> web.Response:
+    """POST /broker/project/{name}/origin {port} — open a web app (gated, origin-checked):
+    give (project, port) an origin port, the one it has or the lowest free one, and answer
+    {ok, origin_port}. The port must be the files server's, a web port named by hand or one
+    listening now, as the broker says."""
+    if not origin_ok(request):
+        return web.Response(status=403, text="origin rejected")
+    if _broker_session(request) is None:
+        return _unauthorized()
+    body = await _json_body(request)
+    if body is None:
+        return _bad_request()
+    project = request.match_info.get("name", "")
+    port = body.get("port")
+    status, listed = await _relay(request, "port_list", {"name": project})
+    if status != 200 or not listed.get("ok"):
+        return web.json_response(listed, status=status)
+    entries = _port_entries(listed)
+    _claims_take(project, entries)
+    if not _is_port(port):
+        return _refusal("validation", "port must be a port number from 1 to 65535")
+    allowed = port == FILES_SERVER_PORT or port in {e["port"] for e in entries if not e.get("passthrough")}
+    if not allowed:
+        status, detected = await _relay(request, "port_detect", {"name": project})
+        if status != 200:
+            return web.json_response(detected, status=status)
+        allowed = port in {r["port"] for r in _detected_rows(detected) or []}
+    if not allowed:
+        return _refusal("validation", f"port {port} of {project} is not the files server, not named by hand and not listening")
+    origin = _origin_port_for(project, port)
+    if origin is None:
+        low, high = ORIGIN_RANGE
+        return _refusal("failed", f"every origin port ({low}-{high}) is taken")
+    return web.json_response({"ok": True, "origin_port": origin})
+
+
+async def _port_relay(request: web.Request, verb: str, args: dict) -> web.Response:
+    """Relay a port verb; the claims follow the project's entries in the broker's reply."""
+    project = request.match_info.get("name", "")
+    status, reply = await _relay(request, verb, dict(args, name=project))
+    if status == 200 and reply.get("ok"):
+        _claims_take(project, _port_entries(reply))
+    return web.json_response(reply, status=status)
+
+
+async def broker_port_list_handler(request: web.Request) -> web.Response:
+    """GET /broker/project/{name}/ports — the ports named by hand (gated), as `port_list`."""
+    return await _port_relay(request, "port_list", {})
+
+
+async def broker_port_add_handler(request: web.Request) -> web.Response:
+    """POST /broker/project/{name}/ports {port, label, passthrough?, host_port?} — name a port
+    by hand (gated, origin-checked); only those fields are forwarded."""
+    if not origin_ok(request):
+        return web.Response(status=403, text="origin rejected")
+    body = await _json_body(request)
+    if body is None:
+        return _bad_request() if _broker_session(request) else _unauthorized()
+    return await _port_relay(request, "port_add", _forward(body, "port_add"))
+
+
+async def broker_port_remove_handler(request: web.Request) -> web.Response:
+    """POST /broker/project/{name}/ports/remove {port, passthrough?} — take a port named by
+    hand out (gated, origin-checked); for raw TCP `port` is the host port."""
+    if not origin_ok(request):
+        return web.Response(status=403, text="origin rejected")
+    body = await _json_body(request)
+    if body is None:
+        return _bad_request() if _broker_session(request) else _unauthorized()
+    return await _port_relay(request, "port_remove", _forward(body, "port_remove"))
+
+
+# ---- the origin proxy: HTTP and WebSocket on every origin port ----------------------
+
+class _UpstreamDown(Exception):
+    """The connect to the upstream failed (nothing sent yet): the address may be stale."""
+
+
+def _own_cookie(name: str) -> bool:
+    return name.strip().startswith(OWN_COOKIE_PREFIXES)
+
+
+def _app_cookies(headers) -> str:
+    """The request's Cookie headers without clanker-learn's own cookies, as one value."""
+    return "; ".join(part.strip() for value in headers.getall("Cookie", []) for part in value.split(";")
+                     if part.strip() and not _own_cookie(part.partition("=")[0]))
+
+
+def _filter_headers(headers, drop: frozenset[str]) -> CIMultiDict[str]:
+    # Preserve DUPLICATE headers (a plain dict collapses them): an upstream can send
+    # multiple Set-Cookie in one response; .items() yields each duplicate pair, add() keeps
+    # them all.
+    out: CIMultiDict[str] = CIMultiDict()
+    for k, v in headers.items():
+        if k.lower() not in drop:
+            out.add(k, v)
+    return out
+
+
+def _upstream_down() -> web.Response:
+    return web.Response(status=502, text="The app does not answer. Is it running in the sandbox?")
+
+
+async def _proxy_ws(request: web.Request, upstream_url: URL,
+                    forward: dict[str, str] | None = None) -> web.StreamResponse:
+    """WS pass-through. Opens upstream first so a failure returns a clean
+    502 to the browser instead of a bare close frame after handshake.
+    `forward` is sent as upstream headers."""
+    client_subprotocols: list[str] = []
+    sec_proto = request.headers.get("Sec-WebSocket-Protocol")
+    if sec_proto:
+        client_subprotocols = [
+            p.strip() for p in sec_proto.split(",") if p.strip()
+        ]
+
+    timeout = ClientTimeout(total=None, sock_read=None, sock_connect=PASSTHROUGH_CONNECT_TIMEOUT_S)
+    sess = ClientSession(timeout=timeout)
+    try:
+        try:
+            upstream_ws = await sess.ws_connect(
+                upstream_url,
+                protocols=client_subprotocols,
+                heartbeat=30,
+                max_msg_size=0,
+                **({"headers": forward} if forward else {}),
+            )
+        except (ClientConnectorError, TimeoutError):
+            raise _UpstreamDown() from None
+        except Exception as e:  # noqa: BLE001 - whatever the upstream did, the browser gets a 502
+            log.info(f"WS upstream connect failed: {type(e).__name__}")
+            return _upstream_down()
+
+        chosen = upstream_ws.protocol
+        client_ws = web.WebSocketResponse(
+            protocols=[chosen] if chosen else (),
+            heartbeat=30,
+            max_msg_size=0,
+        )
+        await client_ws.prepare(request)
+
+        async def c2u():
+            async for msg in client_ws:
+                if msg.type == WSMsgType.TEXT:
+                    await upstream_ws.send_str(msg.data)
+                elif msg.type == WSMsgType.BINARY:
+                    await upstream_ws.send_bytes(msg.data)
+                elif msg.type in (WSMsgType.CLOSE, WSMsgType.CLOSING,
+                                  WSMsgType.CLOSED, WSMsgType.ERROR):
+                    break
+
+        async def u2c():
+            async for msg in upstream_ws:
+                if msg.type == WSMsgType.TEXT:
+                    await client_ws.send_str(msg.data)
+                elif msg.type == WSMsgType.BINARY:
+                    await client_ws.send_bytes(msg.data)
+                elif msg.type in (WSMsgType.CLOSE, WSMsgType.CLOSING,
+                                  WSMsgType.CLOSED, WSMsgType.ERROR):
+                    break
+
+        try:
+            _, pending = await asyncio.wait(
+                [asyncio.create_task(c2u()), asyncio.create_task(u2c())],
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for t in pending:
+                t.cancel()
+        finally:
+            if not upstream_ws.closed:
+                await upstream_ws.close()
+            if not client_ws.closed:
+                await client_ws.close()
+        return client_ws
+    finally:
+        await sess.close()
+
+
+async def _proxy_http(request: web.Request, upstream_url: URL,
+                      forward: dict[str, str] | None = None) -> web.StreamResponse:
+    """HTTP pass-through. Streams body both directions; preserves status,
+    headers (minus hop-by-hop), and the app's own Set-Cookie from upstream.
+    `forward` REPLACES those request headers upstream. clanker-learn's own cookies
+    are taken out both ways."""
+    headers_in = _filter_headers(request.headers, HOP_BY_HOP_HEADERS | {"cookie"})
+    cookies = _app_cookies(request.headers)
+    if cookies:
+        headers_in["Cookie"] = cookies
+    for k, v in (forward or {}).items():
+        headers_in[k] = v
+
+    # Stream the body upstream rather than buffering. GET/HEAD have no body.
+    data = None
+    if request.method not in ("GET", "HEAD"):
+        data = request.content
+
+    # No request timeout — WebSocket-like long polls need to live as long as the user holds
+    # the tab. Connection close is the source of truth for "done", not a wall clock.
+    timeout = ClientTimeout(total=None, sock_read=None, sock_connect=PASSTHROUGH_CONNECT_TIMEOUT_S)
+    async with ClientSession(timeout=timeout, auto_decompress=False) as sess:
+        try:
+            req_ctx = sess.request(
+                request.method,
+                upstream_url,
+                headers=headers_in,
+                data=data,
+                allow_redirects=False,
+            )
+            upstream_resp = await req_ctx.__aenter__()
+        except (ClientConnectorError, TimeoutError):
+            raise _UpstreamDown() from None
+        except Exception:  # noqa: BLE001 - mirror _proxy_ws's connect guard
+            return _upstream_down()
+        try:
+            headers_out = _filter_headers(
+                upstream_resp.headers, RESPONSE_DROP_HEADERS | {"set-cookie"})
+            for value in upstream_resp.headers.getall("Set-Cookie", []):
+                if not _own_cookie(value.partition("=")[0]):
+                    headers_out.add("Set-Cookie", value)
+            response = web.StreamResponse(
+                status=upstream_resp.status,
+                reason=upstream_resp.reason,
+                headers=headers_out,
+            )
+            await response.prepare(request)
+            async for chunk in upstream_resp.content.iter_any():
+                if not chunk:
+                    break
+                await response.write(chunk)
+            await response.write_eof()
+            return response
+        finally:
+            await req_ctx.__aexit__(None, None, None)
+
+
+async def origin_proxy_handler(request: web.Request) -> web.StreamResponse:
+    """Catch-all for the origin ports (CL_ORIGIN_PORTS): which app this port serves comes
+    from the origin table, by the port the request ARRIVED on (the socket's own); the gate is
+    the project's session cookie (host-keyed and port-blind, so the mint on the page's port
+    reaches us); the upstream is the sandbox's address from the broker and the table's port.
+    Reverse-proxied at port root, no path prefix."""
+    sock = request.transport.get_extra_info("sockname") if request.transport else None
+    arrival_port = int(sock[1]) if sock else 0
+    entry = ORIGIN_PORTS.get(arrival_port)
+    if entry is None:
+        return web.Response(status=404, text="no app is assigned to this port")
+    project, port = entry["project"], entry["port"]
+
+    cookie = request.cookies.get(services.session_cookie_name(WEB_PORT, project))
+    if not cookie or not _session_valid(cookie, project):
+        return web.Response(status=401, text="session required")
+
+    is_ws = (request.headers.get("Upgrade", "").lower() == "websocket")
+    # The app sees the address the browser used, the way a standard reverse proxy presents
+    # it: apps that admit only their public URL match on the Host, and build links and
+    # websocket URLs (wss://) from the scheme. Where we connect does not depend on it.
+    forward = {"X-Forwarded-Proto": "https"}
+    if request.headers.get("Host"):
+        forward["Host"] = request.headers["Host"]
+    if is_ws:
+        cookies = _app_cookies(request.headers)
+        if cookies:
+            forward["Cookie"] = cookies
+
+    failed = None
+    while True:
+        address = await sandbox_address(project, failed)
+        if address is None or address == failed:
+            return _upstream_down()
+        # Host and port are the broker's address and the table's port, nothing else: the
+        # request gives only its path and query, from its relative form (an absolute-form
+        # request line names a host, which is not read).
+        upstream_url = URL.build(
+            scheme="ws" if is_ws else "http", host=address, port=port,
+            path=request.rel_url.raw_path, query_string=request.rel_url.raw_query_string, encoded=True)
+        try:
+            if is_ws:
+                return await _proxy_ws(request, upstream_url, forward)
+            return await _proxy_http(request, upstream_url, forward)
+        except _UpstreamDown:
+            failed = address
+
+
+# ---- the pass-through relay: raw TCP on the claimed ports ------------------------
+
+async def _pt_pump(reader: asyncio.StreamReader,
+                   writer: asyncio.StreamWriter) -> None:
+    """One-direction byte pump for the pass-through relay. 64 KiB is read granularity, not a
+    cap — the OS enforces its own socket bounds."""
+    try:
+        while True:
+            data = await reader.read(65536)
+            if not data:
+                break
+            writer.write(data)
+            await writer.drain()
+    except (OSError, asyncio.CancelledError):
+        pass
+    finally:
+        try:
+            writer.close()
+        except OSError:
+            pass
+
+
+async def passthrough_conn_handler(reader: asyncio.StreamReader,
+                                   writer: asyncio.StreamWriter) -> None:
+    """Raw-TCP pass-through: forward the connection UNTOUCHED to the claiming project's
+    sandbox at the claimed port. Deliberately NO login, cookie or session gate (raw TCP, TLS
+    perhaps, cannot carry one: the app's own auth is the only lock), no origin check (this is
+    not HTTP), and no payload logging; these ports are published on the machine's loopback
+    only. The arrival port is the ONLY routing key; an unclaimed port, or a project without
+    an address, closes with ZERO bytes written."""
+    sock = writer.get_extra_info("sockname")
+    arrival = int(sock[1]) if sock else 0
+    claim = PASSTHROUGH_CLAIMS.get(arrival)
+    if claim is None:
+        writer.close()
+        return
+    failed = None
+    while True:
+        address = await sandbox_address(claim["project"], failed)
+        if address is None or address == failed:
+            writer.close()
+            return
+        try:
+            up_reader, up_writer = await asyncio.wait_for(
+                asyncio.open_connection(address, claim["port"]), PASSTHROUGH_CONNECT_TIMEOUT_S)
+            break
+        except (OSError, TimeoutError):
+            failed = address
+    await asyncio.gather(_pt_pump(reader, up_writer),
+                         _pt_pump(up_reader, writer))
 
 
 PLACEHOLDER = """<!doctype html>
@@ -661,8 +1545,15 @@ def build_app() -> web.Application:
     app.router.add_get("/broker/lifecycle", broker_lifecycle_handler)
     app.router.add_post("/broker/project", broker_create_handler)
     app.router.add_get("/broker/project/{name}", broker_project_status_handler)
-    # Before the action route, which would otherwise take "limits" for an action.
+    app.router.add_get("/broker/project/{name}/terminal", ws_handler)
+    app.router.add_get("/broker/project/{name}/services", project_services_handler)
+    app.router.add_get("/broker/project/{name}/ports", broker_port_list_handler)
+    app.router.add_post("/broker/project/{name}/ports/remove", broker_port_remove_handler)
+    # Before the action route, which would otherwise take these for an action.
     app.router.add_post("/broker/project/{name}/limits", broker_project_limits_handler)
+    app.router.add_post("/broker/project/{name}/session", session_handler)
+    app.router.add_post("/broker/project/{name}/origin", project_origin_handler)
+    app.router.add_post("/broker/project/{name}/ports", broker_port_add_handler)
     app.router.add_post("/broker/project/{name}/{action}", broker_project_action_handler)
     app.router.add_get("/broker/op/{op_id}/log", broker_op_log_handler)
     app.router.add_get("/broker/op/{op_id}/alive", broker_op_alive_handler)
@@ -670,15 +1561,59 @@ def build_app() -> web.Application:
     return app
 
 
-def listen_on(subnet: str) -> list[tuple[str, int]]:
-    """Where the server listens: its address in the listen subnet (the front network's), on
-    the page's port, and nothing else a browser or a sandbox could reach: a connection that
-    arrives on a project's network finds nothing listening. The outer container asks at that
-    same address whether it answers. Raises ValueError, as services.listen_address does."""
-    return [(services.listen_address(subnet), WEB_PORT)]
+def build_origin_app() -> web.Application:
+    """What every origin port serves: the origin proxy, for any method and path. No body
+    limit: the body is streamed upstream, never read here."""
+    app = web.Application(client_max_size=0)
+    app.router.add_route("*", "/{tail:.*}", origin_proxy_handler)
+    return app
+
+
+def port_range(text: str, called: str) -> tuple[int, int]:
+    """A range as the run command names it, `first-last`, of ports from 1024 to 65535
+    (outer/core.py checks it the same way before the container is made). Raises ValueError
+    naming the setting."""
+    low, dash, high = str(text).strip().partition("-")
+    if dash and low.isascii() and low.isdigit() and high.isascii() and high.isdigit():
+        first, last = int(low), int(high)
+        if 1024 <= first <= last <= 65535:
+            return first, last
+    raise ValueError(f"{called} is {text!r}: it must be a range of ports from 1024 to 65535, as 11100-11164")
+
+
+def port_ranges(env) -> tuple[tuple[int, int], tuple[int, int]]:
+    """The origin range and the pass-through range from the environment, checked: neither
+    overlaps the other or the page's port. Raises ValueError."""
+    origin = port_range(env.get("CL_ORIGIN_PORTS", "{}-{}".format(*ORIGIN_RANGE)), "CL_ORIGIN_PORTS")
+    passthrough = port_range(env.get("CL_PASSTHROUGH_PORTS", "{}-{}".format(*PASSTHROUGH_RANGE)), "CL_PASSTHROUGH_PORTS")
+    spans = [("CL_WEB_PORT", (WEB_PORT, WEB_PORT)), ("CL_ORIGIN_PORTS", origin), ("CL_PASSTHROUGH_PORTS", passthrough)]
+    for i, (first, (a_low, a_high)) in enumerate(spans):
+        for second, (b_low, b_high) in spans[i + 1:]:
+            if a_low <= b_high and b_low <= a_high:
+                raise ValueError(f"{first} and {second} overlap")
+    return origin, passthrough
+
+
+def listen_on(subnet: str) -> list[tuple[str, int, str]]:
+    """Where the server listens, as (address, port, what): its address in the listen subnet
+    (the front network's) on the page's port ("page"), on every origin port ("origin") and on
+    every pass-through port ("passthrough"), and nothing else a browser or a sandbox could
+    reach: a connection that arrives on a project's network finds nothing listening. The
+    outer container asks at that same address whether it answers. Raises ValueError, as
+    services.listen_address does."""
+    host = services.listen_address(subnet)
+    return [(host, WEB_PORT, "page"),
+            *[(host, port, "origin") for port in range(ORIGIN_RANGE[0], ORIGIN_RANGE[1] + 1)],
+            *[(host, port, "passthrough") for port in range(PASSTHROUGH_RANGE[0], PASSTHROUGH_RANGE[1] + 1)]]
 
 
 def main() -> None:
+    global ORIGIN_RANGE, PASSTHROUGH_RANGE
+    try:
+        ORIGIN_RANGE, PASSTHROUGH_RANGE = port_ranges(os.environ)
+    except ValueError as e:
+        log.error(f"cannot choose the ports to listen on: {e}")
+        raise SystemExit(1) from None
     try:
         sites = listen_on(os.environ.get("CL_LISTEN_SUBNET", ""))
     except ValueError as e:
@@ -687,14 +1622,28 @@ def main() -> None:
         log.error(f"cannot choose the listen address: {e}")
         raise SystemExit(1) from None
     ssl_ctx = ensure_tls(TLS_DIR / "cert.pem", TLS_DIR / "key.pem", HOST_BIND)
+    _origin_table_load()
+    _claims_load()
     app = build_app()
 
     async def _serve() -> None:
+        # Two runners: the page's app on its port, the origin proxy on every origin port,
+        # all with the one certificate.
         runner = web.AppRunner(app, access_log=log)
         await runner.setup()
-        for host, port in sites:
-            await web.TCPSite(runner, host, port, ssl_context=ssl_ctx).start()
-            log.info(f"clanker-learn's web server listening on https://{host}:{port}")
+        # No access log for the apps: a query string there is often the app's own token.
+        origin_runner = web.AppRunner(build_origin_app(), access_log=None)
+        await origin_runner.setup()
+        relays = []
+        for host, port, what in sites:
+            if what == "passthrough":
+                # Plain TCP, deliberately: the traffic is forwarded untouched; TLS, if any,
+                # is the app's own.
+                relays.append(await asyncio.start_server(passthrough_conn_handler, host, port))
+            else:
+                await web.TCPSite(runner if what == "page" else origin_runner, host, port, ssl_context=ssl_ctx).start()
+        log.info(f"clanker-learn's web server listening on https://{sites[0][0]}:{WEB_PORT} "
+                 f"(origin ports {ORIGIN_RANGE[0]}-{ORIGIN_RANGE[1]}, pass-through {PASSTHROUGH_RANGE[0]}-{PASSTHROUGH_RANGE[1]})")
         stop = asyncio.Event()
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGTERM, signal.SIGINT):
@@ -702,6 +1651,9 @@ def main() -> None:
         try:
             await stop.wait()
         finally:
+            for relay in relays:
+                relay.close()
+            await origin_runner.cleanup()
             await runner.cleanup()
 
     try:

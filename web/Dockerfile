@@ -8,7 +8,7 @@ FROM debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f0
 
 RUN set -eux; \
     apt-get update; \
-    apt-get install -y --no-install-recommends ca-certificates tini python3 python3-aiohttp python3-cryptography; \
+    apt-get install -y --no-install-recommends ca-certificates tini python3 python3-aiohttp python3-cryptography python3-asyncssh; \
     rm -rf /var/lib/apt/lists/*
 
 COPY server.py services.py /opt/cl/
