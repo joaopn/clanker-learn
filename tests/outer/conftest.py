@@ -228,10 +228,10 @@ def ready(image, peer):
         one.remove()
 
 
-def fetch_from(container, url, timeout_s=4):
-    """GET `url` from inside a container of the test daemon that has python3.
-    Returns (status, body); status 0 when nothing answered."""
-    code = (
+def fetch_code(url, timeout_s=4):
+    """A python program that GETs `url` and prints the status, then the body; status 0 when
+    nothing answered."""
+    return (
         "import sys, urllib.request, urllib.error\n"
         "try:\n"
         f"    r = urllib.request.urlopen({url!r}, timeout={timeout_s}); print(r.status); print(r.read().decode())\n"
@@ -240,5 +240,14 @@ def fetch_from(container, url, timeout_s=4):
         "except Exception as e:\n"
         "    print(0); print(repr(e))\n"
     )
-    out = run("docker", "exec", container, "python3", "-c", code).stdout.split("\n", 1)
+
+
+def fetched(stdout):
+    out = stdout.split("\n", 1)
     return int(out[0]), out[1] if len(out) > 1 else ""
+
+
+def fetch_from(container, url, timeout_s=4):
+    """GET `url` from inside a container of the test daemon that has python3.
+    Returns (status, body); status 0 when nothing answered."""
+    return fetched(run("docker", "exec", container, "python3", "-c", fetch_code(url, timeout_s)).stdout)

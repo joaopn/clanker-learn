@@ -1,8 +1,10 @@
 """The outer container, started for real in privileged mode."""
+import base64
+import json
 import time
 
 import pytest
-from conftest import PEER_PORT, fetch_from, probe_from, run
+from conftest import IMAGE, PEER_PORT, fetch_code, fetch_from, fetched, probe_from, run
 
 pytestmark = pytest.mark.integration
 
@@ -245,10 +247,11 @@ def test_starts_nothing_when_the_guard_rules_fail(outer, tmp_path, kind, said):
     assert one.sh("test -e /var/log/dockerd.log", check=False).returncode != 0
 
 
-def test_refuses_without_its_own_init_and_ends_nothing(outer):
+def test_refuses_without_its_own_init_and_ends_nothing(outer, peer):
     """Another entrypoint (as --pid=host would): the init cannot know the processes it sees are
     its own, so it starts nothing and ends nothing. A bystander process shows the second half
-    for the refusal; the stop is covered by test_a_stop_in_someone_elses_namespace_ends_nothing."""
+    for the refusal; the stop is covered by test_a_stop_in_someone_elses_namespace_ends_nothing.
+    The network is the container's own, so the port still says why."""
     one = outer().start(extra=("--entrypoint", "sh"),
                         command=("-c", "/bin/busybox sleep 100000 & exec python3 /opt/cl/init.py"))
     state = one.wait()
@@ -257,6 +260,91 @@ def test_refuses_without_its_own_init_and_ends_nothing(outer):
     assert not daemon_runs(one)
     assert sleeper_runs(one)
     assert "refusing" not in run("docker", "logs", one.name).stderr
+    status, body = fetch_from(peer["name"], f"http://{one.address()}:8080/")
+    assert status == 503 and state["reason"] in body
+
+
+# The two flags that would make the container act on the machine itself. A start with one of
+# them cannot be tried on the test daemon: if the refusal were broken, the dev container's own
+# network or control groups would be the ones acted on. So an ordinary outer container stands
+# in for the machine, and the candidate is started by its inner daemon.
+
+RECORDING_TOOL = (
+    '#!/bin/sh\n'
+    'echo "$(basename "$0") $*" >> /ran/log\n'
+    'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin exec "$(basename "$0")" "$@"\n'
+)
+TOOLS_THAT_ACT = ("iptables", "iptables-restore", "ip6tables", "ip6tables-restore", "dockerd")
+CANDIDATE = "candidate"
+
+
+def machine_with_candidate(outer, *flags):
+    """A ready outer container as the machine, and inside it the image started with `flags`.
+    Every tool by which the candidate could act on a network or start a daemon is replaced by
+    one that writes its name to the machine's /cl-ran/log first."""
+    machine = outer().start()
+    assert machine.wait()["state"] == "ready", machine.state()
+    machine.load_probe()
+    stub = base64.b64encode(RECORDING_TOOL.encode()).decode()
+    machine.sh("mkdir -p /cl-fake /cl-ran && " + " && ".join(
+        f"echo {stub} | base64 -d > /cl-fake/{tool} && chmod 755 /cl-fake/{tool}" for tool in TOOLS_THAT_ACT))
+    machine.inner("run", "-d", "--name", CANDIDATE, "--privileged", *flags, "-e", "CL_MODE=privileged",
+                  "-e", f"PATH={PATH_WITH_FAKES}", "-v", "/cl-fake:/fake:ro", "-v", "/cl-ran:/ran", IMAGE)
+    return machine
+
+
+def candidate_state(machine, timeout=90):
+    deadline = time.monotonic() + timeout
+    state = {"state": "unknown"}
+    while time.monotonic() < deadline:
+        done = machine.inner("exec", CANDIDATE, "cat", "/run/cl/state.json", check=False)
+        try:
+            state = json.loads(done.stdout)
+        except ValueError:
+            state = {"state": "unknown", "reason": done.stderr}
+        if state["state"] in ("ready", "refused"):
+            return state
+        time.sleep(0.5)
+    logs = machine.inner("logs", "--tail", "30", CANDIDATE, check=False)
+    raise AssertionError(f"the candidate reached neither ready nor refused; state {state}; log:\n{logs.stderr[-2000:]}")
+
+
+def tools_the_candidate_ran(machine):
+    return machine.sh("cat /cl-ran/log 2>/dev/null", check=False).stdout
+
+
+def assert_the_recording_works(machine):
+    """An empty record means something only if the tools do record."""
+    machine.inner("exec", CANDIDATE, "iptables", "-S", "INPUT")
+    assert tools_the_candidate_ran(machine) == "iptables -S INPUT\n"
+
+
+def test_refuses_the_machines_network_and_touches_nothing(outer):
+    """--network=host: nothing is run that could change a rule or start a daemon, and no port
+    is opened on the machine. The container stays up and its log says why."""
+    machine = machine_with_candidate(outer, "--network=host", "-e", "CL_UI_PORT=8081")
+    state = candidate_state(machine)
+    assert state["state"] == "refused", state
+    assert "--network=host" in state["reason"] and "docker0" in state["reason"]
+    assert tools_the_candidate_ran(machine) == ""
+    listening = machine.sh("ss -ltnH").stdout
+    assert ":8080 " in listening and ":8081 " not in listening, listening
+    assert machine.inner("inspect", "-f", "{{.State.Status}}", CANDIDATE).stdout.strip() == "running"
+    assert state["reason"] in machine.inner("logs", CANDIDATE).stderr
+    assert_the_recording_works(machine)
+
+
+def test_refuses_the_machines_control_groups_and_starts_nothing(outer):
+    """--cgroupns=host: refused before a rule is applied or a daemon started. The network is
+    the candidate's own, so its port says why."""
+    machine = machine_with_candidate(outer, "--cgroupns=host")
+    state = candidate_state(machine)
+    assert state["state"] == "refused", state
+    assert "--cgroupns=private" in state["reason"] and state["mode"] == "privileged"
+    assert tools_the_candidate_ran(machine) == ""
+    status, body = fetched(machine.inner("exec", CANDIDATE, "python3", "-c", fetch_code("http://127.0.0.1:8080/")).stdout)
+    assert status == 503 and state["reason"] in body
+    assert_the_recording_works(machine)
 
 
 def test_an_unforeseen_fault_is_a_refusal_with_a_reason(outer, tmp_path, peer):
