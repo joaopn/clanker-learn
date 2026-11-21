@@ -392,6 +392,207 @@ def test_a_restart_of_clanker_learn_brings_back_what_was_running(outer, sandbox_
     assert "broken could not be started" in run("docker", "logs", one.name).stderr
 
 
+# --- recreate, the setup recipe, the listed services, cl-expose -------------------------------
+
+def setup_becomes(lab, project, wanted, timeout=90):
+    """Wait for the sandbox's init to say how the setup recipe went."""
+    deadline = time.monotonic() + timeout
+    while True:
+        state = lab.cl("status", project)["setup"]
+        if state == wanted:
+            return state
+        assert time.monotonic() < deadline, f"the setup recipe of {project} is {state!r}, not {wanted!r}"
+        time.sleep(0.5)
+
+
+def as_learner(lab, project, script):
+    return lab.sandbox(project, "bash", "-lc", script, user="learner")
+
+
+def test_a_recreate_gives_a_new_container_and_runs_the_recipe_once(lab):
+    lab.cl("create", "rec", "--memory", "256m")
+    assert setup_becomes(lab, "rec", "none") == "none"                      # no recipe yet: nothing to run
+    assert "next recreated" in lab.cl("limits", "rec", "--memory", "none")["notes"][0]
+    assert limits_inside(lab, "rec")["memory"] == str(256 * 1024 ** 2)      # still there: only a recreate removes it
+    lab.sandbox("rec", "sh", "-c", "echo installed > /opt/marker")
+    as_learner(lab, "rec", "mkdir -p /workspace/.learn && echo mine > ~/in-home && echo work > /workspace/work && "
+               "printf 'echo run >> /workspace/.learn/runs\\nsudo touch /opt/from-recipe\\nid -un > /workspace/.learn/ran-as\\n' > /workspace/.learn/setup.sh")
+    before = container_id(lab, "rec")
+
+    lab.cl("stop", "rec")
+    lab.cl("start", "rec")                                                  # a plain stop and start: the recipe is not run
+    time.sleep(2)                                                           # the state still says "none" from before: give a wrong init time to act
+    assert setup_becomes(lab, "rec", "none") == "none"
+    assert lab.sh("cat /data/projects/rec/.learn/runs", check=False).stdout == ""
+
+    assert lab.cl("recreate", "rec")["state"] == "running"
+    assert container_id(lab, "rec") != before
+    assert limits_inside(lab, "rec")["memory"] == "max"
+    setup_becomes(lab, "rec", "done")
+    assert lab.sh("cat /data/projects/rec/.learn/runs /data/projects/rec/.learn/ran-as").stdout.split() == ["run", "learner"]
+    assert lab.sandbox("rec", "ls", "/opt").stdout.split() == ["cl", "from-recipe"]           # the recipe's file; the earlier marker is gone
+    assert as_learner(lab, "rec", "cat ~/in-home /workspace/work").stdout.split() == ["mine", "work"]
+    assert "running the setup recipe" in lab.inner("logs", "cl-sb-rec").stderr
+
+    lab.cl("stop", "rec")
+    lab.cl("start", "rec")
+    setup_becomes(lab, "rec", "done")
+    time.sleep(2)
+    assert lab.sh("cat /data/projects/rec/.learn/runs").stdout.split() == ["run"]              # still once
+
+    # A recreate that was cut short after the old container went is completed by running it again.
+    lab.inner("rm", "-f", "cl-sb-rec")
+    assert lab.cl("status", "rec")["state"] == "missing"
+    assert lab.cl("recreate", "rec")["state"] == "running"
+    setup_becomes(lab, "rec", "done")
+    assert lab.sh("cat /data/projects/rec/.learn/runs").stdout.split() == ["run", "run"]
+
+
+def test_a_recipe_that_fails_says_so_and_the_services_still_start(lab):
+    lab.cl("create", "bad")
+    peer_name = peer_of(lab, "bad")
+    as_learner(lab, "bad", "mkdir -p /workspace/.learn && printf 'echo before the fault\\nwhile [ ! -e /workspace/go ]; do sleep 0.2; done\\ntouch /workspace/recipe-over\\nexit 3\\n' > /workspace/.learn/setup.sh && "
+               "printf 'web: python3 -m http.server 8123 --bind 0.0.0.0 --directory /workspace\\n"
+               "order: test -e /workspace/recipe-over && echo after > /workspace/order || echo before > /workspace/order\\n' > /workspace/.learn/services")
+    address = lab.cl("recreate", "bad")["address"]
+    setup_becomes(lab, "bad", "running")                                    # the recreate did not wait for the recipe
+    assert reach(lab, peer_name, address, 8123) == "refused"                # and the services wait for it
+    as_learner(lab, "bad", "touch /workspace/go")
+    setup_becomes(lab, "bad", "failed (exit 3)")
+    assert "before the fault" in lab.sandbox("bad", "cat", "/var/log/cl/setup.log").stdout
+    deadline = time.monotonic() + 30
+    while reach(lab, peer_name, address, 8123) != "connected":
+        assert time.monotonic() < deadline, "the listed service did not start after the failed recipe"
+        time.sleep(0.5)
+    deadline = time.monotonic() + 30
+    while lab.sh("test -e /data/projects/bad/order", check=False).returncode != 0:
+        assert time.monotonic() < deadline, "the second listed service did not run"
+        time.sleep(0.5)
+    assert lab.sh("cat /data/projects/bad/order").stdout == "after\n"       # the services wait for the recipe
+
+
+def test_a_services_file_that_is_a_pipe_does_not_hold_the_sandbox_up(lab):
+    """What the sandbox user puts at that path is read as that user, with a time limit: the
+    init goes on, and still hears a stop."""
+    lab.cl("create", "pipe")
+    as_learner(lab, "pipe", "mkdir -p /workspace/.learn && mkfifo /workspace/.learn/services")
+    lab.cl("stop", "pipe")
+    lab.cl("start", "pipe")
+    time.sleep(8)                                                           # past the time limit of the read
+    started = time.monotonic()
+    lab.cl("stop", "pipe")
+    assert time.monotonic() - started < 8, "the init did not hear the stop"
+    assert lab.inner("inspect", "-f", "{{.State.ExitCode}}", "cl-sb-pipe").stdout.strip() == "0"
+
+
+def test_listed_services_come_back_at_every_start_and_are_asked_to_end_at_a_stop(lab):
+    lab.cl("create", "serv")
+    peer_name = peer_of(lab, "serv")
+    services = ("# what the tutor started\n"
+                "web: python3 -m http.server 8123 --bind 0.0.0.0 --directory /workspace\n"
+                "polite: trap 'echo ended > /workspace/polite-ended; exit 0' TERM; while true; do sleep 1; done\n"
+                "not a service line\n")
+    as_learner(lab, "serv", f"mkdir -p /workspace/.learn && printf '%s' \"{services}\" > /workspace/.learn/services")
+
+    def web_answers():
+        address = lab.cl("status", "serv")["address"]
+        deadline = time.monotonic() + 30
+        while reach(lab, peer_name, address, 8123) != "connected":
+            assert time.monotonic() < deadline, "the listed service does not answer"
+            time.sleep(0.5)
+        return lab.sandbox("serv", "sh", "-c", "ps -eo user:20,args | grep '[h]ttp.server 8123'").stdout.split()[0]
+
+    assert reach(lab, peer_name, lab.cl("status", "serv")["address"], 8123) == "refused"      # listed, not started yet
+    lab.cl("stop", "serv")
+    lab.cl("start", "serv")
+    assert web_answers() == "learner"
+    assert "started the service web" in lab.inner("logs", "cl-sb-serv").stderr and "not a service line, skipped" in lab.inner("logs", "cl-sb-serv").stderr
+    assert lab.sh("ls /data/projects/serv/.learn/logs").stdout.split() == ["polite.log", "web.log"]
+
+    assert lab.sh("cat /data/projects/serv/polite-ended", check=False).stdout == ""
+    lab.cl("stop", "serv")
+    assert lab.sh("cat /data/projects/serv/polite-ended").stdout == "ended\n"                # asked, not just killed
+    lab.cl("start", "serv")
+    assert web_answers() == "learner"
+    lab.cl("recreate", "serv")
+    assert web_answers() == "learner"
+
+
+def test_a_loopback_only_server_is_reachable_after_cl_expose_and_again_after_a_restart(lab):
+    lab.cl("create", "loop")
+    peer_name = peer_of(lab, "loop")
+    address = lab.cl("status", "loop")["address"]
+    as_learner(lab, "loop", "mkdir -p /workspace/.learn /workspace/site && echo from loopback > /workspace/site/index.html")
+    lab.inner("exec", "-d", "-u", "learner", "cl-sb-loop", "python3", "-m", "http.server", "8456", "--bind", "127.0.0.1", "--directory", "/workspace/site")
+    deadline = time.monotonic() + 20
+    while "from loopback" not in as_learner(lab, "loop", "curl -s --max-time 3 http://127.0.0.1:8456/ || true").stdout:
+        assert time.monotonic() < deadline, "the loopback server did not come up"
+        time.sleep(0.3)
+    assert reach(lab, peer_name, address, 8456) == "refused"                                 # nothing outside the sandbox reaches it
+
+    said = as_learner(lab, "loop", "cl-expose 8456 7070").stdout
+    assert "port 8456: now reachable" in said and "port 7070:" in said and "reachable already" in said   # 7070 is the files server's
+    assert reach(lab, peer_name, address, 8456) == "connected"
+    fetched = lab.inner("exec", peer_name, "curl", "-s", "--max-time", "5", f"http://{address}:8456/").stdout
+    assert fetched == "from loopback\n"
+    assert "port 8456: already taken" in as_learner(lab, "loop", "cl-expose 8456").stdout     # asked twice: harmless
+    assert as_learner(lab, "loop", "cl-expose nonsense; echo $?").stdout.strip() == "2"
+
+    # Listed, both come back at the next start.
+    as_learner(lab, "loop", "printf 'site: python3 -m http.server 8456 --bind 127.0.0.1 --directory /workspace/site\\ntab: cl-expose 8456\\n' > /workspace/.learn/services")
+    lab.cl("stop", "loop")
+    lab.cl("start", "loop")
+    deadline = time.monotonic() + 30
+    while lab.inner("exec", peer_name, "curl", "-s", "--max-time", "3", f"http://{address}:8456/", check=False).stdout != "from loopback\n":
+        assert time.monotonic() < deadline, "the exposed server did not come back"
+        time.sleep(0.5)
+    # `tab` ended as soon as it had detached its relay: the init collects it, it does not stay as a zombie.
+    time.sleep(2)
+    assert "Z" not in lab.sandbox("loop", "ps", "-eo", "stat=").stdout
+
+
+WRITE_A_LONG_SERVICES_FILE = (
+    "head = 'ok: touch /workspace/ok-ran\\n'\n"
+    "cut = 'cut: touch /workspace/cut-ran'\n"                      # the size limit falls right after this...
+    "rest = ' /workspace/never-named\\n'\n"                        # ...so the line as read would be another command
+    "padding = '#' * (64 * 1024 - len(head) - len(cut) - 1) + '\\n'\n"
+    "open('/workspace/.learn/services', 'w').write(head + padding + cut + rest)\n"
+)
+
+
+def test_a_services_file_cut_in_a_sandbox_runs_no_half_command(lab):
+    lab.cl("create", "cutf")
+    as_learner(lab, "cutf", "mkdir -p /workspace/.learn")
+    lab.sandbox("cutf", "python3", "-c", WRITE_A_LONG_SERVICES_FILE, user="learner")
+    assert int(lab.sh("stat -c %s /data/projects/cutf/.learn/services").stdout) > 64 * 1024
+    lab.cl("stop", "cutf")
+    lab.cl("start", "cutf")
+    deadline = time.monotonic() + 30
+    while lab.sh("test -e /data/projects/cutf/ok-ran", check=False).returncode != 0:
+        assert time.monotonic() < deadline, "the first listed service did not run"
+        time.sleep(0.5)
+    time.sleep(2)
+    assert lab.sh("ls /data/projects/cutf").stdout.split() == ["ok-ran"]
+    assert "longer than 65536 bytes" in lab.inner("logs", "cl-sb-cutf").stderr
+
+
+FAKE_DOCKER_BUILD_FAILS = "#!/bin/sh\nif [ \"$1\" = build ]; then echo 'fake docker: build fails' >&2; exit 1; fi\nexec /usr/bin/docker \"$@\"\n"
+
+
+def test_a_recreate_that_cannot_get_its_image_removes_nothing(outer, sandbox_image, tmp_path):
+    tools = fake_tools(tmp_path, {"docker": FAKE_DOCKER_BUILD_FAILS})
+    one = a_lab(outer, sandbox_image, env={"CL_MODE": "privileged", "CL_WATCH_S": "1", "PATH": PATH_WITH_FAKES}, extra=("-v", f"{tools}:/fake:ro"))
+    one.cl("create", "stays")
+    one.sandbox("stays", "sh", "-c", "echo installed > /opt/marker")
+    before = container_id(one, "stays")
+    one.inner("rmi", "-f", sandbox_image)                 # the image is gone; the running sandbox keeps what it was made from
+    assert one.inner("image", "inspect", sandbox_image, check=False).returncode != 0
+    failed = one.cl("recreate", "stays", check=False)["error"]
+    assert "could not be built" in failed and "fake docker: build fails" in failed
+    assert container_id(one, "stays") == before and one.cl("status", "stays")["state"] == "running"
+    assert one.sandbox("stays", "cat", "/opt/marker").stdout == "installed\n"
+
+
 # --- a failed creation, the other runtime, the build -----------------------------------------
 
 FAKE_DOCKER_CREATE_FAILS = (

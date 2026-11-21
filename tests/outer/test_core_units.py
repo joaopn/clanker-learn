@@ -1,9 +1,13 @@
 """The parts of the core and of the sandbox's own programs that are decided without a daemon."""
+import io
 import os
 import subprocess
+import tarfile
+import time
 
 import core
 import files_server
+import loopback_fwd
 import pytest
 import sandbox_init
 
@@ -21,7 +25,7 @@ def test_any_other_name_is_refused(name):
         core.paths(name)
 
 
-@pytest.mark.parametrize("operation", [core.create, core.start, core.stop, core.set_limits, core.destroy, core.status])
+@pytest.mark.parametrize("operation", [core.create, core.start, core.stop, core.recreate, core.set_limits, core.destroy, core.status])
 @pytest.mark.parametrize("name", ["../../xtables", "a/b", "..", ""])
 def test_no_operation_makes_a_path_or_a_lock_from_a_name_that_is_not_one(monkeypatch, tmp_path, operation, name):
     monkeypatch.setattr(core, "DATA", str(tmp_path / "data"))
@@ -300,7 +304,7 @@ def test_a_project_being_destroyed_is_not_started_stopped_or_changed(monkeypatch
     monkeypatch.setattr(core, "LOCKS", str(tmp_path / "locks"))
     monkeypatch.setattr(core, "docker", lambda *args, **kwargs: pytest.fail("the daemon was asked"))
     core.write_record(dict(core.new_record("kafka"), wanted="destroying"))
-    for operation in (core.start, core.stop, core.set_limits):
+    for operation in (core.start, core.stop, core.recreate, core.set_limits):
         with pytest.raises(core.CoreError, match="is being destroyed"):
             operation("kafka")
     with pytest.raises(core.CoreError, match="exists"):
@@ -438,3 +442,232 @@ def test_a_service_of_the_sandbox_that_ends_is_started_again_but_not_in_a_tight_
     clock[0] += 2
     sandbox_init.keep_running(services, running, tried, pause_s=2, now=lambda: clock[0])
     assert len(started) == 2 and running["sshd"] is started[1]
+
+
+# --- the setup recipe, the listed services, cl-expose ----------------------------------------
+
+@pytest.mark.parametrize("state, owed", [("", True), ("running", True), ("none", False), ("done", False), ("failed (exit 3)", False)])
+def test_the_recipe_is_owed_once_per_container_and_again_if_it_was_cut_short(state, owed):
+    assert sandbox_init.setup_is_owed(state) is owed
+
+
+def test_the_recipes_state_is_written_and_read_back(tmp_path):
+    path = str(tmp_path / "lib" / "setup")
+    assert sandbox_init.setup_state(path) == ""
+    sandbox_init.write_setup_state("failed (exit 3)", path)
+    assert sandbox_init.setup_state(path) == "failed (exit 3)"
+
+
+def test_a_services_file_lists_one_named_command_a_line():
+    text = """
+# what should be running
+web: python3 -m http.server 8000 --bind 0.0.0.0
+  notebook :  jupyter lab --ip 0.0.0.0 --port 8888
+tab-8888: cl-expose 8888
+web: a second line under a name already taken
+Not A Name: echo no
+no colon here
+empty:
+../../etc/passwd: echo no
+"""
+    services, refused = sandbox_init.parse_services(text)
+    assert services == [("web", "python3 -m http.server 8000 --bind 0.0.0.0"), ("notebook", "jupyter lab --ip 0.0.0.0 --port 8888"),
+                        ("tab-8888", "cl-expose 8888")]
+    assert refused == ["web: a second line under a name already taken", "Not A Name: echo no", "no colon here", "empty:", "../../etc/passwd: echo no"]
+    assert sandbox_init.parse_services("") == ([], [])
+
+
+@pytest.mark.parametrize("breaker", ["\x0c", "\x0b", "\u2028", "\u2029", "\x85", "\x1c", "\r"])
+def test_only_a_newline_ends_a_services_line(breaker):
+    """Cut at anything else, `rm -rf /workspace/tmp<breaker>/build` would be another command."""
+    services, refused = sandbox_init.parse_services(f"clean: rm -rf /workspace/tmp{breaker}/build\nnext: true\r\n")
+    assert services == [("clean", f"rm -rf /workspace/tmp{breaker}/build"), ("next", "true")] and refused == []
+
+
+def test_a_line_with_a_nul_is_no_service():
+    """No command can hold one; started, it would end the init, at every start."""
+    services, refused = sandbox_init.parse_services("web: printf 'a\0b'\nfine: true\n")
+    assert services == [("fine", "true")] and len(refused) == 1
+
+
+def test_a_services_file_cut_by_the_size_limit_loses_its_cut_line(capsys):
+    text = b"a: true\nclean: rm -rf /workspace/tmp/build\n"
+    assert sandbox_init.whole_lines(text, 1000) == text                                   # short of the limit: all of it
+    assert sandbox_init.whole_lines(text, len(text)) == text                              # exactly the limit: all of it, and not called long
+    assert sandbox_init.whole_lines(text[:-1], len(text) - 1) == text[:-1]                # the same without a last newline
+    assert "longer than" not in capsys.readouterr().err
+    limit = len(b"a: true\nclean: rm -rf /workspace/")
+    read = text[:limit + 1]                                                               # what `head` hands over: one byte more
+    assert sandbox_init.whole_lines(read, limit) == b"a: true\n"                          # past the limit: the cut line goes
+    assert sandbox_init.parse_services(sandbox_init.whole_lines(read, limit).decode()) == ([("a", "true")], [])
+    assert sandbox_init.whole_lines(b"a: true\n" + b"x" * 10, 8) == b"a: true\n"          # the limit falls right after a newline
+    assert sandbox_init.whole_lines(b"a: true\nb: x\n", 12) == b"a: true\nb: x\n"        # a line ending one byte past it is whole
+    assert sandbox_init.whole_lines(b"x" * 11, 10) == b""                                 # one line longer than the limit
+    assert "longer than" in capsys.readouterr().err
+
+
+def test_a_services_file_is_not_followed_past_a_fair_number_of_services():
+    many = "".join(f"s{n}: true\n" for n in range(sandbox_init.MAX_SERVICES + 3))
+    services, refused = sandbox_init.parse_services(many)
+    assert len(services) == sandbox_init.MAX_SERVICES and len(refused) == 3
+    started = time.monotonic()
+    sandbox_init.parse_services("".join(f"n{n}: true\n" for n in range(20000)))   # a file filled on purpose costs no time
+    assert time.monotonic() - started < 2
+
+
+def test_a_recipes_end_that_cannot_be_recorded_does_not_end_the_init(monkeypatch, tmp_path):
+    """A full disk when the recipe ends: the init must go on, with sshd and the files server."""
+    class Ended:
+        returncode = 0
+
+        def poll(self):
+            return 0
+
+    class Running:
+        def poll(self):
+            return None
+
+    not_a_folder = tmp_path / "file"
+    not_a_folder.write_text("")
+    monkeypatch.setattr(sandbox_init, "SETUP_STATE", str(not_a_folder / "setup"))
+    assert sandbox_init.setup_ended(Ended()) is None          # no exception
+    assert sandbox_init.setup_ended(None) is None
+    still = Running()
+    assert sandbox_init.setup_ended(still) is still
+    monkeypatch.setattr(sandbox_init, "SETUP_STATE", str(tmp_path / "setup"))
+    failed = Ended()
+    failed.returncode = 3
+    assert sandbox_init.setup_ended(failed) is None and sandbox_init.setup_state() == "failed (exit 3)"
+
+
+def archive_of(name, content=b"", link=None, size=None):
+    out = io.BytesIO()
+    with tarfile.open(fileobj=out, mode="w") as tar:
+        info = tarfile.TarInfo(name)
+        if link:
+            info.type, info.linkname = tarfile.SYMTYPE, link
+            tar.addfile(info)
+        else:
+            info.size = len(content) if size is None else size
+            tar.addfile(info, io.BytesIO(content.ljust(info.size, b"x")))
+    return out.getvalue()
+
+
+@pytest.mark.parametrize("archive, state", [
+    (archive_of("setup", b"done\n"), "done"),
+    (archive_of("setup", b"running\n"), "running"),
+    (archive_of("setup", b"none"), "none"),
+    (archive_of("setup", b"failed (exit 3)\n"), "failed (exit 3)"),
+    (archive_of("setup", b"failed (exit -9)\n"), "failed (exit -9)"),
+    (archive_of("setup", b"<script>alert(1)</script>\n"), ""),      # whatever else the sandbox wrote there
+    (archive_of("setup", b"done\nand more\n"), ""),
+    (archive_of("setup", b"done", size=5000), ""),                  # too long to be a state
+    (archive_of("setup", link="/data/core/keys"), ""),              # a link is not followed, here or by the daemon
+    (b"", ""),                                                      # no such file, or no such container
+    (b"not a tar archive at all", ""),
+])
+def test_the_recipes_state_is_one_of_a_few_words_or_nothing(monkeypatch, archive, state):
+    monkeypatch.setattr(core, "first_bytes", lambda command, limit, timeout: archive[:limit])
+    assert core.setup_state("cl-sb-kafka") == state
+
+
+def test_only_the_first_bytes_of_a_command_are_read_and_only_for_so_long():
+    started = time.monotonic()
+    assert core.first_bytes(["yes"], 1000, 20) == b"y\n" * 500          # endless output: cut at the limit
+    assert core.first_bytes(["sleep", "30"], 1000, 0.5) == b""          # no output: given up on
+    assert core.first_bytes(["printf", "short"], 1000, 20) == b"short"
+    assert time.monotonic() - started < 10
+
+
+@pytest.mark.parametrize("args, ports", [(["8888"], [8888]), (["80", "8080"], [80, 8080]), ([], None), (["0"], None), (["65536"], None),
+                                         (["http"], None), (["8888", "-1"], None), (["--serve"], None), (["\u00b2"], None), (["\u0663"], None)])
+def test_cl_expose_takes_port_numbers_and_nothing_else(args, ports):
+    assert loopback_fwd.ports_of(args) == ports
+
+
+def told_of(reports, wait_s=5):
+    """What cl-expose says, and its exit status, for what its detached relay reported."""
+    read, write = os.pipe()
+    os.write(write, reports)
+    if not reports.endswith(b"\0"):
+        os.close(write)          # the relay ended (or closed its report)
+    out, err = io.StringIO(), io.StringIO()
+    try:
+        status, done = loopback_fwd.told(read, wait_s, out, err)
+        assert done is (b"done\n" in reports)
+        return status, out.getvalue(), err.getvalue()
+    finally:
+        os.close(read)
+        if reports.endswith(b"\0"):
+            os.close(write)
+
+
+def test_cl_expose_says_what_became_of_each_port():
+    status, out, err = told_of(b"relaying 8888\nheld 7070\ndone\n")
+    assert status == 0 and err == ""
+    assert out.splitlines()[0] == "port 8888: now reachable from outside the sandbox"
+    assert out.splitlines()[1].startswith("port 7070: already taken on the sandbox's own address, so it is reachable already")
+    status, out, err = told_of(b"relaying 8888\nfailed 80 Permission denied\ndone\n")
+    assert status == 1 and "port 8888: now reachable" in out and err == "port 80: could not be relayed: Permission denied\n"
+
+
+def test_a_relay_that_cannot_find_the_sandboxes_address_says_so_for_every_port(monkeypatch):
+    import asyncio
+
+    def lost():
+        raise OSError("Name or service not known")
+    monkeypatch.setattr(loopback_fwd, "own_address", lost)
+    reports = []
+    asyncio.run(loopback_fwd.relay([8888, 8889], reports.append))
+    assert reports == ["failed 8888 the sandbox's own address could not be found (Name or service not known)",
+                       "failed 8889 the sandbox's own address could not be found (Name or service not known)", "done"]
+    status, out, err = told_of(("\n".join(reports) + "\n").encode())
+    assert status == 1 and out == "" and err.count("could not be relayed") == 2
+
+
+def test_a_port_that_is_taken_is_told_from_one_that_cannot_be_bound(monkeypatch):
+    """Taken on the sandbox's address: reachable already, and no failure. Any other reason is one."""
+    import asyncio
+    import errno
+
+    async def cannot_bind(callback, host, port, reuse_address):
+        assert (host, reuse_address) == ("10.210.9.2", False)   # the sandbox's own address, never every address
+        raise OSError(errno.EADDRINUSE, "Address already in use") if port == 7070 else OSError(errno.EACCES, "Permission denied")
+    monkeypatch.setattr(loopback_fwd, "own_address", lambda: "10.210.9.2")
+    monkeypatch.setattr(loopback_fwd.asyncio, "start_server", cannot_bind)
+    reports = []
+    asyncio.run(loopback_fwd.relay([7070, 80], reports.append))
+    assert reports == ["held 7070", "failed 80 Permission denied", "done"]
+
+
+@pytest.mark.parametrize("report, status, killed", [(b"", 1, True), (b"relaying 8888\n", 1, True), (b"relaying 8888\ndone\n", 0, False),
+                                                    (b"relaying 8888\nfailed 80 Permission denied\ndone\n", 1, False)])
+def test_a_relay_that_did_not_say_it_was_done_is_stopped_and_one_that_did_is_left(monkeypatch, capsys, report, status, killed):
+    """`main` with a stand-in for the detached relay: silent, it is ended, so that "did not
+    start" is true; done, it stays, also when one of its ports failed."""
+    read, write = os.pipe()
+    os.write(write, report)
+
+    class Relay:
+        pid = 424242
+        stdout = os.fdopen(read, "rb", buffering=0)
+    ended = []
+    monkeypatch.setattr(loopback_fwd.subprocess, "Popen", lambda *args, **kwargs: Relay)
+    monkeypatch.setattr(loopback_fwd.os, "killpg", lambda pid, sig: ended.append((pid, sig)))
+    monkeypatch.setattr(loopback_fwd, "REPORT_WAIT_S", 0.3)
+    try:
+        assert loopback_fwd.main(["8888", "80"]) == status
+    finally:
+        os.close(write)
+        Relay.stdout.close()
+    assert ended == ([(424242, loopback_fwd.signal.SIGKILL)] if killed else [])
+    assert ("the relay did not start" in capsys.readouterr().err) is killed
+
+
+def test_cl_expose_fails_when_its_relay_says_nothing_or_dies():
+    assert told_of(b"") == (1, "", "cl-expose: the relay did not start\n")                      # died before a word
+    status, out, err = told_of(b"relaying 8888\n")                                              # died before it was done
+    assert status == 1 and "port 8888" in out and "the relay did not start" in err
+    started = time.monotonic()
+    status, out, err = told_of(b"relaying 8888\n\0", wait_s=0.5)                                # alive and silent: not waited for long
+    assert status == 1 and "port 8888" in out and "the relay did not start" in err and time.monotonic() - started < 5
