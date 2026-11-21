@@ -118,9 +118,30 @@ def flocked(filename):
         yield
 
 
+# Projects whose lock this process holds already, through a descriptor it was handed (the
+# broker takes the lock without waiting and hands it to the child that does the work).
+HELD = set()
+
+
 def locked(name):
     """A project's lock. The name is checked before it becomes part of a path."""
-    return flocked(valid_name(name) + ".lock")
+    valid_name(name)
+    return contextlib.nullcontext() if name in HELD else flocked(name + ".lock")
+
+
+def try_lock(name):
+    """A project's lock, taken without waiting: an open file that holds it, or None when
+    something else does. It is held until that file, and every copy of its descriptor in a
+    child, is closed."""
+    valid_name(name)
+    os.makedirs(LOCKS, exist_ok=True)
+    fh = open(os.path.join(LOCKS, name + ".lock"), "w")  # noqa: SIM115 - the caller keeps it, or hands it on
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        fh.close()
+        return None
+    return fh
 
 
 # --- limits --------------------------------------------------------------------------------
@@ -653,6 +674,30 @@ def start_wanted(say=say_nothing):
 
 # --- the `cl` command ----------------------------------------------------------------------
 
+def read_new_password(stdin=None):
+    """The new password: typed twice without echo at a terminal, else all of standard input,
+    less one trailing line end (which `echo` adds and nobody means)."""
+    stdin = stdin or sys.stdin
+    if stdin.isatty():
+        import getpass
+        first = getpass.getpass("New password: ")
+        if getpass.getpass("Again: ") != first:
+            raise CoreError("The two did not match; nothing was changed.")
+        return first
+    text = stdin.read()
+    return text[:-2] if text.endswith("\r\n") else text.removesuffix("\n")
+
+
+def set_password(password):
+    """Set the password the interface logs in with. What is stored is a hash of the proof the
+    browser derives from it, never the password; setting it ends every session."""
+    import broker_auth
+    if len(password) < broker_auth.MIN_PASSWORD_LENGTH:
+        raise CoreError(f"The password must have at least {broker_auth.MIN_PASSWORD_LENGTH} characters; nothing was changed.")
+    broker_auth.set_password(broker_auth.derive_login_proof(password), path=broker_auth.PASSWD_FILE)
+    return {"password": "set"}
+
+
 def limit_option(text, kind):
     if text is None:
         return UNCHANGED
@@ -671,6 +716,7 @@ def main(argv=None):
     verbs = parser.add_subparsers(dest="verb", required=True)
     verbs.add_parser("list")
     verbs.add_parser("start-wanted")
+    verbs.add_parser("passwd", help="set the interface's password: read from standard input, or asked for at a terminal")
     for verb in ("status", "create", "start", "stop", "recreate", "destroy", "limits"):
         one = verbs.add_parser(verb)
         one.add_argument("name")
@@ -683,7 +729,9 @@ def main(argv=None):
         print(f"clanker-learn: {message}", file=sys.stderr, flush=True)
 
     try:
-        if args.verb == "list":
+        if args.verb == "passwd":
+            out = set_password(read_new_password())
+        elif args.verb == "list":
             out = list_projects()
         elif args.verb == "start-wanted":
             out = start_wanted(say)
