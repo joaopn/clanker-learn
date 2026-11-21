@@ -7,8 +7,8 @@ self-signed); asked for "cert", it returns that certificate instead.
 The request: {"url", "method"?, "jar"?, "origin"?, "json"?, "filler"?}. "origin" is the
 header's value, the request's own origin when it is missing, and no header when it is
 null. "filler" sends {"proof": "<that many x>"} as the body. The answer: {"status", "body",
-"set_cookie": [raw Set-Cookie headers]}, or {"cert": <PEM>}; status 0 when nothing
-answered, with the error in "body"."""
+"set_cookie": [raw Set-Cookie headers], "headers": {lower-case name: value}}, or {"cert":
+<PEM>}; status 0 when nothing answered, with the error in "body"."""
 import http.cookies
 import json
 import os
@@ -71,13 +71,16 @@ def main():
     try:
         with urllib.request.urlopen(request, timeout=20, context=context) as answer:
             status, body, set_cookies = answer.status, answer.read().decode(errors="replace"), answer.headers.get_all("Set-Cookie") or []
+            headers = answer.headers
     except urllib.error.HTTPError as exc:
         status, body, set_cookies = exc.code, exc.read().decode(errors="replace"), exc.headers.get_all("Set-Cookie") or []
+        headers = exc.headers
     except (OSError, urllib.error.URLError) as exc:
         print(json.dumps({"status": 0, "body": repr(exc), "set_cookie": []}))
         return
     keep(asked.get("jar"), jar, set_cookies)
-    print(json.dumps({"status": status, "body": body, "set_cookie": set_cookies}))
+    print(json.dumps({"status": status, "body": body, "set_cookie": set_cookies,
+                      "headers": {name.lower(): value for name, value in headers.items()}}))
 
 
 main()

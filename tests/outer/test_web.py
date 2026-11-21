@@ -112,7 +112,7 @@ def project_networks(outer):
 
 
 def answers(page, timeout=30):
-    """The placeholder's status, once it answers or the time is up."""
+    """The page's status, once it answers or the time is up."""
     deadline = time.monotonic() + timeout
     while True:
         status = page.get("/")["status"]
@@ -177,10 +177,25 @@ def test_the_web_server_comes_up_from_the_preloaded_images_and_builds_nothing(si
     assert inner_images(site, "cl-sandbox") == [site.sandbox_image]
 
 
-def test_the_placeholder_answers_over_https_on_the_published_port_with_a_loopback_certificate(site):
-    page = Page(site)
+def directives(header):
+    """A content-security header as {directive: [its sources]}."""
+    return {words[0]: words[1:] for words in (part.split() for part in header.split(";")) if words}
+
+
+def test_the_page_and_its_files_come_without_a_login_under_a_strict_content_security_header_and_a_loopback_certificate(site):
+    page = Page(site)                                                   # no login, no cookie
     answer = page.get("/")
-    assert answer["status"] == 200 and "<h1>clanker-learn</h1>" in answer["body"]
+    assert answer["status"] == 200 and '<script src="/static/app.js" defer></script>' in answer["body"], answer
+    assert answer["headers"]["x-content-type-options"] == "nosniff"
+    policy = directives(answer["headers"]["content-security-policy"])
+    assert policy["script-src"] == ["'self'"] and policy["default-src"] == ["'none'"]
+    assert policy["frame-src"] == [f"https://{site.address()}:*"]       # the host the browser asked, nothing else
+    assert policy["frame-ancestors"] == ["'none'"] and policy["object-src"] == ["'none'"]
+    assert not {"'unsafe-inline'", "'unsafe-eval'"} & set(policy["script-src"] + policy["default-src"])
+    for path in ("/static/app.js", "/static/vendor/xterm.js"):
+        served = page.get(path)
+        assert served["status"] == 200 and served["headers"]["x-content-type-options"] == "nosniff", path
+        assert served["headers"]["content-type"].startswith("text/javascript") and len(served["body"]) > 1000, path
     names = page.cert().extensions.get_extension_for_class(x509.SubjectAlternativeName).value
     assert len(list(names)) == 3
     assert names.get_values_for_type(x509.DNSName) == ["localhost"]

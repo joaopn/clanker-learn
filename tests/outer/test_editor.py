@@ -7,8 +7,8 @@ import time
 import pytest
 from conftest import Outer
 from test_broker import set_password
-from test_web import PASSWORD, Page, act, proof, web_on
-from test_web_apps import on_port, opened, session_for
+from test_web import PASSWORD, Page, act, proof, said, web_on
+from test_web_apps import on_port, services, session_for
 
 pytestmark = pytest.mark.integration
 
@@ -23,10 +23,13 @@ def test_the_editor_of_a_new_project_opens_through_its_origin_port(image, peer, 
         page = Page(one)
         assert page.post("/broker/login", {"proof": proof()})["status"] == 200
         act(page, "/broker/project", {"name": "editing"})
-        origin = opened(page, "editing", EDITOR_PORT, timeout=60)   # once code-server listens
+        assert list(services(page, "editing"))[:2] == ["editor", "files"]   # the page's tabs, in this order
+        opened = page.post("/broker/project/editing/origin", {"port": EDITOR_PORT})   # listed always, never detected
+        assert opened["status"] == 200 and said(opened)["ok"], opened
+        origin = said(opened)["origin_port"]
         session_for(page, "editing")
         editor = on_port(one, page, origin)
-        deadline = time.monotonic() + 30
+        deadline = time.monotonic() + 60                              # once code-server listens
         while (answer := editor.get("/"))["status"] != 200:
             assert time.monotonic() < deadline, answer
             time.sleep(0.5)
