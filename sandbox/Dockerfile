@@ -29,7 +29,11 @@ RUN set -eux; \
     mkdir -p /workspace /etc/cl-provision; \
     chown learner:learner /workspace
 
-COPY sandbox_init.py files_server.py /opt/cl/
+COPY sandbox_init.py files_server.py loopback_fwd.py /opt/cl/
+
+# `cl-expose <port>`: give a service that listens only on loopback a place on the sandbox's
+# own address, so that the interface can show it.
+RUN printf '#!/bin/sh\nexec python3 /opt/cl/loopback_fwd.py "$@"\n' > /usr/local/bin/cl-expose && chmod 0755 /usr/local/bin/cl-expose
 
 WORKDIR /workspace
 STOPSIGNAL SIGTERM
