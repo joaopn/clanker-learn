@@ -246,13 +246,17 @@ def test_the_child_that_starts_sandboxes_is_ended_before_they_are_stopped(monkey
     calls = []
     net = tmp_path / "net"
     net.mkdir()
-    daemon, child = Running(), Running()
+    daemon, child, broker = Running(), Running(), Running()
     monkeypatch.setattr(init, "Stop", StopAtTheFirstWait)
     monkeypatch.setattr(init, "serve_status", lambda: None)
     monkeypatch.setattr(init, "own_process_namespace", lambda parent, pid1: True)
     monkeypatch.setattr(init, "bring_up", lambda stop: calls.append("bring up") or (daemon, ()))
     monkeypatch.setattr(init, "start_wanted_sandboxes", lambda: calls.append("start the projects") or child)
     monkeypatch.setattr(init, "end_child", lambda c, wait_s=5: calls.append("end the child" if c is child else "end something else"))
+    monkeypatch.setattr(init, "clear_broker_folders", lambda: calls.append("clear the broker's folders"))
+    monkeypatch.setattr(init, "start_broker", lambda: calls.append("start the broker") or broker)
+    monkeypatch.setattr(init, "broker_answers", lambda: True)
+    monkeypatch.setattr(init, "end_group", lambda leader, wait_s=5: calls.append("end the broker's group" if leader is broker else "end another group"))
     monkeypatch.setattr(init, "stop_inner_containers", lambda timeout=0: calls.append("stop the containers"))
     monkeypatch.setattr(init, "stop_daemon", lambda d, wait_s=0: calls.append("stop the daemon"))
     monkeypatch.setattr(init, "end_everything_else", lambda: calls.append("end the rest") or True)
@@ -260,8 +264,103 @@ def test_the_child_that_starts_sandboxes_is_ended_before_they_are_stopped(monkey
     monkeypatch.setattr(init, "STATE_FILE", str(tmp_path / "state.json"))
     monkeypatch.setattr(init, "NET_DIR", str(net))
     init.main()
-    assert calls == ["bring up", "start the projects", "end the child", "stop the containers", "stop the daemon", "end the rest"]
-    assert init.state["sandboxes"] == "starting"
+    assert calls == ["bring up", "clear the broker's folders", "start the projects", "start the broker",
+                     "end the child", "end the broker's group", "stop the containers", "stop the daemon", "end the rest"]
+    assert init.state["sandboxes"] == "starting" and init.state["broker"] == "down"
+
+
+def test_the_broker_is_started_again_when_it_ends_but_not_in_a_tight_loop(monkeypatch):
+    class Process:
+        def __init__(self):
+            self.ended = False
+
+        def poll(self):
+            return 0 if self.ended else None
+
+    started, empty_groups = [], set()
+
+    def start():
+        started.append(Process())
+        started[-1].pid = 1000 + len(started)
+        return started[-1]
+    monkeypatch.setattr(init, "start_broker", start)
+    monkeypatch.setattr(init, "group_is_gone", lambda pgid: pgid in empty_groups)
+    clock = [100.0]
+    brokers = []
+    tried = init.keep_broker(brokers, float("-inf"), now=lambda: clock[0])
+    assert len(started) == 1 and brokers == started and tried == 100.0
+    assert init.keep_broker(brokers, tried, now=lambda: clock[0]) == tried and len(started) == 1      # it runs: left alone
+    started[0].ended = True
+    clock[0] += init.BROKER_RESTART_S - 1
+    assert init.keep_broker(brokers, tried, now=lambda: clock[0]) == tried and len(started) == 1      # ended, but tried a moment ago
+    clock[0] += 1
+    tried = init.keep_broker(brokers, tried, now=lambda: clock[0])
+    assert len(started) == 2 and brokers == started and tried == clock[0]     # the ended one is kept: its operations still run in its group
+    empty_groups.add(started[0].pid)                                          # its last operation ends: the group's number is free for others
+    assert init.keep_broker(brokers, tried, now=lambda: clock[0]) == tried and brokers == [started[1]]   # forgotten, so a stop signals no stranger
+    monkeypatch.setattr(init, "start_broker", lambda: None)                   # from now on it cannot be started
+    started[1].ended = True
+    empty_groups.add(started[1].pid)
+    for _ in range(5):                                                        # tried again and again: nothing piles up
+        clock[0] += init.BROKER_RESTART_S
+        assert init.keep_broker(brokers, tried, now=lambda: clock[0]) == clock[0] and brokers == []
+        tried = clock[0]
+
+
+def test_the_loop_hurries_for_the_projects_and_for_a_broker_that_was_answering_and_not_for_ever(monkeypatch):
+    monkeypatch.setattr(init, "WATCH_S", 10.0)
+    child = object()
+    assert init.loop_wait(child, True, "up", 0, 100) == 1                 # the projects are being started
+    assert init.loop_wait(None, True, "down", 130, 100) == 1              # ready a moment ago: is the broker answering yet?
+    assert init.loop_wait(None, True, "down", 130, 131) == 10             # the hurry is over, answering or not
+    assert init.loop_wait(None, True, "up", 130, 100) == 10               # it answers: nothing to hurry for
+    assert init.loop_wait(None, False, "down", 130, 100) == 10            # refused: nothing is hurried
+    monkeypatch.setattr(init, "WATCH_S", 0.2)
+    assert init.loop_wait(child, True, "up", 0, 100) == 0.2               # never slower than the watch itself
+
+    hurry = init.BROKER_HURRY_S
+    assert init.hurry_after("up", "down", 130, 200) == 200 + hurry        # it was answering and no longer is: hurry anew
+    assert init.hurry_after("up", "up", 130, 200) == 130                  # still answering: unchanged
+    assert init.hurry_after("down", "up", 130, 200) == 130                # it answers now: unchanged (and nothing left to hurry for)
+    assert init.hurry_after("down", "down", 130, 200) == 130              # it cannot be started, or never answers: no new hurry
+    assert init.hurry_after(None, "down", 130, 200) == 130                # the state did not name a broker yet
+
+
+def test_a_group_is_ended_whether_or_not_its_leader_lives(tmp_path):
+    """A broker and the operations in its group; and an earlier broker that ended, whose
+    operation still runs: at a stop both groups must be gone before the containers are stopped."""
+    import subprocess
+    import time
+
+    def member_of(mark):
+        deadline = time.monotonic() + 10
+        while not mark.exists() or not mark.read_text().strip():
+            assert time.monotonic() < deadline
+            time.sleep(0.05)
+        return int(mark.read_text())
+
+    def runs(pid):
+        try:
+            with open(f"/proc/{pid}/stat") as fh:
+                return fh.read().split(")")[-1].split()[0] != "Z"
+        except OSError:
+            return False
+
+    alive, orphaned = tmp_path / "alive", tmp_path / "orphaned"
+    with_leader = subprocess.Popen(["sh", "-c", f"(trap '' TERM; exec sleep 300) & echo $! > {alive}; wait"], start_new_session=True)
+    leader_gone = subprocess.Popen(["sh", "-c", f"sleep 300 & echo $! > {orphaned}"], start_new_session=True)
+    members = [member_of(alive), member_of(orphaned)]
+    leader_gone.wait()
+    assert all(runs(pid) for pid in members)
+    started = time.monotonic()
+    init.end_group(with_leader, wait_s=1)     # its member ignores the request: killed after the wait
+    init.end_group(leader_gone, wait_s=1)     # the leader is long gone; the group is not
+    deadline = time.monotonic() + 10
+    while any(runs(pid) for pid in members):
+        assert time.monotonic() < deadline, "a member of an ended group still runs"
+        time.sleep(0.05)
+    assert with_leader.poll() is not None and time.monotonic() - started < 10
+    init.end_group(leader_gone)               # nothing left: nothing to do
 
 
 def test_ending_the_child_ends_the_command_it_is_waiting_on(tmp_path):

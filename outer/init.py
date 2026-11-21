@@ -19,6 +19,12 @@ started by the core, in a child process, while this init goes on watching: a pro
 cannot be started is that project's trouble and never a refusal. The state says "sandboxes:
 starting" until that child is done, then "started" or "some failed".
 
+The broker (broker.py), the door the web server will use, is started then too, in a process
+group of its own in which its operations stay. If it ends it is started again, a few seconds
+apart at most; the state says "broker: up" once its socket accepts a connection. A broker that
+cannot run is never a refusal either. At a stop every broker group is ended, operations
+included, before the inner containers are stopped.
+
 If any step fails the start is refused: every other process in the container is ended, the
 daemon and anything it ran included, so nothing runs unfenced, and the interface's port answers
 503 with the reason until the container is stopped. A fault nobody foresaw is refused the same
@@ -35,7 +41,9 @@ The state is also in /run/cl/state.json, with a "boot" value that is new at ever
 import json
 import os
 import select
+import shutil
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -52,6 +60,11 @@ DAEMON_LOG = "/var/log/dockerd.log"
 DAEMON_LOG_MAX = 5 * 1024 * 1024
 DAEMON_JSON = "/etc/docker/daemon.json"
 CORE = "/opt/cl/core.py"
+BROKER = "/opt/cl/broker.py"
+BROKER_SOCKET = "/run/cl/broker/broker.sock"
+BROKER_FOLDERS = ("/run/cl/broker", "/run/cl/broker-ops")  # the socket and progress logs; the markers of operations
+BROKER_RESTART_S = 5
+BROKER_HURRY_S = 30
 SELFTEST_ROOT = "/opt/cl/selftest"
 SELFTEST_IMAGE = "cl-selftest"
 UI_PORT = int(os.environ.get("CL_UI_PORT", "8080"))
@@ -505,6 +518,95 @@ def end_child(child, wait_s=5):
         pass
 
 
+def clear_broker_folders():
+    """Once per start of the container, before any broker runs: /run outlives a stop and
+    start, and what an earlier run left there (logs of operations that were cut off, markers)
+    describes nothing that still exists."""
+    for folder in BROKER_FOLDERS:
+        shutil.rmtree(folder, ignore_errors=True)
+
+
+def start_broker():
+    """The broker, in a process group of its own. None when it cannot be run."""
+    try:
+        return subprocess.Popen(["python3", BROKER, "serve"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, start_new_session=True)
+    except OSError as exc:
+        log(f"the broker could not be started: {exc}")
+        return None
+
+
+def keep_broker(brokers, tried, now=time.monotonic):
+    """Start the broker if none runs, not more often than every BROKER_RESTART_S seconds.
+    `brokers` holds the running one, and each ended one whose operations still run in its
+    group. Returns when it was last tried."""
+    # One that ended is kept only while something of its group still runs: once the group is
+    # empty its number is free for the kernel to give to others, which a stop must not signal.
+    running = bool(brokers) and brokers[-1].poll() is None
+    brokers[:] = [b for i, b in enumerate(brokers) if (running and i == len(brokers) - 1) or not group_is_gone(b.pid)]
+    if running:
+        return tried
+    if now() - tried < BROKER_RESTART_S:
+        return tried
+    if tried != float("-inf"):
+        log("the broker is not running; starting it again")
+    new = start_broker()
+    if new is not None:
+        brokers.append(new)
+    return now()
+
+
+def loop_wait(starting, ready, broker, hurry_until, now):
+    """How long the init's loop sleeps. A second while the projects are being started, and
+    while it is in a hurry to see the broker answer; WATCH_S otherwise, which is also the pace
+    of the guard check."""
+    return min(WATCH_S, 1) if starting or (ready and broker != "up" and now < hurry_until) else WATCH_S
+
+
+def hurry_after(was, broker, hurry_until, now):
+    """Until when the loop hurries, given what the state said of the broker and what is seen
+    now. It hurries anew when a broker that was answering no longer is: the one started in its
+    place should be shown soon. A broker that cannot be started, or never answers, renews
+    nothing, so it cannot keep the loop, and the guard check with it, at one-second pace."""
+    return now + BROKER_HURRY_S if was == "up" and broker == "down" else hurry_until
+
+
+def broker_answers(path=BROKER_SOCKET):
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+            probe.settimeout(2)
+            probe.connect(path)
+        return True
+    except OSError:
+        return False
+
+
+def group_is_gone(pgid):
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return False
+    return False
+
+
+def end_group(leader, wait_s=5):
+    """End a process group this init started (a broker and its operations), whether or not
+    its leader still lives: asked first, then killed."""
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(leader.pid, sig)
+        except ProcessLookupError:
+            break
+        deadline = time.monotonic() + wait_s
+        while time.monotonic() < deadline:
+            leader.poll()  # collect the leader, so that its group can empty
+            if group_is_gone(leader.pid):
+                return
+            time.sleep(0.05)
+    leader.poll()
+
+
 def watch(daemon, dns):
     """One pass while ready. Raises Refused when the container can no longer be trusted."""
     if daemon.poll() is not None:
@@ -543,6 +645,7 @@ def main():
         mine = False
     daemon = dns = starting = None
     ready = False
+    brokers, broker_tried, hurry_until = [], float("-inf"), 0.0
     if not mine:
         refuse("This container does not have its own process namespace and init. Start it without --pid=host, without --init and without another entrypoint. " + HOW_TO_RUN, mine=False)
     elif not_my_network:
@@ -556,24 +659,36 @@ def main():
         except Exception as exc:  # noqa: BLE001 - anything unforeseen is a refusal, not a crash
             refuse(unforeseen(exc))
     if ready:
+        clear_broker_folders()
         starting = start_wanted_sandboxes()
-        set_state("ready", sandboxes="starting" if starting else "some failed")
-    while not stop.wait(min(WATCH_S, 1) if starting else WATCH_S):
+        broker_tried = keep_broker(brokers, broker_tried)
+        hurry_until = time.monotonic() + BROKER_HURRY_S
+        set_state("ready", sandboxes="starting" if starting else "some failed", broker="down")
+    while not stop.wait(loop_wait(starting, ready, state.get("broker"), hurry_until, time.monotonic())):
         if not ready:
             continue
         if starting is not None and starting.poll() is not None:
             set_state("ready", sandboxes="started" if starting.returncode == 0 else "some failed")
             starting = None
+        broker_tried = keep_broker(brokers, broker_tried)
+        broker = "up" if brokers and brokers[-1].poll() is None and broker_answers() else "down"
+        hurry_until = hurry_after(state.get("broker"), broker, hurry_until, time.monotonic())
+        if broker != state.get("broker"):
+            set_state("ready", broker=broker)
         try:
             watch(daemon, dns)
         except Exception as exc:  # noqa: BLE001 - as at the start
             ready = False
             daemon = starting = None  # ended, and reaped, by refuse()
+            brokers.clear()
             with state_lock:
                 state.pop("sandboxes", None)  # nothing is starting or started any more
+                state.pop("broker", None)
             refuse(str(exc) if isinstance(exc, Refused) else unforeseen(exc))
     if mine:
         end_child(starting)
+        for broker in brokers:
+            end_group(broker)  # the broker and its operations: they ask the daemon for nothing more
         if daemon is not None and daemon.poll() is None:
             log("stopping the inner containers and the daemon")
             try:

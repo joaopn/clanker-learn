@@ -226,6 +226,16 @@ class Outer:
             time.sleep(0.5)
         raise AssertionError(f"{self.name} did not finish starting its sandboxes in {timeout}s; state {self.state()}")
 
+    def wait_broker(self, wanted="up", timeout=60):
+        """The state once it says the broker is `wanted` (up or down)."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            state = self.state()
+            if state.get("broker") == wanted:
+                return state
+            time.sleep(0.3)
+        raise AssertionError(f"the broker of {self.name} did not become {wanted} in {timeout}s; state {self.state()}")
+
     def cl(self, *args, check=True, timeout=300):
         """The core's command in the outer container: the JSON it prints, or, when it fails
         and `check` is off, {"error": ...}."""
