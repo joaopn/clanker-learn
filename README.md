@@ -2,7 +2,7 @@
 
 A self-hosted tutor: you learn a technical subject by doing it in a real environment, with a tutor that knows what you already know. One container, no tool on the host.
 
-It is being built. What exists so far is the outer container and, inside it, projects with their sandboxes, the broker, the web server, and its page: projects, a terminal, the editor and the web apps of a sandbox in the browser, Claude Code in the projects that are given it, and the tutor: a conversation per lesson, in which Claude Code works in the project's sandbox. Study plans and the knowledge base are not built yet.
+It is being built. What exists so far is the outer container and, inside it, projects with their sandboxes, the broker, the web server, and its page: projects, a terminal, the editor and the web apps of a sandbox in the browser, Claude Code in the projects that are given it, and the tutor: a conversation per lesson, in which Claude Code works in the project's sandbox. A project opens on Goals, where the tutor proposes a study plan you edit and approve. The knowledge base is not built yet.
 
 ## The outer container
 
@@ -49,7 +49,7 @@ The first start takes a few minutes longer: the web server's image is built then
 
 After the login the projects are listed down the left side. `+ New project` makes one and shows its progress. Its box asks what the project gets: under Agents, Claude Code (ticked by default, with the model and the effort it starts on), and the editor (ticked by default). The gear beside a project starts, stops and recreates it, changes its limits, and destroys it (which asks for the password again); its Agents section adds Claude Code to a project that has none, updates it to the fetched version, and changes its model and effort, all while the project runs and without a restart.
 
-A project opens into its lessons in the list; `+ New lesson` adds one. A project has these tabs:
+A project opens into its lessons in the list: Goals first, then the plan's lessons under their modules, each with its state; `+ New lesson` adds one by hand. A project's tabs can be dragged apart into up to three columns shown side by side (drag a tab to the side of the tab area; drag the line between two columns to change their widths). A project has these tabs:
 
 - **The open lesson**: the conversation with the tutor (see The tutor, below).
 - **Shell**: a terminal in the sandbox. It keeps its session when the tab or the browser is closed.
@@ -65,12 +65,18 @@ The password never leaves the browser: the page sends a proof derived from it. T
 
 A lesson is a conversation with a tutor, and the tutor is the project's own Claude Code, working in the project's sandbox with the model and effort the project was given. So a lesson needs a project that has Claude Code and is running.
 
+- **Goals and the plan.** A project's first conversation is Goals: the tutor asks what you want to be able to do, what you know and how much time you have, and proposes a study plan as a card. Change anything on the card (titles, objectives, lessons added, removed or moved), then approve it or dismiss it; on approval the lessons appear in the list. A tutor can later propose a change to the plan the same way; nothing changes until you approve it. The tutor is told what you decided with your next message.
+- **Lessons** can be opened in any order. A lesson's tutor is given its objective, its place in the plan and one line on each lesson already done. It closes the lesson with a short summary when the objective is met; you can still write in it.
+- **A lesson's files** are in the workspace under `.learn/lessons/`: the conversation written out, and the tutor's notes. If the tutor's own memory of a lesson is lost, it takes the lesson up from them.
+- **The tutor's instructions** can be read and changed in Settings, under Tutor, and put back to the shipped text. A lesson under way follows a new text from its next message.
+- What the tutor writes can be more than text: a diagram, an interactive plot, a picture or a page it made in the workspace, a link that opens a file in the Editor. None of it is fetched from outside the project or run on the page itself.
+
 - You write, the tutor answers as it goes: its text appears while it is written, and each thing it does in the sandbox (a command, a file it read or wrote) is a line you can open. What it installs and starts stays in the sandbox, where you work in the Shell and the Editor beside the conversation.
 - **Stop** ends an answer and what it was running. Closing the browser does not: the answer goes on and is there when you come back.
 - Lessons are independent: two can have their tutors working at once, also in one project, where both then work in the same sandbox. A lesson takes one message at a time.
 - Under the conversation a line says how full the tutor's context is.
 - **Signing in.** The tutor uses the project's own Claude Code login (run `claude` in its Shell once). Or set a Claude token in Settings, under Tutor (from `claude setup-token`): the tutor in every project then uses it, and a new project's first lesson works without a login. The token is kept in the `/data` volume and handed to each answer; code the tutor runs in the sandbox can read it, as it can read a project's own login.
-- The tutor runs as a service of its own inside clanker-learn (`state.json`: `tutor`). A sandbox cannot reach it. If it restarts while an answer is being written, that answer is shown as interrupted and the lesson takes the next message.
+- The tutor runs as a service of its own inside clanker-learn (`state.json`: `tutor`). A sandbox reaches one thing of it: the tools a tutor uses while it answers (the plan, closing a lesson, proposing), and only with the pass of an answer that is being written. If it restarts while an answer is being written, that answer is shown as interrupted and the lesson takes the next message.
 - A lesson continues through Claude Code's own session in the project's home folder: `claude --resume` in the Shell lists it. If that session is lost, the conversation stays on the page and the tutor starts again without it, saying so.
 
 ### Software
