@@ -112,7 +112,15 @@ def web_image(image):
 
 
 @pytest.fixture(scope="session")
-def preload(web_image, sandbox_image, tmp_path_factory):
+def tutor_image(image):
+    """The tutor service's image, built once on the test daemon under the tag the core computes."""
+    tag = core.image_tag(str(REPO / "tutor"), core.TUTOR_REPO)
+    run("docker", "build", "-q", "-t", tag, str(REPO / "tutor"), timeout=2400)
+    return tag
+
+
+@pytest.fixture(scope="session")
+def preload(web_image, sandbox_image, tutor_image, tmp_path_factory):
     """A folder to mount at an outer container's /opt/cl/preload, where the core loads an
     image from instead of building it. It holds both images: once the web server is up, its
     keeper gets the sandbox's image too, and would build it if it were not there. Then the
@@ -122,7 +130,7 @@ def preload(web_image, sandbox_image, tmp_path_factory):
     --version and --install-extension and serves a page on the --bind-addr it is given."""
     folder = tmp_path_factory.mktemp("preload")
     folder.chmod(0o755)
-    for tag in (web_image, sandbox_image):
+    for tag in (web_image, sandbox_image, tutor_image):   # the keeper would build whichever is missing
         saved = folder / f"{tag.partition(':')[0]}.tar"
         run("docker", "save", "-o", str(saved), tag, timeout=900)
         saved.chmod(0o644)
