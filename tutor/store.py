@@ -1,21 +1,64 @@
-"""The tutor service's store: one SQLite file, its lessons, messages, runs and their events.
+"""The tutor service's store: one SQLite file, its lessons, plans, messages, runs, events,
+proposals, the audit of the "learn" tools, and the tutor's instructions.
 
 Lifted from gaggiclanker (the maintainer's project, AGPL like this one): the connection and its
 pragmas from gaggiclanker/db/connection.py, the runs and the persisted event stream from the
 generic classes of gaggiclanker/db/repos/chat.py (ChatRunsRepository, ChatEventsRepository,
-reconcile_running among them). Adapted: the standard library's sqlite3, used from the event
-loop's thread only (every statement here is small, and one writer is all there is), plain
-functions over one Database instead of repository classes, and no models: rows become the
-dictionaries the HTTP contract names.
+reconcile_running among them), the seeding of an editable text from gaggiclanker/llm/prompts.py
+(seed_prompts) and gaggiclanker/db/repos/llm.py (PromptsRepository). Adapted: the standard
+library's sqlite3, used from the event loop's thread only (every statement here is small, and
+one writer is all there is), plain functions over one Database instead of repository classes,
+and no models: rows become the dictionaries the HTTP contract names.
 """
+import hashlib
 import json
 import os
+import re
 import sqlite3
+import unicodedata
 import uuid
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 SCHEMA_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "schema.sql")
 NOW = "strftime('%Y-%m-%dT%H:%M:%fZ','now')"
+LESSONS_DIR = "/workspace/.learn/lessons"
+GOALS_TITLE = "Goals"
+INSTRUCTIONS = "tutor"
+
+# A file of version 1 (step 2: lessons without plans) brought to version 2 in place, in one
+# transaction: the new columns and tables added, a lesson's state read from whether it has
+# messages, its position from its id. Its slug is filled by `fill_slugs` after.
+MIGRATE_1_TO_2 = """
+BEGIN;
+ALTER TABLE lessons ADD COLUMN kind TEXT NOT NULL DEFAULT 'lesson';
+ALTER TABLE lessons ADD COLUMN objective TEXT NOT NULL DEFAULT '';
+ALTER TABLE lessons ADD COLUMN module_id INTEGER REFERENCES modules (id) ON DELETE SET NULL;
+ALTER TABLE lessons ADD COLUMN position INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE lessons ADD COLUMN summary TEXT NOT NULL DEFAULT '';
+ALTER TABLE lessons ADD COLUMN one_line TEXT NOT NULL DEFAULT '';
+ALTER TABLE lessons ADD COLUMN closed_at TEXT;
+ALTER TABLE lessons ADD COLUMN slug TEXT NOT NULL DEFAULT '';
+ALTER TABLE lessons ADD COLUMN session_text TEXT NOT NULL DEFAULT '';
+ALTER TABLE messages ADD COLUMN context TEXT NOT NULL DEFAULT '';
+UPDATE lessons SET position = id,
+    state = CASE WHEN EXISTS (SELECT 1 FROM messages WHERE messages.lesson_id = lessons.id) THEN 'in_progress' ELSE 'not_started' END;
+CREATE TABLE modules (id INTEGER PRIMARY KEY, project TEXT NOT NULL, created TEXT NOT NULL, title TEXT NOT NULL,
+    position INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')));
+CREATE INDEX modules_of_project ON modules (project, created);
+CREATE TABLE proposals (id INTEGER PRIMARY KEY, lesson_id INTEGER NOT NULL REFERENCES lessons (id) ON DELETE CASCADE,
+    run_id INTEGER REFERENCES runs (id) ON DELETE SET NULL, message_id INTEGER REFERENCES messages (id) ON DELETE SET NULL,
+    kind TEXT NOT NULL, proposed_json TEXT NOT NULL, approved_json TEXT, changes_json TEXT NOT NULL DEFAULT '[]',
+    state TEXT NOT NULL DEFAULT 'open', told INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')), decided_at TEXT);
+CREATE INDEX proposals_of_lesson ON proposals (lesson_id, id);
+CREATE TABLE tool_calls (id INTEGER PRIMARY KEY, run_id INTEGER, tool TEXT NOT NULL, permission TEXT NOT NULL,
+    input_hash TEXT NOT NULL, duration_ms INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL, error TEXT,
+    at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')));
+CREATE TABLE prompts (name TEXT PRIMARY KEY, content TEXT NOT NULL, default_content TEXT NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')));
+PRAGMA user_version = 2;
+COMMIT;
+"""
 
 # As gaggiclanker has them: WAL so that a reader never waits for the writer; foreign keys,
 # which SQLite leaves off per connection and the schema's ON DELETE CASCADE needs (a lesson
@@ -37,10 +80,11 @@ class Database:
     def __init__(self, path):
         self.path = path
         self.conn = None
+        self.migrated = False
 
     def connect(self):
-        """Open the file, apply the pragmas, and make the schema in a new file. A file at
-        another version is refused: there is no upgrade machinery yet."""
+        """Open the file, apply the pragmas, make the schema in a new file and bring a file of
+        version 1 to version 2. A file at another version is refused."""
         os.makedirs(os.path.dirname(self.path), mode=0o700, exist_ok=True)
         conn = sqlite3.connect(self.path, isolation_level=None)
         conn.row_factory = sqlite3.Row
@@ -51,11 +95,23 @@ class Database:
         if version == 0 and tables == 0:
             with open(SCHEMA_FILE) as fh:
                 conn.executescript(fh.read())
+        elif version == 1:
+            try:
+                conn.executescript(MIGRATE_1_TO_2)
+            except sqlite3.Error as exc:
+                if conn.in_transaction:
+                    conn.execute("ROLLBACK")
+                conn.close()
+                raise StoreError(f"The tutor's database {self.path} is at version 1 and could not be brought to version 2 ({exc}); "
+                                 "it is left as it was.") from None
+            self.migrated = True
         elif version != SCHEMA_VERSION:
             conn.close()
-            raise StoreError(f"The tutor's database {self.path} is at version {version}; this tutor service knows version {SCHEMA_VERSION} only. "
-                             "Move the file away to start with an empty one, or run the version of clanker-learn that wrote it.")
+            raise StoreError(f"The tutor's database {self.path} is at version {version}; this tutor service knows versions 1 and "
+                             f"{SCHEMA_VERSION} only. Move the file away to start with an empty one, or run the version of "
+                             "clanker-learn that wrote it.")
         self.conn = conn
+        fill_slugs(self)
         return self
 
     def close(self):
@@ -80,27 +136,73 @@ class Database:
 
 # --- lessons --------------------------------------------------------------------------------
 
+def slug_of(title):
+    """A short folder name from a title: lower-case ASCII words joined by dashes, at most 40."""
+    plain = unicodedata.normalize("NFKD", title).encode("ascii", "ignore").decode().lower()
+    words = re.sub(r"[^a-z0-9]+", "-", plain).strip("-")
+    return (words[:40].rstrip("-")) or "lesson"
+
+
+def fill_slugs(db):
+    for row in db.all("SELECT id, title FROM lessons WHERE slug = ''"):
+        db.execute("UPDATE lessons SET slug = ? WHERE id = ?", (slug_of(row["title"]), row["id"]))
+
+
+def folder_of(row):
+    """The lesson's folder in the workspace, where its transcript and the tutor's notes are."""
+    return f"{LESSONS_DIR}/{row['id']}-{row['slug'] or slug_of(row['title'])}"
+
+
 def lesson_out(row, running=None):
-    return {"id": row["id"], "project": row["project"], "created": row["created"], "title": row["title"], "state": row["state"],
+    return {"id": row["id"], "project": row["project"], "created": row["created"], "title": row["title"], "kind": row["kind"],
+            "objective": row["objective"], "module": row["module_id"], "position": row["position"], "state": row["state"],
+            "summary": row["summary"], "one_line": row["one_line"], "closed_at": row["closed_at"], "folder": folder_of(row),
             "created_at": row["created_at"], "updated_at": row["updated_at"], "running": running}
 
 
+ORDER = "ORDER BY kind = 'goals' DESC, position, id"
+
+
 def lessons(db, project, created):
-    return db.all("SELECT * FROM lessons WHERE project = ? AND created = ? ORDER BY id", (project, created))
+    """The project's lessons, Goals first (made here the first time they are asked for), then
+    in the order of the plan, lessons added by hand after."""
+    ensure_goals(db, project, created)
+    return db.all(f"SELECT * FROM lessons WHERE project = ? AND created = ? {ORDER}", (project, created))
 
 
 def lesson(db, lesson_id):
     return db.one("SELECT * FROM lessons WHERE id = ?", (lesson_id,))
 
 
-def add_lesson(db, project, created, title):
-    cursor = db.execute("INSERT INTO lessons (project, created, title, session_id) VALUES (?, ?, ?, ?)",
-                        (project, created, title, str(uuid.uuid4())))
+def ensure_goals(db, project, created):
+    row = db.one("SELECT * FROM lessons WHERE project = ? AND created = ? AND kind = 'goals'", (project, created))
+    if row is None:
+        cursor = db.execute("INSERT INTO lessons (project, created, title, kind, state, slug, session_id) VALUES (?, ?, ?, 'goals', 'not_started', 'goals', ?)",
+                            (project, created, GOALS_TITLE, str(uuid.uuid4())))
+        row = lesson(db, cursor.lastrowid)
+    return row
+
+
+def next_position(db, project, created):
+    return (db.one("SELECT max(position) FROM lessons WHERE project = ? AND created = ?", (project, created))[0] or 0) + 1
+
+
+def add_lesson(db, project, created, title, objective="", module_id=None, position=None):
+    ensure_goals(db, project, created)
+    if position is None:
+        position = next_position(db, project, created)
+    # The state is given: a file brought from version 1 keeps that version's default ('open').
+    cursor = db.execute("INSERT INTO lessons (project, created, title, objective, module_id, position, state, slug, session_id) "
+                        "VALUES (?, ?, ?, ?, ?, ?, 'not_started', ?, ?)",
+                        (project, created, title, objective, module_id, position, slug_of(title), str(uuid.uuid4())))
     return lesson(db, cursor.lastrowid)
 
 
-def rename_lesson(db, lesson_id, title):
-    db.execute(f"UPDATE lessons SET title = ?, updated_at = {NOW} WHERE id = ?", (title, lesson_id))
+def edit_lesson(db, lesson_id, title=None, objective=None):
+    if title is not None:
+        db.execute(f"UPDATE lessons SET title = ?, updated_at = {NOW} WHERE id = ?", (title, lesson_id))
+    if objective is not None:
+        db.execute(f"UPDATE lessons SET objective = ?, updated_at = {NOW} WHERE id = ?", (objective, lesson_id))
     return lesson(db, lesson_id)
 
 
@@ -112,27 +214,148 @@ def touch_lesson(db, lesson_id):
     db.execute(f"UPDATE lessons SET updated_at = {NOW} WHERE id = ?", (lesson_id,))
 
 
-def set_session(db, lesson_id, session_id, started):
+def mark_started(db, lesson_id):
+    db.execute("UPDATE lessons SET state = 'in_progress' WHERE id = ? AND state = 'not_started'", (lesson_id,))
+
+
+def close_lesson(db, lesson_id, summary, one_line):
+    db.execute(f"UPDATE lessons SET state = 'done', summary = ?, one_line = ?, closed_at = {NOW}, updated_at = {NOW} WHERE id = ?",
+               (summary, one_line, lesson_id))
+    return lesson(db, lesson_id)
+
+
+def has_messages(db, lesson_id):
+    return db.one("SELECT 1 FROM messages WHERE lesson_id = ? LIMIT 1", (lesson_id,)) is not None
+
+
+def set_session(db, lesson_id, session_id, started, text_hash=None):
     db.execute("UPDATE lessons SET session_id = ?, session_started = ? WHERE id = ?", (session_id, 1 if started else 0, lesson_id))
+    if text_hash is not None:
+        db.execute("UPDATE lessons SET session_text = ? WHERE id = ?", (text_hash, lesson_id))
+
+
+def done_lessons(db, project, created):
+    """The project's lessons that are done, in the order they were closed."""
+    return db.all("SELECT * FROM lessons WHERE project = ? AND created = ? AND state = 'done' ORDER BY closed_at, id", (project, created))
+
+
+# --- the plan -------------------------------------------------------------------------------
+
+def modules(db, project, created):
+    return db.all("SELECT * FROM modules WHERE project = ? AND created = ? ORDER BY position, id", (project, created))
+
+
+def has_plan(db, project, created):
+    return db.one("SELECT 1 FROM modules WHERE project = ? AND created = ? LIMIT 1", (project, created)) is not None
+
+
+def add_module(db, project, created, title, position):
+    return db.execute("INSERT INTO modules (project, created, title, position) VALUES (?, ?, ?, ?)",
+                      (project, created, title, position)).lastrowid
+
+
+def plan_out(db, project, created, view):
+    """The project's plan: Goals, the modules with their lessons in order, the lessons outside
+    the plan (added by hand), the dropped ones, and the proposals still open. `view(row)` makes
+    a lesson's dictionary (it knows which are running)."""
+    rows = lessons(db, project, created)
+    goals = next(row for row in rows if row["kind"] == "goals")
+    out = {"goals": view(goals), "modules": [], "other": [], "dropped": [],
+           "proposals": [proposal_out(row) for row in open_proposals(db, project, created)]}
+    by_module = {}
+    for row in modules(db, project, created):
+        entry = {"id": row["id"], "title": row["title"], "position": row["position"], "lessons": []}
+        out["modules"].append(entry)
+        by_module[row["id"]] = entry
+    for row in rows:
+        if row["kind"] == "goals":
+            continue
+        if row["state"] == "dropped":
+            out["dropped"].append(view(row))
+        elif row["module_id"] in by_module:
+            by_module[row["module_id"]]["lessons"].append(view(row))
+        else:
+            out["other"].append(view(row))
+    return out
+
+
+# --- proposals ------------------------------------------------------------------------------
+
+def proposal_out(row):
+    return {"id": row["id"], "kind": row["kind"], "lesson_id": row["lesson_id"], "run_id": row["run_id"], "message_id": row["message_id"],
+            "state": row["state"], "proposed": json.loads(row["proposed_json"]),
+            "approved": json.loads(row["approved_json"]) if row["approved_json"] else None, "changes": json.loads(row["changes_json"]),
+            "created_at": row["created_at"], "decided_at": row["decided_at"]}
+
+
+def proposal(db, proposal_id):
+    return db.one("SELECT * FROM proposals WHERE id = ?", (proposal_id,))
+
+
+def add_proposal(db, lesson_id, run_id, kind, proposed):
+    cursor = db.execute("INSERT INTO proposals (lesson_id, run_id, kind, proposed_json) VALUES (?, ?, ?, ?)",
+                        (lesson_id, run_id, kind, json.dumps(proposed)))
+    return proposal(db, cursor.lastrowid)
+
+
+def decide_proposal(db, proposal_id, state, approved=None, changes=()):
+    db.execute(f"UPDATE proposals SET state = ?, approved_json = ?, changes_json = ?, told = 0, decided_at = {NOW} WHERE id = ?",
+               (state, json.dumps(approved) if approved is not None else None, json.dumps(list(changes)), proposal_id))
+    return proposal(db, proposal_id)
+
+
+def open_proposals(db, project, created):
+    return db.all("SELECT proposals.* FROM proposals JOIN lessons ON lessons.id = proposals.lesson_id "
+                  "WHERE lessons.project = ? AND lessons.created = ? AND proposals.state = 'open' ORDER BY proposals.id", (project, created))
+
+
+def untold_outcomes(db, lesson_id):
+    """The proposals of this conversation that the learner decided and its tutor was not told of yet."""
+    return db.all("SELECT * FROM proposals WHERE lesson_id = ? AND state != 'open' AND told = 0 ORDER BY id", (lesson_id,))
+
+
+def mark_told(db, proposal_ids):
+    for proposal_id in proposal_ids:
+        db.execute("UPDATE proposals SET told = 1 WHERE id = ?", (proposal_id,))
+
+
+def link_proposals(db, proposal_ids, message_id):
+    for proposal_id in proposal_ids:
+        db.execute("UPDATE proposals SET message_id = ? WHERE id = ?", (message_id, proposal_id))
 
 
 # --- messages -------------------------------------------------------------------------------
 
-def message_out(row):
+def message_out(row, proposals=()):
     out = {"id": row["id"], "role": row["role"], "text": row["text"], "run_id": row["run_id"], "created_at": row["created_at"]}
     if row["role"] == "assistant":
         out["tools"] = json.loads(row["tools_json"] or "[]")
+        out["proposals"] = [proposal_out(p) for p in proposals]
+    else:
+        out["context"] = row["context"]
     return out
 
 
 def messages(db, lesson_id):
-    return [message_out(row) for row in db.all("SELECT * FROM messages WHERE lesson_id = ? ORDER BY id", (lesson_id,))]
+    by_message = {}
+    for row in db.all("SELECT * FROM proposals WHERE lesson_id = ? AND message_id IS NOT NULL ORDER BY id", (lesson_id,)):
+        by_message.setdefault(row["message_id"], []).append(row)
+    return [message_out(row, by_message.get(row["id"], ())) for row in db.all("SELECT * FROM messages WHERE lesson_id = ? ORDER BY id", (lesson_id,))]
 
 
-def add_message(db, lesson_id, run_id, role, text, tools=()):
-    cursor = db.execute("INSERT INTO messages (lesson_id, run_id, role, text, tools_json) VALUES (?, ?, ?, ?, ?)",
-                        (lesson_id, run_id, role, text, json.dumps(list(tools))))
-    return message_out(db.one("SELECT * FROM messages WHERE id = ?", (cursor.lastrowid,)))
+def message(db, message_id):
+    return message_out(db.one("SELECT * FROM messages WHERE id = ?", (message_id,)),
+                       db.all("SELECT * FROM proposals WHERE message_id = ? ORDER BY id", (message_id,)))
+
+
+def add_message(db, lesson_id, run_id, role, text, tools=(), context=""):
+    cursor = db.execute("INSERT INTO messages (lesson_id, run_id, role, text, tools_json, context) VALUES (?, ?, ?, ?, ?, ?)",
+                        (lesson_id, run_id, role, text, json.dumps(list(tools)), context))
+    return cursor.lastrowid
+
+
+def set_context(db, message_id, context):
+    db.execute("UPDATE messages SET context = ? WHERE id = ?", (context, message_id))
 
 
 # --- runs (gaggiclanker's ChatRunsRepository) -------------------------------------------------
@@ -199,3 +422,49 @@ def next_seq(db, run_id):
 def events_since(db, run_id, after=0):
     rows = db.all("SELECT seq, kind, data FROM events WHERE run_id = ? AND seq > ? ORDER BY seq", (run_id, after))
     return [{"seq": row["seq"], "kind": row["kind"], "data": json.loads(row["data"])} for row in rows]
+
+
+# --- the audit of the "learn" tools (gaggiclanker's ToolCallsRepository) ---------------------
+
+def record_tool_call(db, run_id, tool, permission, input_hash, duration_ms, status, error=""):
+    db.execute("INSERT INTO tool_calls (run_id, tool, permission, input_hash, duration_ms, status, error) VALUES (?, ?, ?, ?, ?, ?, ?)",
+               (run_id, tool, permission, input_hash, duration_ms, status, error or None))
+
+
+# --- the tutor's instructions (gaggiclanker's prompts) ---------------------------------------
+
+def seed_instructions(db, shipped):
+    """gaggiclanker's seeding rule, for the one text: no row, insert it; the shipped text
+    unchanged, nothing; changed and the row unedited, take the new text; changed and the row
+    edited, update the default only (the learner's text stands, and "back to the shipped
+    text" converges on the new one). Returns what was done, for the log."""
+    row = db.one("SELECT * FROM prompts WHERE name = ?", (INSTRUCTIONS,))
+    if row is None:
+        db.execute("INSERT INTO prompts (name, content, default_content) VALUES (?, ?, ?)", (INSTRUCTIONS, shipped, shipped))
+        return "inserted"
+    if row["default_content"] == shipped:
+        return "unchanged"
+    if row["content"] != row["default_content"]:
+        db.execute("UPDATE prompts SET default_content = ? WHERE name = ?", (shipped, INSTRUCTIONS))
+        return "default updated (the text in force is edited and stays)"
+    db.execute(f"UPDATE prompts SET content = ?, default_content = ?, updated_at = {NOW} WHERE name = ?", (shipped, shipped, INSTRUCTIONS))
+    return "updated to the shipped text"
+
+
+def instructions(db):
+    row = db.one("SELECT * FROM prompts WHERE name = ?", (INSTRUCTIONS,))
+    return {"text": row["content"], "edited": row["content"] != row["default_content"], "updated_at": row["updated_at"]}
+
+
+def set_instructions(db, text):
+    db.execute(f"UPDATE prompts SET content = ?, updated_at = {NOW} WHERE name = ?", (text, INSTRUCTIONS))
+    return instructions(db)
+
+
+def reset_instructions(db):
+    db.execute(f"UPDATE prompts SET content = default_content, updated_at = {NOW} WHERE name = ?", (INSTRUCTIONS,))
+    return instructions(db)
+
+
+def text_hash(text):
+    return hashlib.sha256(text.encode()).hexdigest()[:16]

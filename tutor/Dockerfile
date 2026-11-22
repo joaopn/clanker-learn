@@ -13,7 +13,7 @@ RUN set -eux; \
     apt-get install -y --no-install-recommends tini python3 python3-aiohttp openssh-client; \
     rm -rf /var/lib/apt/lists/*
 
-COPY server.py store.py sse.py tasks.py turn.py claude_stream.py schema.sql tutor.md /opt/cl/tutor/
+COPY server.py store.py sse.py tasks.py turn.py claude_stream.py mcp.py tools.py plans.py schema.sql tutor.md /opt/cl/tutor/
 
 WORKDIR /opt/cl/tutor
 STOPSIGNAL SIGTERM

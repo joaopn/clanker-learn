@@ -19,6 +19,7 @@ import json
 PREVIEW = 2000      # of a tool's output, what the stream and the message keep
 LABEL = 200         # of a tool's label: one line
 DETAIL = 4000
+LEARN_PREFIX = "mcp__learn__"   # Claude Code's name for a tool of the server "learn"
 
 
 def as_int(value):
@@ -69,8 +70,11 @@ def one_line(text, limit=LABEL):
 
 def tool_view(name, arguments):
     """(kind, label, detail) of a tool call, as the conversation shows it: a command, the path
-    of a file read, written or edited, a search, or another tool by its name."""
+    of a file read, written or edited, a search, one of clanker-learn's own "learn" tools by its
+    name, or another tool by its name."""
     args = arguments if isinstance(arguments, dict) else {}
+    if name.startswith(LEARN_PREFIX):
+        return "learn", one_line(name[len(LEARN_PREFIX):]), json.dumps(args, default=str, ensure_ascii=False)[:DETAIL]
     path = args.get("file_path") or args.get("notebook_path") or args.get("path") or ""
     if name == "Bash":
         command = str(args.get("command", ""))

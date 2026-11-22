@@ -13,17 +13,27 @@ and its events are stored before they are published, so that a stream that comes
 replays what it missed (sse.py). One running turn per lesson; lessons run side by side, in
 the same project too.
 
+A second listener, on every address, port 7802, is the "learn" tool server for Claude Code in
+the sandboxes (mcp.py): it takes only the token of a running answer, and answers none of the
+routes below, as this one answers none of its.
+
+Every project has a Goals conversation and a study plan; a tutor's proposal of a plan, or of
+a change of it, is a card the learner edits and approves or dismisses here (plans.py).
+
 The HTTP contract (paths, bodies, the envelope) is the one the web server's relay is built
 against; see the web server's routes under /broker/tutor/.
 """
 import hmac
 import ipaddress
+import json
 import logging
 import os
 import re
 import socket
 import sys
 
+import mcp
+import plans
 import store
 import turn
 from aiohttp import web
@@ -39,6 +49,7 @@ PROJECT = re.compile(r"[a-z0-9]([a-z0-9-]{0,29}[a-z0-9])?")   # the core's proje
 CREATED_MAX = 64
 TITLE_MAX = 200
 TEXT_MAX = 32000
+INSTRUCTIONS_MAX = 100000
 TOKEN = re.compile(r"[\x21-\x7e]{1,4096}")   # printable, no spaces: it becomes an environment variable
 LISTEN_PROBE_PORT = 9
 STATUS = {"validation": 400, "unauthorized": 401, "not_found": 404, "busy": 409, "failed": 500}
@@ -106,6 +117,13 @@ def title_of(body):
     return " ".join(title.split())
 
 
+def objective_of(body):
+    objective = body.get("objective", "")
+    if not isinstance(objective, str) or len(objective) > plans.OBJECTIVE_MAX:
+        raise Refusal("validation", f"A lesson's objective is at most {plans.OBJECTIVE_MAX} characters.")
+    return objective.strip()
+
+
 def number(request, key):
     try:
         return int(request.match_info[key])
@@ -139,7 +157,7 @@ async def list_lessons(request):
 async def add_lesson(request):
     body = await body_of(request)
     project, created = project_pair(body)
-    row = store.add_lesson(request.app["db"], project, created, title_of(body))
+    row = store.add_lesson(request.app["db"], project, created, title_of(body), objective_of(body))
     return ok(lesson_view(request, row))
 
 
@@ -152,14 +170,22 @@ async def get_lesson(request):
                "ended": store.ended_runs(db, row["id"])})
 
 
-async def rename_lesson(request):
+async def edit_lesson(request):
     row = lesson_or_404(request)
-    title = title_of(await body_of(request))
-    return ok(lesson_view(request, store.rename_lesson(request.app["db"], row["id"], title)))
+    body = await body_of(request)
+    if "title" not in body and "objective" not in body:
+        raise Refusal("validation", "Give a `title`, an `objective`, or both.")
+    if row["kind"] == "goals" and "title" in body:
+        raise Refusal("validation", "Goals keeps its name.")
+    title = title_of(body) if "title" in body else None
+    objective = objective_of(body) if "objective" in body else None
+    return ok(lesson_view(request, store.edit_lesson(request.app["db"], row["id"], title, objective)))
 
 
 async def delete_lesson(request):
     row = lesson_or_404(request)
+    if row["kind"] == "goals":
+        raise Refusal("validation", "Goals cannot be deleted: every project has it.")
     if request.app["runner"].running_run(row["id"]):
         raise Refusal("busy", "The tutor is working in this lesson: stop it first.")
     store.delete_lesson(request.app["db"], row["id"])
@@ -195,6 +221,71 @@ async def cancel(request):
     if run is None:
         raise Refusal("not_found", "There is no such run.")
     return ok({"run": run})
+
+
+async def get_plan(request):
+    project, created = project_pair(request.query)
+    return ok(store.plan_out(request.app["db"], project, created, lambda row: lesson_view(request, row)))
+
+
+def proposal_or_404(request):
+    row = store.proposal(request.app["db"], number(request, "id"))
+    if row is None:
+        raise Refusal("not_found", "There is no such proposal.")
+    return row
+
+
+async def get_proposal(request):
+    return ok({"proposal": store.proposal_out(proposal_or_404(request))})
+
+
+async def approve_proposal(request):
+    """The learner's edited version of what was proposed (or the proposal as it is when the body
+    has no `modules`), applied: a plan's lessons made, a change's arrangement put in place."""
+    db = request.app["db"]
+    row = proposal_or_404(request)
+    if row["state"] != "open":
+        raise Refusal("validation", f"This proposal was {row['state']} already.")
+    body = await body_of(request)
+    home = store.lesson(db, row["lesson_id"])
+    project, created = home["project"], home["created"]
+    proposed = json.loads(row["proposed_json"])
+    raw = body.get("modules", proposed["modules"])
+    try:
+        if row["kind"] == "plan":
+            modules = plans.clean_plan(raw)
+            changes = plans.describe_changes(proposed["modules"], modules)
+            plans.apply_plan(db, project, created, modules)
+        else:
+            modules, _dropped = plans.clean_change(db, project, created, raw)
+            changes = plans.describe_changes(proposed["modules"], modules)
+            plans.apply_change(db, project, created, modules)
+    except plans.PlanError as exc:
+        raise Refusal("validation", str(exc)) from None
+    decided = store.decide_proposal(db, row["id"], "approved", {"modules": modules}, changes)
+    return ok({"proposal": store.proposal_out(decided), "plan": store.plan_out(db, project, created, lambda r: lesson_view(request, r))})
+
+
+async def dismiss_proposal(request):
+    row = proposal_or_404(request)
+    if row["state"] != "open":
+        raise Refusal("validation", f"This proposal was {row['state']} already.")
+    return ok({"proposal": store.proposal_out(store.decide_proposal(request.app["db"], row["id"], "dismissed"))})
+
+
+async def get_instructions(request):
+    return ok(store.instructions(request.app["db"]))
+
+
+async def put_instructions(request):
+    text = (await body_of(request)).get("text")
+    if not isinstance(text, str) or not text.strip() or len(text) > INSTRUCTIONS_MAX:
+        raise Refusal("validation", f"The tutor's instructions are 1 to {INSTRUCTIONS_MAX} characters.")
+    return ok(store.set_instructions(request.app["db"], text.strip()))
+
+
+async def reset_instructions(request):
+    return ok(store.reset_instructions(request.app["db"]))
 
 
 async def activity(request):
@@ -247,9 +338,14 @@ def build_app(db, secret):
     app.add_routes([
         web.get("/health", health),
         web.get("/lessons", list_lessons), web.post("/lessons", add_lesson),
-        web.get("/lessons/{id}", get_lesson), web.patch("/lessons/{id}", rename_lesson), web.delete("/lessons/{id}", delete_lesson),
+        web.get("/lessons/{id}", get_lesson), web.patch("/lessons/{id}", edit_lesson), web.delete("/lessons/{id}", delete_lesson),
         web.post("/lessons/{id}/messages", post_message),
         web.get("/runs/{id}/stream", stream), web.post("/runs/{id}/cancel", cancel),
+        web.get("/plan", get_plan),
+        web.get("/proposals/{id}", get_proposal), web.post("/proposals/{id}/approve", approve_proposal),
+        web.post("/proposals/{id}/dismiss", dismiss_proposal),
+        web.get("/instructions", get_instructions), web.put("/instructions", put_instructions),
+        web.post("/instructions/reset", reset_instructions),
         web.get("/activity", activity),
         web.get("/settings", get_settings), web.put("/settings", put_settings),
     ])
@@ -257,6 +353,16 @@ def build_app(db, secret):
     async def on_shutdown(app):
         await app["tasks"].cancel_all()
     app.on_shutdown.append(on_shutdown)
+
+    # The tool server: its own application on its own port, started and stopped with this one.
+    async def tool_server(app):
+        runner = web.AppRunner(mcp.build_tool_app(db, app["runner"]), access_log=None)
+        await runner.setup()
+        await web.TCPSite(runner, "0.0.0.0", mcp.PORT).start()
+        log.info("the learn tool server listens on every address, port %d", mcp.PORT)
+        yield
+        await runner.cleanup()
+    app.cleanup_ctx.append(tool_server)
     return app
 
 
@@ -275,10 +381,14 @@ def main():
         host = listen_address(os.environ.get("CL_LISTEN_SUBNET", ""))
         secret = read_secret()
         db = store.Database(DB_FILE).connect()
+        seeded = store.seed_instructions(db, turn.shipped_text())
     except (OSError, ValueError, store.StoreError) as exc:
         # The reason is in the container's log, where the keeper reads why it ended.
         log.error("cannot start: %s", exc)
         raise SystemExit(1) from None
+    if db.migrated:
+        log.info("the database was at version 1: brought to version %d in place", store.SCHEMA_VERSION)
+    log.info("the tutor's instructions: %s", seeded)
     found = store.reconcile_running(db)
     app = build_app(db, secret)
 
