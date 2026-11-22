@@ -267,8 +267,10 @@ def test_cl_web_runs_without_capabilities_or_privileges_and_sees_only_its_two_fo
     host = web["HostConfig"]
     assert host["SecurityOpt"] == ["no-new-privileges"] and host["Privileged"] is False
     mounts = sorted((m["Source"], m["Destination"], m["RW"]) for m in web["Mounts"])
-    # No Docker socket, no project folder or home: the broker's folder read-only, its own data folder.
-    assert mounts == [("/data/web", "/data", True), ("/run/cl/broker", "/run/cl-broker", False)]
+    # No Docker socket, no project folder or home: the broker's folder read-only, its own data folder,
+    # and the secret it shares with the tutor service, read-only.
+    assert mounts == [("/data/core/tutor_secret", "/run/cl-secret/tutor", False), ("/data/web", "/data", True),
+                      ("/run/cl/broker", "/run/cl-broker", False)]
     write = site.inner("exec", "cl-web", "python3", "-c", "open('/run/cl-broker/written', 'w')", check=False)
     assert write.returncode != 0 and "Read-only file system" in write.stderr
     assert site.sh("test -e /run/cl/broker/written", check=False).returncode != 0
