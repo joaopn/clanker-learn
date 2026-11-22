@@ -18,6 +18,14 @@ creation was cut short is finished by its next start.
     /data/tutor/keys/<name>           the key the tutor logs in with, and known_hosts
     cl-sb-<name>, cl-net-<name>       the container and its network
 
+The software projects get (Claude Code, the editor) is fetched once into a distribution:
+
+    /data/dist/agents/claude          what Claude Code's installer left as ~/.local
+    /data/dist/agents/claude.json     its version and when it was pulled (also in .cl-dist inside)
+    /data/dist/editor, editor.json    the same for the editor (code-server)
+    /data/dist-staging                where a distribution is built before it replaces the old
+    /data/versions.local.env          versions raised by Refresh, over /opt/cl/versions.env
+
 A sandbox is created without privilege, without a published port, without a restart policy
 (the init starts what should run, after the guard rules are in place) and without raw
 sockets: the services that will sit on its network also sit on another, and with hand-built
@@ -47,6 +55,7 @@ import secrets
 import select
 import shutil
 import ssl
+import stat
 import string
 import subprocess
 import sys
@@ -64,6 +73,7 @@ WEB_REPO = "cl-web"
 IMAGES = {"sandbox": (SANDBOX_DIR, IMAGE_REPO, "the sandbox image"), "web": (WEB_DIR, WEB_REPO, "the web server's image")}
 PRELOAD = "/opt/cl/preload"   # <repository>.tar here is loaded where it holds the image wanted; else the image is built
 BUILD_NET = "cl-build"
+VERSIONS_FILE = "/opt/cl/versions.env"   # the repository's pins; /data/versions.local.env overrides them per key
 # The web server's container and the network its ports are published on. The subnet is
 # fixed (the web server listens on its address there and nowhere else) and lies outside
 # the range the inner daemon draws project networks from.
@@ -389,6 +399,536 @@ def ensure_image(say=say_nothing, kind="sandbox"):
             raise ImageError(f"{called[0].upper()}{called[1:]} could not be built: " + (done.stderr.strip() or done.stdout.strip())[-600:])
         say(f"{called} is built")
     return tag
+
+
+# --- the software projects get: pins and distributions -------------------------------------
+#
+# As research-sandbox does it: the version of each piece of software is pinned (the
+# repository's versions.env, which a local file overrides key by key), a throwaway container
+# runs the vendor's installer at that version, and what the installer left in its ~/.local
+# becomes the distribution, from which every project gets its own copy. A version becomes part
+# of a command line and of a path, so nothing that is not digits and dots is ever taken as one.
+
+VERSION = re.compile(r"[0-9]+(\.[0-9]+){1,3}")
+DIST_ATTEMPTS = 3
+DIST_BUILD_TIMEOUT_S = 1200      # one installer run; the container is ended after it
+UPSTREAM_TIMEOUT_S = 15          # curl's --max-time when upstream is asked, as in RS
+BUILD_HOME = "/build"            # the build container's home: the staging folder
+MARK = ".cl-dist"                # inside a distribution, written last: the tree is whole
+# The closed table of what can be pulled. `dist` is the place under /data/dist; `launcher`
+# the program, relative to the distribution; `in_tree` where the launcher must lead, with the
+# version in it; `installer` the vendor's script and the shell and arguments it is run with.
+SOFTWARE = {
+    "claude": {
+        "kind": "agent", "label": "Claude Code", "key": "CLAUDE_CODE_VERSION", "report": "agents",
+        "dist": "agents/claude", "launcher": "bin/claude", "in_tree": re.compile(r"share/claude/versions/([^/]+)"),
+        "installer": "https://claude.ai/install.sh", "shell": "bash", "args": ("{version}",),
+        "upstream": "https://downloads.claude.ai/claude-code-releases/latest",   # a bare version
+    },
+    "code-server": {
+        "kind": "editor", "label": "the editor (code-server)", "key": "CODE_SERVER_VERSION", "report": "editor",
+        "dist": "editor", "launcher": "bin/code-server", "in_tree": re.compile(r"lib/code-server-([^/]+)/bin/code-server"),
+        "installer": "https://code-server.dev/install.sh", "shell": "sh", "args": ("--method", "standalone", "--version", "{version}"),
+        "upstream": "https://github.com/coder/code-server/releases/latest",      # redirects to .../tag/v<version>
+    },
+}
+AGENTS = tuple(one for one, spec in SOFTWARE.items() if spec["kind"] == "agent")
+STALE = "stale — re-pull"
+
+
+def known_software(software):
+    if not isinstance(software, str) or software not in SOFTWARE:
+        raise CoreError(f"There is no software named {str(software)[:40]!r} to pull (there is {', '.join(SOFTWARE)}).")
+    return SOFTWARE[software]
+
+
+def checked_version(value, called):
+    if not isinstance(value, str) or not VERSION.fullmatch(value):
+        raise CoreError(f"{called} is not a version (digits and dots, as 2.1.330): {str(value)[:40]!r}.")
+    return value
+
+
+def version_key(value):
+    """For comparing versions number by number: 2.1.10 is above 2.1.9, and 2.1 is 2.1.0."""
+    numbers = [int(part) for part in checked_version(value, "The version").split(".")]
+    return tuple(numbers + [0] * (4 - len(numbers)))
+
+
+def is_newer(value, than):
+    return version_key(value) > version_key(than)
+
+
+def dist_paths(software):
+    spec = known_software(software)
+    root = f"{DATA}/dist/{spec['dist']}"
+    return {"root": root, "sidecar": root + ".json", "staging": f"{DATA}/dist-staging/{software}",
+            "old": f"{DATA}/dist-staging/{software}.old", "container": f"cl-dist-{software}",
+            "preload": f"{PRELOAD}/dist/{spec['dist']}", "preload_json": f"{PRELOAD}/dist/{spec['dist']}.json",
+            "installer": f"{PRELOAD}/installers/{software}.sh", "upstream": f"{PRELOAD}/upstream/{software}"}
+
+
+def versions_local():
+    return f"{DATA}/versions.local.env"
+
+
+def parse_pins(path):
+    """KEY=VALUE lines of one file, `#` comment lines and blank lines passed over; {} when there
+    is no such file. The values are checked where they are used."""
+    pins = {}
+    try:
+        text = read_text(path)
+    except FileNotFoundError:
+        return pins
+    except (OSError, UnicodeDecodeError) as exc:
+        raise CoreError(f"{path} cannot be read ({type(exc).__name__}).") from exc
+    for line in text.splitlines():
+        line = line.strip()
+        if line and not line.startswith("#"):
+            key, _, value = line.partition("=")
+            if key.strip():
+                pins[key.strip()] = value.strip()
+    return pins
+
+
+def load_versions():
+    """The pins in effect: the repository's, overlaid key by key with the local override."""
+    return {**parse_pins(VERSIONS_FILE), **parse_pins(versions_local())}
+
+
+def pin(software):
+    """The version of `software` in effect, checked."""
+    spec = known_software(software)
+    value = load_versions().get(spec["key"])
+    if value is None:
+        raise CoreError(f"No version of {spec['label']} is pinned ({spec['key']} in {VERSIONS_FILE}).")
+    return checked_version(value, f"{spec['key']} (in {VERSIONS_FILE} or {versions_local()})")
+
+
+def write_pins(lines):
+    """The override file, replaced whole: a reader never sees half of it."""
+    os.makedirs(DATA, exist_ok=True)
+    write_file(versions_local(), "".join(line + "\n" for line in lines), 0o644)
+
+
+def pin_lines_without(key):
+    """The override's lines but those that set `key` (all of them: the last one would win)."""
+    try:
+        lines = read_text(versions_local()).splitlines()
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeDecodeError) as exc:
+        raise CoreError(f"{versions_local()} cannot be read ({type(exc).__name__}).") from exc
+    return [line for line in lines if line.strip().startswith("#") or line.partition("=")[0].strip() != key]
+
+
+def set_version_pin(key, value):
+    """Raise a pin in the local override. Never down, and an unchanged pin is not written (a
+    line that only repeats the repository's value would keep the pin from following the
+    repository later). True when the file was written."""
+    if key not in {spec["key"] for spec in SOFTWARE.values()}:
+        raise CoreError(f"{key!r} is not a version clanker-learn pins.")
+    checked_version(value, f"The new {key}")
+    with flocked("versions.lock"):
+        current = load_versions().get(key)
+        if current is not None and VERSION.fullmatch(current):   # one that is not a version is replaced
+            if version_key(value) == version_key(current):
+                return False
+            if version_key(value) < version_key(current):
+                raise CoreError(f"{key} is {current}; {value} would move it down, so nothing was changed.")
+        lines = pin_lines_without(key)
+        if lines is None:
+            lines = ["# Written by clanker-learn: versions raised over /opt/cl/versions.env (see its header)."]
+        write_pins([*lines, f"{key}={value}"])
+        return True
+
+
+def pin_reset(software):
+    """"Use repo version": take the software's key out of the local override. Nothing to take
+    out is no error. Refused while that software is being built."""
+    spec = known_software(software)
+    with build_lane(software), flocked("versions.lock"):
+        removed = spec["key"] in parse_pins(versions_local())
+        if removed:
+            write_pins(pin_lines_without(spec["key"]))
+    return {"software": software, "key": spec["key"], "removed": removed, "version": pin(software)}
+
+
+# The build lane: one build at a time, refused rather than queued. Two locks, flocks on open
+# files as a project's lock is, so the kernel drops them when the holder dies: the lane itself,
+# and one per software, which says what is being built to anyone who asks without waiting.
+
+LANE_HELD = None     # the software whose lane this process was handed (by a parent that took it)
+
+
+def lane_file(name):
+    os.makedirs(LOCKS, exist_ok=True)
+    return open(os.path.join(LOCKS, name), "a")
+
+
+def building_now():
+    """The software being built now, or None."""
+    for software in SOFTWARE:
+        with lane_file(f"dist-{software}.lock") as fh:
+            try:
+                fcntl.flock(fh, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return software
+    return None
+
+
+def take_build_lane(software):
+    """The lane for building `software`, taken without waiting: two open files that hold it
+    until they are closed. Refused, naming what is being built, while another build runs."""
+    spec = known_software(software)
+    lane = lane_file("dist.lock")
+    try:
+        fcntl.flock(lane, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lane.close()
+        now = building_now()
+        what = SOFTWARE[now]["label"] if now else "Something"
+        raise CoreError(f"{what[0].upper()}{what[1:]} is being built now; try again when that is done.") from None
+    own = lane_file(f"dist-{software}.lock")
+    try:
+        fcntl.flock(own, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        own.close()
+        lane.close()
+        raise CoreError(f"{spec['label'][0].upper()}{spec['label'][1:]} is in use; try again in a moment.") from None
+    return [lane, own]
+
+
+@contextlib.contextmanager
+def build_lane(software):
+    if LANE_HELD == software:
+        yield
+        return
+    held = take_build_lane(software)
+    try:
+        yield
+    finally:
+        for fh in reversed(held):
+            fh.close()
+
+
+def now_utc():
+    return datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds")
+
+
+def pulled(software):
+    """What is pulled of `software`: its mark ({"version", "pulled_at"}), or None when there is
+    no whole distribution (no mark, a mark that does not read, no launcher)."""
+    spec, p = known_software(software), dist_paths(software)
+    try:
+        with open(os.path.join(p["root"], MARK)) as fh:
+            mark = json.loads(fh.read(4096))
+        if not os.path.lexists(os.path.join(p["root"], spec["launcher"])):
+            return None
+        return {"version": checked_version(mark["version"], "The pulled version"), "pulled_at": str(mark.get("pulled_at", ""))}
+    except (OSError, ValueError, KeyError, TypeError, CoreError):
+        return None
+
+
+def relativize_launcher(root, launcher):
+    """The installer links the launcher to an absolute path under the build's home, which
+    leads nowhere in a project's home: it is made relative, as RS does. Any other absolute
+    link is left for the check to refuse."""
+    path = os.path.join(root, launcher)
+    if not os.path.islink(path):
+        return
+    target = os.readlink(path)
+    prefix = BUILD_HOME + "/.local/"
+    if target.startswith(prefix):
+        relative = os.path.relpath(os.path.join(root, target[len(prefix):]), os.path.dirname(path))
+        tmp = path + ".cl-tmp"
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(tmp)
+        os.symlink(relative, tmp)
+        os.replace(tmp, path)
+
+
+def check_tree(software, root, version):
+    """A tree is taken only if its launcher is there, leads (through relative links only) to
+    a program inside the tree, and that program is the version wanted. Raises with why not."""
+    spec = known_software(software)
+    path = os.path.join(root, spec["launcher"])
+    if not os.path.lexists(path):
+        raise CoreError(f"the installer left no {spec['launcher']}")
+    if os.path.islink(path) and os.path.isabs(os.readlink(path)):
+        raise CoreError(f"{spec['launcher']} is a link to {os.readlink(path)[:200]}, outside the distribution")
+    real, top = os.path.realpath(path), os.path.realpath(root)
+    if not real.startswith(top + os.sep):
+        raise CoreError(f"{spec['launcher']} leads outside the distribution")
+    try:
+        mode = os.stat(real).st_mode
+    except OSError as exc:
+        raise CoreError(f"{spec['launcher']} leads nowhere ({type(exc).__name__})") from exc
+    if not stat.S_ISREG(mode) or not mode & 0o111:
+        raise CoreError(f"{spec['launcher']} does not lead to a program")
+    found = spec["in_tree"].fullmatch(os.path.relpath(real, top))
+    if not found:
+        raise CoreError(f"{spec['launcher']} leads to {os.path.relpath(real, top)[:200]}, not to a version of {spec['label']}")
+    if found.group(1) != version:
+        raise CoreError(f"the distribution holds version {found.group(1)[:40]}, not {version}")
+
+
+def remove_path(path):
+    """Remove a folder or a file, without following a link."""
+    if os.path.isdir(path) and not os.path.islink(path):
+        shutil.rmtree(path)
+    elif os.path.lexists(path):
+        os.remove(path)
+
+
+def fresh_folder(path, owner=None):
+    """An empty folder at `path`: whatever an earlier build left there is removed first."""
+    remove_path(path)
+    os.makedirs(path, mode=0o755)
+    if owner is not None:
+        os.chown(path, owner, owner)
+
+
+def install_dist(software, tree, version, say):
+    """Mark a checked tree and put it in the distribution's place by renames: the old one is
+    moved aside only once the new one is whole, and removed only after the new one is in. The
+    folders above are never replaced: running sandboxes have /data/dist mounted."""
+    p = dist_paths(software)
+    if os.path.islink(tree) or not os.path.isdir(tree):   # before anything is written into it: never through a link
+        raise CoreError("the installer left no folder of its own (a link, or nothing)")
+    relativize_launcher(tree, SOFTWARE[software]["launcher"])
+    check_tree(software, tree, version)
+    mark = {"version": version, "pulled_at": now_utc()}
+    write_json(os.path.join(tree, MARK), mark)   # last: a tree without it was cut short, and is not copied
+    os.makedirs(os.path.dirname(p["root"]), mode=0o755, exist_ok=True)
+    remove_path(p["old"])   # left by a swap that was cut short
+    if os.path.lexists(p["root"]):
+        os.rename(p["root"], p["old"])
+    try:
+        os.rename(tree, p["root"])
+    except OSError:
+        if os.path.lexists(p["old"]) and not os.path.lexists(p["root"]):
+            os.rename(p["old"], p["root"])   # the old one back, rather than none
+        raise
+    write_json(p["sidecar"], mark)
+    if os.path.lexists(p["old"]):
+        shutil.rmtree(p["old"], ignore_errors=True)
+    say(f"{SOFTWARE[software]['label']} {version} is pulled")
+    return dict(mark, software=software)
+
+
+DROPPED = ("--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--user", f"{SANDBOX_UID}:{SANDBOX_UID}")
+
+
+def build_dist(software, version, say=say_nothing):
+    """Run the installer of `software` at `version` in a throwaway container of the sandbox
+    image, on the fenced build network, with no capability, as the sandbox's user, its home the
+    staging folder; check what it left, and install it. Three attempts, as RS."""
+    spec, p = known_software(software), dist_paths(software)
+    checked_version(version, f"The version of {spec['label']}")
+    image = ensure_image(say, "sandbox")
+    if not there_is("network", BUILD_NET):
+        docker("network", "create", BUILD_NET)
+    os.makedirs(f"{DATA}/dist-staging", mode=0o700, exist_ok=True)
+    args = [arg.format(version=version) for arg in spec["args"]]
+    mounts, script = [], f'set -euo pipefail; curl -fsSL "$0" | {spec["shell"]} -s -- "$@"'
+    if os.path.isfile(p["installer"]):   # the tests' way in: the build network reaches no test server
+        mounts, script = ["-v", f"{p['installer']}:/opt/cl-installer:ro"], f'set -euo pipefail; {spec["shell"]} /opt/cl-installer "$@"'
+    last = ""
+    try:
+        for attempt in range(1, DIST_ATTEMPTS + 1):
+            docker("rm", "-f", "-v", p["container"], check=False, timeout=STOP_GRACE_S + 120)   # a leftover of a build that was cut
+            fresh_folder(p["staging"], SANDBOX_UID)
+            say(f"installing {spec['label']} {version} (attempt {attempt} of {DIST_ATTEMPTS})")
+            try:
+                done = docker("run", "--rm", "--name", p["container"], "--network", BUILD_NET, *DROPPED,
+                              "-e", f"HOME={BUILD_HOME}", "-v", f"{p['staging']}:{BUILD_HOME}", *mounts,
+                              "--entrypoint", "timeout", image, str(DIST_BUILD_TIMEOUT_S), "bash", "-c", script, spec["installer"], *args,
+                              timeout=DIST_BUILD_TIMEOUT_S + 120, check=False)
+            except CoreError as exc:
+                last = str(exc)
+                continue
+            if done.returncode != 0:
+                last = f"the installer failed (exit {done.returncode}): " + (done.stderr.strip() or done.stdout.strip())[-500:]
+                continue
+            try:
+                return install_dist(software, os.path.join(p["staging"], ".local"), version, say)
+            except CoreError as exc:
+                last = str(exc)
+    finally:
+        docker("rm", "-f", "-v", p["container"], check=False, timeout=STOP_GRACE_S + 120)
+        if os.path.lexists(p["staging"]):
+            shutil.rmtree(p["staging"], ignore_errors=True)
+    raise CoreError(f"{spec['label'][0].upper()}{spec['label'][1:]} {version} could not be pulled in {DIST_ATTEMPTS} attempts: {last}")
+
+
+def take_preloaded(software, say=say_nothing):
+    """A ready distribution from the preload folder, copied, checked, marked and installed as
+    a built one is. None when there is none."""
+    spec, p = known_software(software), dist_paths(software)
+    if not os.path.isdir(p["preload"]) or not os.path.isfile(p["preload_json"]):
+        return None
+    try:
+        with open(p["preload_json"]) as fh:
+            version = checked_version(json.loads(fh.read(4096))["version"], f"The version in {p['preload_json']}")
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise CoreError(f"{p['preload_json']} cannot be read ({type(exc).__name__}).") from exc
+    say(f"taking {spec['label']} {version} from {p['preload']}")
+    os.makedirs(f"{DATA}/dist-staging", mode=0o700, exist_ok=True)
+    fresh_folder(p["staging"])
+    try:
+        tree = os.path.join(p["staging"], ".local")
+        shutil.copytree(p["preload"], tree, symlinks=True)
+        return install_dist(software, tree, version, say)
+    finally:
+        shutil.rmtree(p["staging"], ignore_errors=True)
+
+
+def software_pull(software, say=say_nothing):
+    """Pull `software` again at the version in effect (Settings -> Software, Pull)."""
+    known_software(software)
+    with build_lane(software):
+        return build_dist(software, pin(software), say)
+
+
+def first_pull(software, say=say_nothing, build=True):
+    """What the keeper does at a first start: a distribution handed in through the preload
+    folder is taken; otherwise it is built, if `build` (the sandbox image is there)."""
+    spec = known_software(software)
+    with build_lane(software):
+        there = pulled(software)
+        if there is not None:
+            return dict(there, software=software)
+        taken = take_preloaded(software, say)
+        if taken is not None:
+            return taken
+        if not build:
+            raise CoreError(f"{spec['label'][0].upper()}{spec['label'][1:]} is built in a container of the sandbox image, which could not be had.")
+        return build_dist(software, pin(software), say)
+
+
+def upstream_version(software):
+    """The newest version upstream, asked from a throwaway container on the build network, as
+    RS does (or read from the preload folder, the tests' way in). Checked as a version."""
+    spec, p = known_software(software), dist_paths(software)
+    if os.path.isfile(p["upstream"]):
+        answer = read_bounded(p["upstream"], 256).strip()
+    else:
+        image = ensure_image(kind="sandbox")
+        if not there_is("network", BUILD_NET):
+            docker("network", "create", BUILD_NET)
+        how = ["--max-filesize", "1024", spec["upstream"]] if software == "claude" else ["-o", "/dev/null", "-w", "%{url_effective}", spec["upstream"]]
+        try:
+            done = docker("run", "--rm", "--network", BUILD_NET, *DROPPED, "--entrypoint", "curl", image,
+                          "-fsSL", "--max-time", str(UPSTREAM_TIMEOUT_S), *how, timeout=UPSTREAM_TIMEOUT_S + 60, check=False)
+        except CoreError as exc:
+            raise CoreError(f"Upstream could not be asked for the newest version of {spec['label']}: {exc}") from exc
+        if done.returncode != 0:
+            raise CoreError(f"Upstream could not be asked for the newest version of {spec['label']}: {(done.stderr.strip() or 'curl failed')[-300:]}")
+        answer = done.stdout.strip()
+        if software == "code-server":
+            # The version rides the redirect to .../releases/tag/v<version>; without one the
+            # address still ends in "latest", which must never become a pin.
+            if "/releases/tag/" not in answer:
+                raise CoreError(f"Upstream did not name a release of {spec['label']} (it answered {answer[:120]!r}).")
+            answer = answer.rsplit("/", 1)[-1].removeprefix("v")
+    return checked_version(answer, f"Upstream's newest version of {spec['label']}")
+
+
+def refresh_check(software):
+    """The version in effect, upstream's newest, and whether upstream's is newer. Changes
+    nothing."""
+    current, latest = pin(software), upstream_version(software)
+    return {"software": software, "version": current, "upstream": latest, "newer": is_newer(latest, current)}
+
+
+def software_refresh(software, say=say_nothing):
+    """Refresh: if upstream has a newer version, raise the pin to it and pull it; otherwise
+    there is nothing to do (a pin is never moved down)."""
+    spec = known_software(software)
+    with build_lane(software):
+        say(f"asking upstream for the newest version of {spec['label']}")
+        check = refresh_check(software)
+        if not check["newer"]:
+            say(f"{spec['label']} {check['version']} is in effect and upstream's newest is {check['upstream']}: nothing to do")
+            return dict(check, bumped=False)
+        say(f"raising {spec['key']} from {check['version']} to {check['upstream']}")
+        set_version_pin(spec["key"], check["upstream"])
+        return dict(check, previous=check["version"], version=check["upstream"], bumped=True, pulled=build_dist(software, check["upstream"], say))
+
+
+# Named as RS names them.
+def known_agent(agent):
+    if agent not in AGENTS:
+        raise CoreError(f"There is no agent named {str(agent)[:40]!r} (there is {', '.join(AGENTS)}).")
+    return agent
+
+
+def agent_pull(agent="claude", say=say_nothing):
+    return software_pull(known_agent(agent), say)
+
+
+def agent_refresh_check(agent="claude"):
+    return refresh_check(known_agent(agent))
+
+
+def agent_refresh(agent="claude", say=say_nothing):
+    return software_refresh(known_agent(agent), say)
+
+
+def editor_pull(say=say_nothing):
+    return software_pull("code-server", say)
+
+
+def editor_refresh_check():
+    return refresh_check("code-server")
+
+
+def editor_refresh(say=say_nothing):
+    return software_refresh("code-server", say)
+
+
+def dist_status_word(have, version):
+    if have is None:
+        return "not pulled"
+    return "up to date" if have["version"] == version else STALE
+
+
+def software_status():
+    """One row per software, for Settings -> Software: what is pulled, the version in effect
+    and the repository's, whether the local override sets it (so "Use repo version" can be
+    offered), a status word, and whether it is being built now. Reads files only."""
+    rows, now = [], building_now()
+    try:
+        base, problem = parse_pins(VERSIONS_FILE), ""
+        override = parse_pins(versions_local())
+    except CoreError as exc:
+        base, override, problem = {}, {}, str(exc)
+    for software, spec in SOFTWARE.items():
+        row = {"id": software, "kind": spec["kind"], "row": f"{spec['kind']}: {software}", "label": spec["label"],
+               "key": spec["key"], "pulled": pulled(software), "version": None, "repo_version": base.get(spec["key"]),
+               "overridden": spec["key"] in override, "building": now == software}
+        try:
+            row["version"] = pin(software)
+        except CoreError as exc:
+            row["problem"] = problem or str(exc)
+        row["status"] = dist_status_word(row["pulled"], row["version"])   # a version that cannot be read is never "up to date"
+        rows.append(row)
+    return rows
+
+
+def keep_software(report, image_ready):
+    """The keeper's first pulls, once the sandbox image is had: for the agent and then the
+    editor, a distribution that is there is said ready; one that is not is pulled, once."""
+    for software, spec in SOFTWARE.items():
+        key = spec["report"]
+        try:
+            there = pulled(software)
+            if there is None:
+                report(key, "pulling")
+                there = first_pull(software, lambda message, key=key: report(key, f"pulling: {message}"), build=image_ready)
+            report(key, f"ready: {there['version']}")
+        except (CoreError, OSError) as exc:
+            report(key, f"failed: {exc}")
 
 
 # --- making what a project needs -----------------------------------------------------------
@@ -1160,7 +1700,9 @@ def web_health(settings, timeout=3):
 
 def keep_web(env, status_port, report, sleep=time.sleep, turns=None, now=time.monotonic):
     """Bring the web server up and keep it up, saying how it stands through `report(key,
-    value)`: "preparing", "up", "off", or "down: <why>". Returns 0 when it is off, 3 when it
+    value)`: "preparing", "up", "off", or "down: <why>". Once it is up, the sandbox image is had
+    ("sandbox_image"), then the agent's and the editor's distributions ("agents", "editor":
+    "pulling", then "ready: <version>" or "failed: <why>"). Returns 0 when it is off, 3 when it
     is down for good this run (a wrong setting, an image that cannot be had: the next start of
     clanker-learn tries again). A web server that is missing, ended, or cannot be asked about is
     started again, a turn apart; one that runs and does not answer is left alone, and called
@@ -1232,8 +1774,13 @@ def keep_web(env, status_port, report, sleep=time.sleep, turns=None, now=time.mo
             try:
                 ensure_image(lambda message: report("sandbox_image", f"preparing: {message}"), "sandbox")
                 report("sandbox_image", "ready")
+                image_ready = True
             except CoreError as exc:
                 report("sandbox_image", f"failed: {exc}")
+                image_ready = False
+            # Then the agent and the editor, each pulled here once if it is not there (a
+            # distribution is built in a container of the sandbox image): never at every start.
+            keep_software(report, image_ready)
         sleep(1 if said[0].startswith("preparing") else WEB_RESTART_S)
     return 0
 
@@ -1285,6 +1832,16 @@ def main(argv=None):
     keeper = verbs.add_parser("web-keep", help="(run by the init) bring the web server up and keep it up")
     keeper.add_argument("status_port", type=int)
     verbs.add_parser("passwd", help="set the interface's password: read from standard input, or asked for at a terminal")
+    verbs.add_parser("software", help="what is pulled of the agent and the editor, and at which version")
+    for verb in ("agent", "editor"):
+        actions = verbs.add_parser(verb, help=f"pull or refresh the {verb}'s distribution").add_subparsers(dest="action", required=True)
+        for action in ("pull", "refresh"):
+            one = actions.add_parser(action, help="pull again at the version in effect" if action == "pull"
+                                     else "raise the version to upstream's newest and pull it, if it is newer")
+            if verb == "agent":
+                one.add_argument("agent", nargs="?", default="claude", choices=AGENTS)
+            if action == "refresh":
+                one.add_argument("--check", action="store_true", help="only say whether upstream has a newer version")
     for verb in ("status", "create", "start", "stop", "recreate", "destroy", "limits"):
         one = verbs.add_parser(verb)
         one.add_argument("name")
@@ -1305,6 +1862,14 @@ def main(argv=None):
             out = set_password(read_new_password())
         elif args.verb == "list":
             out = list_projects()
+        elif args.verb == "software":
+            out = software_status()
+        elif args.verb in ("agent", "editor"):
+            software = args.agent if args.verb == "agent" else "code-server"
+            if args.action == "pull":
+                out = software_pull(software, say)
+            else:
+                out = refresh_check(software) if args.check else software_refresh(software, say)
         elif args.verb == "start-wanted":
             out = start_wanted(say)
         elif args.verb == "status":

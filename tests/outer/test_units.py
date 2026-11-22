@@ -717,6 +717,8 @@ def keeper_process():
 @pytest.mark.parametrize("line, report", [
     (b'{"web": "up"}', ("web", "up")),
     (b'{"sandbox_image": "ready"}', ("sandbox_image", "ready")),
+    (b'{"agents": "ready: 2.1.330"}', ("agents", "ready: 2.1.330")),
+    (b'{"editor": "pulling: installing the editor"}', ("editor", "pulling: installing the editor")),
     (b'{"web": "down: ' + b"x" * 1000 + b'"}', ("web", "down: " + "x" * 594)),       # cut to a sane length
     (b'{"other": "up"}', None),
     (b'{"web": "up", "sandbox_image": "ready"}', None),
@@ -785,7 +787,7 @@ def read_line_by_line(process, keeper):
 def keeping(monkeypatch, tmp_path, keeper_process):
     """keep_web_keeper with stand-in keepers and a clock: what it started, and the state."""
     monkeypatch.setattr(init, "STATE_FILE", str(tmp_path / "state.json"))
-    for key in ("web", "sandbox_image"):
+    for key in ("web", "sandbox_image", "agents", "editor"):
         monkeypatch.delitem(init.state, key, raising=False)
     started, gone, clock = [], set(), [100.0]
 
@@ -909,7 +911,7 @@ def test_the_loop_hurries_while_the_web_server_is_prepared(monkeypatch, web, wai
 
 def test_after_a_refusal_the_keeper_is_forgotten_and_its_state_dropped(monkeypatch, tmp_path, keeper_process):
     """Ready, the keeper says the web server is up, then the watch refuses: "web" and
-    "sandbox_image" leave the state with "sandboxes" and "broker", the keeper is not started
+    "sandbox_image" (and "agents", "editor") leave the state with "sandboxes" and "broker", the keeper is not started
     again, and the stop does not signal its group (refuse() ended it; the number may be
     someone else's by then). The code never reaches the state file."""
     import json
@@ -936,10 +938,10 @@ def test_after_a_refusal_the_keeper_is_forgotten_and_its_state_dropped(monkeypat
     net = tmp_path / "net"
     net.mkdir()
     process = keeper_process()
-    process.say(b'{"web": "up"}\n{"sandbox_image": "ready"}\n')
+    process.say(b'{"web": "up"}\n{"sandbox_image": "ready"}\n{"agents": "ready: 2.1.330"}\n{"editor": "ready: 4.126.0"}\n')
 
     def watch(daemon, dns):
-        calls.append(("watch", init.state.get("web"), init.state.get("sandbox_image")))
+        calls.append(("watch", init.state.get("web"), init.state.get("sandbox_image"), init.state.get("agents"), init.state.get("editor")))
         raise init.Refused("the rules were lost")
     monkeypatch.setattr(init, "Stop", StopAfterTurns)
     monkeypatch.setattr(init, "serve_status", lambda: None)
@@ -961,8 +963,8 @@ def test_after_a_refusal_the_keeper_is_forgotten_and_its_state_dropped(monkeypat
     monkeypatch.setattr(init, "STATE_FILE", str(tmp_path / "state.json"))
     monkeypatch.setattr(init, "NET_DIR", str(net))
     init.main()
-    assert calls == ["start the web keeper", ("watch", "up", "ready")]
+    assert calls == ["start the web keeper", ("watch", "up", "ready", "ready: 2.1.330", "ready: 4.126.0")]
     assert init.state["state"] == "refused"
-    assert not {"sandboxes", "broker", "web", "sandbox_image"} & set(init.state)
-    assert not {"sandboxes", "broker", "web", "sandbox_image"} & set(json.loads((tmp_path / "state.json").read_text()))
+    assert not {"sandboxes", "broker", "web", "sandbox_image", "agents", "editor"} & set(init.state)
+    assert not {"sandboxes", "broker", "web", "sandbox_image", "agents", "editor"} & set(json.loads((tmp_path / "state.json").read_text()))
     assert len(codes) == 1 and codes[0] not in (tmp_path / "state.json").read_text()

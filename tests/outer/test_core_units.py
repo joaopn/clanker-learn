@@ -2,7 +2,9 @@
 import io
 import json
 import os
+import pathlib
 import subprocess
+import sys
 import tarfile
 import time
 
@@ -1250,11 +1252,14 @@ UP = ("up", "")
 ABSENT = ("absent", "there is no web server container")
 
 
-def keep_web_with(monkeypatch, healths, ups=(), sandbox_image=None, env=None, turns=None):
+def keep_web_with(monkeypatch, healths, ups=(), sandbox_image=None, env=None, turns=None, software=None):
     """keep_web with stand-ins: `healths` is what web_health says turn by turn; `ups` what each
     web_up does (None: works; a string: says it and works; an exception: raised); the clock
-    moves by what it sleeps. Returns (exit, reports, sleeps, web_up calls, sandbox image calls)."""
+    moves by what it sleeps; the first pulls of the agent and the editor are recorded in
+    `software` (whether the sandbox image was had), not done. Returns (exit, reports, sleeps,
+    web_up calls, sandbox image calls)."""
     healths, ups = list(healths), list(ups)
+    software = [] if software is None else software
     reports, sleeps, called, images, clock = [], [], [], [], [0.0]
 
     def web_up(settings, say):
@@ -1278,18 +1283,20 @@ def keep_web_with(monkeypatch, healths, ups=(), sandbox_image=None, env=None, tu
     monkeypatch.setattr(core, "web_health", lambda settings: healths.pop(0))
     monkeypatch.setattr(core, "web_up", web_up)
     monkeypatch.setattr(core, "ensure_image", ensure_image)
+    monkeypatch.setattr(core, "keep_software", lambda report, image_ready: software.append(image_ready))
     code = core.keep_web(env or {}, 8080, lambda key, value: reports.append((key, value)), sleep=sleep,
                          turns=len(healths) if turns is None else turns, now=lambda: clock[0])
     return code, reports, sleeps, called, images
 
 
-def test_a_first_start_is_preparing_then_up_then_the_sandbox_image_is_ready(monkeypatch):
-    code, reports, sleeps, called, images = keep_web_with(monkeypatch, [ABSENT, SILENT, UP, UP, UP], ["building the web server's image"])
+def test_a_first_start_is_preparing_then_up_then_the_sandbox_image_is_ready_then_the_software_is_pulled(monkeypatch):
+    software = []
+    code, reports, sleeps, called, images = keep_web_with(monkeypatch, [ABSENT, SILENT, UP, UP, UP], ["building the web server's image"], software=software)
     assert code == 0
     assert reports == [("web", "preparing"), ("web", "preparing: building the web server's image"), ("web", "up"),
                        ("sandbox_image", "preparing: building the sandbox image (once; this takes a few minutes and needs the internet)"),
                        ("sandbox_image", "ready")]
-    assert sleeps == [1, 1, 5, 5, 5] and len(called) == 1 and images == ["sandbox"]
+    assert sleeps == [1, 1, 5, 5, 5] and len(called) == 1 and images == ["sandbox"] and software == [True]   # once
     assert called[0] == {"port": 7788, "origin": (11100, 11164), "passthrough": (11200, 11299)}
 
 
@@ -1432,9 +1439,11 @@ def test_a_web_server_that_never_answers_does_not_stay_preparing(monkeypatch):
 
 def test_a_sandbox_image_that_fails_leaves_the_web_server_up_and_is_not_tried_again(monkeypatch):
     failed = core.ImageError("The sandbox image could not be built: no network")
-    _, reports, _, _, images = keep_web_with(monkeypatch, [ABSENT, UP, UP, UP], sandbox_image=failed)
+    software = []
+    _, reports, _, _, images = keep_web_with(monkeypatch, [ABSENT, UP, UP, UP], sandbox_image=failed, software=software)
     assert reports[-1] == ("sandbox_image", "failed: The sandbox image could not be built: no network")
     assert [r for r in reports if r[0] == "web"][-1] == ("web", "up") and images == ["sandbox"]
+    assert software == [False]                          # said, so that what needs the image is not built
 
 
 # --- the Shell's password and login ----------------------------------------------------------
@@ -1659,3 +1668,394 @@ def test_the_sandbox_user_gets_the_password_from_its_hash_and_keeps_its_own_with
     (tmp_path / "shell_password_hash").write_text(A_HASH + "\n")
     assert sandbox_init.set_password(str(tmp_path), run=run) is True
     assert ran == [(["chpasswd", "-e"], f"learner:{A_HASH}\n".encode())]
+
+
+# --- the software projects get: pins, distributions, the build lane ---------------------------
+
+CLAUDE, EDITOR = "2.1.330", "4.126.0"
+
+
+def stand_in(root, software, version, absolute=False):
+    """A tree as the installer leaves it: the launcher a link to the versioned program, which
+    is a tiny script. `absolute`: the link as the installer makes it, into the build's home."""
+    inside = {"claude": f"share/claude/versions/{version}", "code-server": f"lib/code-server-{version}/bin/code-server"}[software]
+    program = root / inside
+    program.parent.mkdir(parents=True, exist_ok=True)
+    program.write_text(f"#!/bin/sh\necho {version}\n")
+    program.chmod(0o755)
+    (root / "bin").mkdir(exist_ok=True)
+    launcher = root / "bin" / ("claude" if software == "claude" else "code-server")
+    launcher.symlink_to(f"/build/.local/{inside}" if absolute else os.path.relpath(program, launcher.parent))
+    return root
+
+
+class Builds:
+    """Answers the docker commands of a build or an upstream question. A build container
+    "runs the installer" by writing a tree into the staging folder it was given, at the version
+    in its command line or at `leaves`, unless `fails` says it exits non-zero."""
+
+    def __init__(self):
+        self.calls, self.leaves, self.fails, self.upstream = [], None, False, {}
+
+    def __call__(self, *args, timeout=120, check=True):
+        self.calls.append(args)
+        done = self.answer(args)
+        if check and done.returncode != 0:
+            raise core.CoreError(f"`docker {' '.join(args[:2])}` failed: {done.stderr}")
+        return done
+
+    def answer(self, args):
+        if args[0] != "run":
+            return answer(0, stdout="[{}]")
+        if "curl" in args:
+            url = args[-1]
+            return answer(0, stdout=self.upstream[url]) if url in self.upstream else answer(6, "curl: (6) Could not resolve host")
+        if self.fails:
+            return answer(1, "curl: (6) Could not resolve host: claude.ai")
+        software = args[args.index("--name") + 1].removeprefix("cl-dist-")
+        staging = next(a.split(":")[0] for a in args if a.endswith(":/build"))
+        version = self.leaves or args[-1]
+        stand_in(pathlib.Path(staging) / ".local", software, version, absolute=True)
+        return answer(0)
+
+    def runs(self):
+        return [c for c in self.calls if c[0] == "run"]
+
+
+@pytest.fixture
+def dists(monkeypatch, tmp_path):
+    monkeypatch.setattr(core, "DATA", str(tmp_path / "data"))
+    monkeypatch.setattr(core, "LOCKS", str(tmp_path / "locks"))
+    monkeypatch.setattr(core, "PRELOAD", str(tmp_path / "preload"))
+    base = tmp_path / "versions.env"
+    base.write_text(f"# the repository's\nCLAUDE_CODE_VERSION={CLAUDE}\nCODE_SERVER_VERSION={EDITOR}\n")
+    monkeypatch.setattr(core, "VERSIONS_FILE", str(base))
+    builds = Builds()
+    monkeypatch.setattr(core, "docker", builds)
+    monkeypatch.setattr(core, "ensure_image", lambda say=core.say_nothing, kind="sandbox": "cl-sandbox:abc")
+    return builds
+
+
+def local_pins(tmp_path):
+    path = tmp_path / "data" / "versions.local.env"
+    return path.read_text() if path.exists() else None
+
+
+def test_the_repository_ships_both_pins_and_the_image_has_them():
+    repo = pathlib.Path(__file__).resolve().parents[2]
+    assert core.parse_pins(str(repo / "versions.env")) == {"CLAUDE_CODE_VERSION": CLAUDE, "CODE_SERVER_VERSION": EDITOR}
+    assert "COPY versions.env /opt/cl/versions.env" in (repo / "outer" / "Dockerfile").read_text()
+
+
+def test_the_local_override_wins_key_by_key(dists, tmp_path):
+    assert core.load_versions() == {"CLAUDE_CODE_VERSION": CLAUDE, "CODE_SERVER_VERSION": EDITOR}
+    (tmp_path / "data").mkdir()
+    (tmp_path / "data" / "versions.local.env").write_text("# mine\n\nCLAUDE_CODE_VERSION = 2.1.400\n")
+    assert core.load_versions() == {"CLAUDE_CODE_VERSION": "2.1.400", "CODE_SERVER_VERSION": EDITOR}
+    assert (core.pin("claude"), core.pin("code-server")) == ("2.1.400", EDITOR)
+
+
+def test_a_pin_is_raised_in_the_override_and_the_rest_of_it_is_kept(dists, tmp_path):
+    (tmp_path / "data").mkdir()
+    (tmp_path / "data" / "versions.local.env").write_text("# mine\nCODE_SERVER_VERSION=4.127.0\n")
+    assert core.set_version_pin("CLAUDE_CODE_VERSION", "2.1.400") is True
+    assert local_pins(tmp_path) == "# mine\nCODE_SERVER_VERSION=4.127.0\nCLAUDE_CODE_VERSION=2.1.400\n"
+    assert core.set_version_pin("CLAUDE_CODE_VERSION", "2.1.1000") is True              # 1000 is above 400: numbers, not text
+    assert local_pins(tmp_path) == "# mine\nCODE_SERVER_VERSION=4.127.0\nCLAUDE_CODE_VERSION=2.1.1000\n"
+    assert not list((tmp_path / "data").glob("*.tmp"))
+
+
+def test_an_unchanged_pin_is_not_written_and_none_is_moved_down(dists, tmp_path):
+    assert core.set_version_pin("CLAUDE_CODE_VERSION", CLAUDE) is False
+    assert core.set_version_pin("CLAUDE_CODE_VERSION", CLAUDE + ".0") is False          # the same number
+    assert local_pins(tmp_path) is None                                                 # the pin still follows the repository
+    with pytest.raises(core.CoreError, match="would move it down"):
+        core.set_version_pin("CLAUDE_CODE_VERSION", "2.1.99")
+    assert local_pins(tmp_path) is None
+
+
+@pytest.mark.parametrize("value", ["latest", "v2.1.400", "2", "2.1.400-rc1", "2.1.400\n", "2.1.400; rm -rf /", "1.2.3.4.5", "２.1.400", "", None, 2.1])
+def test_a_version_that_is_not_digits_and_dots_is_refused(dists, tmp_path, value):
+    with pytest.raises(core.CoreError, match="is not a version"):
+        core.set_version_pin("CLAUDE_CODE_VERSION", value)
+    assert local_pins(tmp_path) is None
+    if isinstance(value, str) and not core.VERSION.fullmatch(value.strip()):              # (a line is read stripped)
+        (tmp_path / "data").mkdir(exist_ok=True)
+        (tmp_path / "data" / "versions.local.env").write_text(f"CLAUDE_CODE_VERSION={value}\n")
+        with pytest.raises(core.CoreError, match="is not a version"):
+            core.pin("claude")                                                            # nor taken from the override
+
+
+def test_only_the_two_known_pins_are_written(dists, tmp_path):
+    with pytest.raises(core.CoreError, match="not a version clanker-learn pins"):
+        core.set_version_pin("DOCKER_VERSION", "30.0.0")
+    assert local_pins(tmp_path) is None
+
+
+def test_use_repo_version_takes_one_key_out_of_the_override(dists, tmp_path):
+    (tmp_path / "data").mkdir()
+    (tmp_path / "data" / "versions.local.env").write_text("# mine\nCLAUDE_CODE_VERSION=2.1.400\nCODE_SERVER_VERSION=4.127.0\nCLAUDE_CODE_VERSION=2.1.401\n")
+    assert core.pin_reset("claude") == {"software": "claude", "key": "CLAUDE_CODE_VERSION", "removed": True, "version": CLAUDE}
+    assert local_pins(tmp_path) == "# mine\nCODE_SERVER_VERSION=4.127.0\n"
+    assert core.pin_reset("claude")["removed"] is False
+    assert local_pins(tmp_path) == "# mine\nCODE_SERVER_VERSION=4.127.0\n"
+
+
+@pytest.mark.parametrize("newer, than", [("2.1.10", "2.1.9"), ("10.0", "9.9.9"), ("2.2", "2.1.330"), ("4.126.1", "4.126.0")])
+def test_versions_are_compared_number_by_number(newer, than):
+    assert core.is_newer(newer, than) and not core.is_newer(than, newer)
+    assert not core.is_newer("2.1", "2.1.0") and not core.is_newer("2.1.0", "2.1")
+
+
+def test_the_launcher_link_is_made_relative(tmp_path):
+    tree = stand_in(tmp_path / "local", "claude", CLAUDE, absolute=True)
+    core.relativize_launcher(str(tree), "bin/claude")
+    assert os.readlink(tree / "bin" / "claude") == f"../share/claude/versions/{CLAUDE}"
+    core.check_tree("claude", str(tree), CLAUDE)
+
+
+@pytest.mark.parametrize("spoil, why", [
+    (lambda tree: (tree / "bin" / "claude").unlink(), "left no bin/claude"),
+    (lambda tree: relink(tree, "/usr/bin/env"), "outside the distribution"),
+    (lambda tree: relink(tree, "../../../../../../etc/passwd"), "leads outside the distribution"),
+    (lambda tree: relink(tree, "../share/claude"), "does not lead to a program"),
+    (lambda tree: relink(tree, "../nowhere"), "leads nowhere"),
+    (lambda tree: (tree / f"share/claude/versions/{CLAUDE}").chmod(0o644), "does not lead to a program"),
+])
+def test_a_tree_whose_launcher_is_not_the_version_wanted_is_refused(tmp_path, spoil, why):
+    tree = stand_in(tmp_path / "local", "claude", CLAUDE)
+    spoil(tree)
+    with pytest.raises(core.CoreError, match=why):
+        core.check_tree("claude", str(tree), CLAUDE)
+    with pytest.raises(core.CoreError, match=f"holds version {CLAUDE}, not 2.1.400"):
+        core.check_tree("claude", str(stand_in(tmp_path / "other", "claude", CLAUDE)), "2.1.400")
+
+
+def relink(tree, target):
+    (tree / "bin" / "claude").unlink()
+    (tree / "bin" / "claude").symlink_to(target)
+
+
+def test_a_pull_runs_the_installer_without_privileges_checks_marks_and_swaps(dists, tmp_path):
+    said = []
+    out = core.software_pull("claude", said.append)
+    root = tmp_path / "data" / "dist" / "agents" / "claude"
+    assert out["software"] == "claude" and out["version"] == CLAUDE
+    assert os.readlink(root / "bin" / "claude") == f"../share/claude/versions/{CLAUDE}"
+    assert json.loads((root / ".cl-dist").read_text()) == json.loads((root.parent / "claude.json").read_text()) == {"version": CLAUDE, "pulled_at": out["pulled_at"]}
+    assert core.pulled("claude") == {"version": CLAUDE, "pulled_at": out["pulled_at"]}
+    run, = dists.runs()
+    staging = str(tmp_path / "data" / "dist-staging" / "claude")
+    assert run[:run.index("cl-sandbox:abc") + 1] == (
+        "run", "--rm", "--name", "cl-dist-claude", "--network", "cl-build", "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+        "--user", "1000:1000", "-e", "HOME=/build", "-v", f"{staging}:/build", "--entrypoint", "timeout", "cl-sandbox:abc")
+    assert run[-3] == 'set -euo pipefail; curl -fsSL "$0" | bash -s -- "$@"' and run[-2:] == ("https://claude.ai/install.sh", CLAUDE)
+    assert ("rm", "-f", "-v", "cl-dist-claude") in dists.calls[:dists.calls.index(run)]     # a leftover goes first
+    assert os.listdir(tmp_path / "data" / "dist-staging") == []
+    assert said[-1] == f"Claude Code {CLAUDE} is pulled"
+
+
+def test_the_editor_is_installed_standalone_at_its_pin(dists, tmp_path):
+    core.editor_pull()
+    run, = dists.runs()
+    assert run[-6] == 'set -euo pipefail; curl -fsSL "$0" | sh -s -- "$@"'
+    assert run[-5:] == ("https://code-server.dev/install.sh", "--method", "standalone", "--version", EDITOR)
+    assert os.readlink(tmp_path / "data" / "dist" / "editor" / "bin" / "code-server") == f"../lib/code-server-{EDITOR}/bin/code-server"
+    assert core.pulled("code-server")["version"] == EDITOR
+
+
+def test_a_new_pull_replaces_the_old_tree_and_leaves_the_folders_above_in_place(dists, tmp_path):
+    core.software_pull("claude")
+    agents = tmp_path / "data" / "dist" / "agents"
+    folders = (os.stat(agents.parent).st_ino, os.stat(agents).st_ino)
+    core.set_version_pin("CLAUDE_CODE_VERSION", "2.1.400")
+    core.software_pull("claude")
+    assert core.pulled("claude")["version"] == "2.1.400" and not (agents / "claude" / "share" / "claude" / "versions" / CLAUDE).exists()
+    assert (os.stat(agents.parent).st_ino, os.stat(agents).st_ino) == folders
+    assert sorted(os.listdir(agents)) == ["claude", "claude.json"] and os.listdir(agents.parent.parent / "dist-staging") == []
+
+
+@pytest.mark.parametrize("how", ["installer fails", "wrong version"])
+def test_a_build_that_fails_its_check_three_times_leaves_the_old_distribution(dists, tmp_path, how):
+    old = core.software_pull("claude")
+    core.set_version_pin("CLAUDE_CODE_VERSION", "2.1.400")
+    dists.calls.clear()
+    dists.fails, dists.leaves = how == "installer fails", "2.1.399" if how == "wrong version" else None
+    why = "the installer failed .exit 1.: curl" if how == "installer fails" else "the distribution holds version 2.1.399, not 2.1.400"
+    with pytest.raises(core.CoreError, match=f"Claude Code 2.1.400 could not be pulled in 3 attempts: {why}"):
+        core.software_pull("claude")
+    assert len(dists.runs()) == 3
+    assert core.pulled("claude") == {"version": CLAUDE, "pulled_at": old["pulled_at"]}
+    assert (tmp_path / "data" / "dist" / "agents" / "claude" / "share" / "claude" / "versions" / CLAUDE).is_file()
+    assert os.listdir(tmp_path / "data" / "dist-staging") == [] and dists.calls[-1] == ("rm", "-f", "-v", "cl-dist-claude")
+
+
+def test_an_installer_in_the_preload_folder_is_run_in_place_of_the_vendors(dists, tmp_path):
+    installer = tmp_path / "preload" / "installers" / "claude.sh"
+    installer.parent.mkdir(parents=True)
+    installer.write_text("#!/bin/bash\n")
+    core.software_pull("claude")
+    run, = dists.runs()
+    assert run[run.index("-v") + 2:run.index("-v") + 4] == ("-v", f"{installer}:/opt/cl-installer:ro")
+    assert run[-3] == 'set -euo pipefail; bash /opt/cl-installer "$@"' and run[-1] == CLAUDE
+
+
+def test_a_second_build_while_one_runs_is_refused_naming_what_is_built(dists, tmp_path):
+    assert core.building_now() is None
+    held = core.take_build_lane("claude")
+    try:
+        assert core.building_now() == "claude"
+        for build in (lambda: core.software_pull("code-server"), lambda: core.software_pull("claude"),
+                      lambda: core.software_refresh("code-server"), lambda: core.pin_reset("claude")):
+            with pytest.raises(core.CoreError, match="Claude Code is being built now; try again when that is done."):
+                build()
+        assert core.software_status()[0]["building"] is True and core.software_status()[1]["building"] is False
+    finally:
+        for fh in held:
+            fh.close()
+    assert core.building_now() is None and dists.runs() == []
+    core.software_pull("code-server")
+
+
+def test_the_lane_is_dropped_when_its_holder_dies(dists, tmp_path):
+    hold = (f"import sys, time; sys.path.insert(0, {os.path.dirname(core.__file__)!r}); import core; core.LOCKS = {core.LOCKS!r};"
+            " held = core.take_build_lane('claude'); print('held', flush=True); time.sleep(60)")
+    holder = subprocess.Popen([sys.executable, "-c", hold], stdout=subprocess.PIPE, text=True)
+    try:
+        assert holder.stdout.readline() == "held\n"
+        assert core.building_now() == "claude"
+    finally:
+        holder.kill()
+        holder.wait()
+    assert core.building_now() is None
+    core.software_pull("claude")
+
+
+def test_the_status_words(dists, tmp_path):
+    rows = core.software_status()
+    assert [(r["id"], r["row"], r["status"], r["pulled"], r["version"], r["repo_version"], r["overridden"]) for r in rows] == [
+        ("claude", "agent: claude", "not pulled", None, CLAUDE, CLAUDE, False),
+        ("code-server", "editor: code-server", "not pulled", None, EDITOR, EDITOR, False)]
+    core.software_pull("claude")
+    assert [r["status"] for r in core.software_status()] == ["up to date", "not pulled"]
+    core.set_version_pin("CLAUDE_CODE_VERSION", "2.1.400")
+    claude = core.software_status()[0]
+    assert (claude["status"], claude["pulled"]["version"], claude["version"], claude["repo_version"], claude["overridden"]) == (
+        "stale — re-pull", CLAUDE, "2.1.400", CLAUDE, True)
+    core.pin_reset("claude")
+    assert core.software_status()[0]["status"] == "up to date"
+    (tmp_path / "data" / "versions.local.env").write_text("CLAUDE_CODE_VERSION=latest\n")
+    claude = core.software_status()[0]
+    assert claude["status"] == "stale — re-pull" and claude["version"] is None and "is not a version" in claude["problem"]
+
+
+def test_upstream_is_asked_from_a_throwaway_container_and_its_answer_checked(dists):
+    dists.upstream = {"https://downloads.claude.ai/claude-code-releases/latest": "2.1.400\n",
+                      "https://github.com/coder/code-server/releases/latest": "https://github.com/coder/code-server/releases/tag/v4.127.0"}
+    assert core.refresh_check("claude") == {"software": "claude", "version": CLAUDE, "upstream": "2.1.400", "newer": True}
+    assert core.editor_refresh_check() == {"software": "code-server", "version": EDITOR, "upstream": "4.127.0", "newer": True}
+    claude, editor = dists.runs()
+    assert claude[:claude.index("cl-sandbox:abc") + 1] == ("run", "--rm", "--network", "cl-build", "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+                                                           "--user", "1000:1000", "--entrypoint", "curl", "cl-sandbox:abc")
+    assert claude[claude.index("cl-sandbox:abc") + 1:][:3] == ("-fsSL", "--max-time", "15")
+    assert editor[-5:] == ("-o", "/dev/null", "-w", "%{url_effective}", "https://github.com/coder/code-server/releases/latest")
+
+
+@pytest.mark.parametrize("software, said, why", [
+    ("claude", "2.1.400; echo owned", "is not a version"),
+    ("claude", "<html>", "is not a version"),
+    ("code-server", "https://github.com/coder/code-server/releases/latest", "did not name a release"),
+    ("code-server", "https://github.com/coder/code-server/releases/tag/vlatest", "is not a version"),
+    ("claude", None, "Upstream could not be asked for the newest version of Claude Code: curl: .6. Could not resolve host"),
+])
+def test_an_answer_from_upstream_that_is_not_a_version_is_refused(dists, software, said, why):
+    if said is not None:
+        dists.upstream = {core.SOFTWARE[software]["upstream"]: said}
+    with pytest.raises(core.CoreError, match=why):
+        core.software_refresh(software)
+    assert core.load_versions()[core.SOFTWARE[software]["key"]] in (CLAUDE, EDITOR) and len(dists.runs()) == 1
+
+
+def test_refresh_raises_the_pin_and_pulls_only_when_upstream_is_newer(dists, tmp_path):
+    (tmp_path / "preload" / "upstream").mkdir(parents=True)
+    (tmp_path / "preload" / "upstream" / "claude").write_text(CLAUDE + "\n")
+    said = []
+    assert core.agent_refresh(say=said.append) == {"software": "claude", "version": CLAUDE, "upstream": CLAUDE, "newer": False, "bumped": False}
+    assert said[-1].endswith("nothing to do") and dists.runs() == [] and local_pins(tmp_path) is None
+    (tmp_path / "preload" / "upstream" / "claude").write_text("2.1.300\n")                 # older: never down
+    assert core.agent_refresh()["bumped"] is False and local_pins(tmp_path) is None
+    (tmp_path / "preload" / "upstream" / "claude").write_text("2.1.400\n")
+    out = core.agent_refresh()
+    assert (out["bumped"], out["previous"], out["version"], out["pulled"]["version"]) == (True, CLAUDE, "2.1.400", "2.1.400")
+    assert core.pulled("claude")["version"] == "2.1.400"
+    assert "CLAUDE_CODE_VERSION=2.1.400\n" in local_pins(tmp_path)
+    assert core.software_status()[0]["status"] == "up to date"
+
+
+def test_unknown_software_is_refused_by_name():
+    for call in (lambda: core.software_pull("pi"), lambda: core.agent_pull("code-server"), lambda: core.pin_reset("../x")):
+        with pytest.raises(core.CoreError, match="There is no"):
+            call()
+
+
+def preloaded(tmp_path, software, version):
+    place = {"claude": "agents/claude", "code-server": "editor"}[software]
+    stand_in(tmp_path / "preload" / "dist" / place, software, version)
+    (tmp_path / "preload" / "dist" / f"{place}.json").write_text(json.dumps({"version": version}))
+
+
+def test_the_keeper_takes_a_preloaded_distribution_and_builds_nothing(dists, tmp_path):
+    preloaded(tmp_path, "claude", CLAUDE)
+    preloaded(tmp_path, "code-server", "4.125.0")
+    reports = []
+    core.keep_software(lambda key, value: reports.append((key, value)), True)
+    assert reports == [("agents", "pulling"), ("agents", f"pulling: taking Claude Code {CLAUDE} from {tmp_path}/preload/dist/agents/claude"),
+                       ("agents", f"pulling: Claude Code {CLAUDE} is pulled"), ("agents", f"ready: {CLAUDE}"),
+                       ("editor", "pulling"), ("editor", f"pulling: taking the editor (code-server) 4.125.0 from {tmp_path}/preload/dist/editor"),
+                       ("editor", "pulling: the editor (code-server) 4.125.0 is pulled"), ("editor", "ready: 4.125.0")]
+    assert dists.runs() == [] and (tmp_path / "data" / "dist" / "editor" / ".cl-dist").is_file()
+    assert [r["status"] for r in core.software_status()] == ["up to date", "stale — re-pull"]
+    reports.clear()
+    core.keep_software(lambda key, value: reports.append((key, value)), True)                # the next start: nothing pulled
+    assert reports == [("agents", f"ready: {CLAUDE}"), ("editor", "ready: 4.125.0")] and dists.runs() == []
+
+
+def test_an_explicit_pull_builds_even_with_a_preloaded_distribution(dists, tmp_path):
+    preloaded(tmp_path, "claude", CLAUDE)
+    core.software_pull("claude")
+    assert len(dists.runs()) == 1
+
+
+def test_the_keeper_builds_what_is_missing_and_says_what_failed(dists, tmp_path):
+    reports = []
+    dists.fails = True
+    core.keep_software(lambda key, value: reports.append((key, value)), True)
+    assert [r for r in reports if not r[1].startswith("pulling: ")] == [
+        ("agents", "pulling"), ("agents", f"failed: Claude Code {CLAUDE} could not be pulled in 3 attempts: the installer failed (exit 1): curl: (6) Could not resolve host: claude.ai"),
+        ("editor", "pulling"), ("editor", f"failed: The editor (code-server) {EDITOR} could not be pulled in 3 attempts: the installer failed (exit 1): curl: (6) Could not resolve host: claude.ai")]
+    assert ("agents", f"pulling: installing Claude Code {CLAUDE} (attempt 1 of 3)") in reports
+    reports.clear()
+    dists.fails = False
+    core.keep_software(lambda key, value: reports.append((key, value)), False)              # no sandbox image: nothing to build in
+    assert reports == [("agents", "pulling"), ("agents", "failed: Claude Code is built in a container of the sandbox image, which could not be had."),
+                       ("editor", "pulling"), ("editor", "failed: The editor (code-server) is built in a container of the sandbox image, which could not be had.")]
+    core.keep_software(lambda key, value: reports.append((key, value)), True)
+    assert reports[-1] == ("editor", f"ready: {EDITOR}") and ("agents", f"ready: {CLAUDE}") in reports
+
+
+def test_the_software_verbs_print_json(dists, tmp_path, capsys):
+    assert core.main(["software"]) == 0
+    assert [row["status"] for row in json.loads(capsys.readouterr().out)] == ["not pulled", "not pulled"]
+    assert core.main(["agent", "pull"]) == 0 and json.loads(capsys.readouterr().out)["version"] == CLAUDE
+    assert core.main(["editor", "pull"]) == 0 and json.loads(capsys.readouterr().out)["version"] == EDITOR
+    (tmp_path / "preload" / "upstream").mkdir(parents=True)
+    (tmp_path / "preload" / "upstream" / "code-server").write_text(EDITOR)
+    assert core.main(["editor", "refresh", "--check"]) == 0 and json.loads(capsys.readouterr().out)["newer"] is False
+    assert core.main(["editor", "refresh"]) == 0 and json.loads(capsys.readouterr().out)["bumped"] is False
+    held = core.take_build_lane("code-server")
+    try:
+        assert core.main(["agent", "refresh", "claude"]) == 1
+        assert "is being built now" in json.loads(capsys.readouterr().err.splitlines()[-1])["error"]
+    finally:
+        for fh in held:
+            fh.close()

@@ -9,6 +9,7 @@ sandbox image `cl-sandbox:<hash>` and the web server's `cl-web:<hash>`, are kept
 cache.
 """
 import json
+import os
 import pathlib
 import subprocess
 import sys
@@ -114,14 +115,38 @@ def web_image(image):
 def preload(web_image, sandbox_image, tmp_path_factory):
     """A folder to mount at an outer container's /opt/cl/preload, where the core loads an
     image from instead of building it. It holds both images: once the web server is up, its
-    keeper gets the sandbox's image too, and would build it if it were not there."""
+    keeper gets the sandbox's image too, and would build it if it were not there. Then the
+    keeper pulls Claude Code's and the editor's distributions, which it takes from here too:
+    stand-ins at the repository's versions, whose launcher is a small script."""
     folder = tmp_path_factory.mktemp("preload")
     folder.chmod(0o755)
     for tag in (web_image, sandbox_image):
         saved = folder / f"{tag.partition(':')[0]}.tar"
         run("docker", "save", "-o", str(saved), tag, timeout=900)
         saved.chmod(0o644)
+    pins = core.parse_pins(str(REPO / "versions.env"))
+    for place, launcher, version, program in (("agents/claude", "claude", pins["CLAUDE_CODE_VERSION"], "share/claude/versions/{v}"),
+                                              ("editor", "code-server", pins["CODE_SERVER_VERSION"], "lib/code-server-{v}/bin/code-server")):
+        stand_in_dist(folder / "dist" / place, launcher, program.format(v=version), version)
+        (folder / "dist" / f"{place}.json").write_text(json.dumps({"version": version}))
+        (folder / "dist" / f"{place}.json").chmod(0o644)
+    for above in (folder / "dist", folder / "dist" / "agents"):
+        above.chmod(0o755)
     return folder
+
+
+def stand_in_dist(root, launcher, program, version):
+    """A distribution as the vendor's installer leaves it, with its launcher link made
+    relative: bin/<name> leads to `program`, which says the version."""
+    target = root / program
+    target.parent.mkdir(parents=True)
+    target.write_text(f"#!/bin/sh\necho '{version} (a stand-in for the tests)'\n")
+    target.chmod(0o755)
+    (root / "bin").mkdir()
+    launcher = root / "bin" / launcher
+    launcher.symlink_to(os.path.relpath(target, launcher.parent))
+    for folder in (root, *[p for p in root.rglob("*") if p.is_dir() and not p.is_symlink()]):
+        folder.chmod(0o755)
 
 
 @pytest.fixture(scope="session")

@@ -41,6 +41,10 @@ RUN mkdir -p /opt/cl/selftest/bin && cp /bin/busybox /opt/cl/selftest/bin/busybo
 
 COPY outer/guard.py outer/init.py outer/core.py outer/broker.py outer/broker_auth.py /opt/cl/
 
+# The versions of Claude Code and the editor that projects get, as the repository has them
+# (/data/versions.local.env overrides them; see that file's header).
+COPY versions.env /opt/cl/versions.env
+
 # The definition of the sandbox image. The core builds it in the inner daemon the first time
 # a project needs it, and tags it by a hash of these files.
 COPY sandbox/ /opt/cl/sandbox/
