@@ -117,7 +117,9 @@ def preload(web_image, sandbox_image, tmp_path_factory):
     image from instead of building it. It holds both images: once the web server is up, its
     keeper gets the sandbox's image too, and would build it if it were not there. Then the
     keeper pulls Claude Code's and the editor's distributions, which it takes from here too:
-    stand-ins at the repository's versions, whose launcher is a small script."""
+    stand-ins at the repository's versions, whose launcher is a small script. The editor's is
+    RS's tree with the repository's own tools and settings; its code-server answers
+    --version and --install-extension and serves a page on the --bind-addr it is given."""
     folder = tmp_path_factory.mktemp("preload")
     folder.chmod(0o755)
     for tag in (web_image, sandbox_image):
@@ -134,7 +136,18 @@ def preload(web_image, sandbox_image, tmp_path_factory):
                 (folder / "dist" / place / name).write_text(text)
                 (folder / "dist" / place / name).chmod(0o644)
         else:
-            stand_in_dist(folder / "dist" / place, launcher, program.format(v=version), version)
+            root = folder / "dist" / place
+            stand_in_dist(root / ".local", launcher, program.format(v=version), version, EDITOR_STAND_IN)
+            for relative, (source, _mode) in core.SOFTWARE["code-server"]["copies"].items():
+                (root / relative).parent.mkdir(parents=True, exist_ok=True)
+                (root / relative).write_bytes((REPO / "outer" / "editor" / source).read_bytes())
+                (root / relative).chmod(0o755)
+            for ns, name, _key in core.SOFTWARE["code-server"]["extensions"]:
+                (root / "templates" / "extensions").mkdir(parents=True, exist_ok=True)
+                (root / "templates" / "extensions" / f"{ns}.{name}.vsix").write_text("a stand-in")
+                (root / "templates" / "extensions" / f"{ns}.{name}.vsix").chmod(0o644)
+            for above in (root, *[p for p in root.rglob("*") if p.is_dir() and not p.is_symlink()]):
+                above.chmod(0o755)
         (folder / "dist" / f"{place}.json").write_text(json.dumps({"version": version, "ext_version": pins["CLAUDE_CODE_EXT_VERSION"]}))
         (folder / "dist" / f"{place}.json").chmod(0o644)
     for above in (folder / "dist", folder / "dist" / "agents"):
@@ -142,12 +155,23 @@ def preload(web_image, sandbox_image, tmp_path_factory):
     return folder
 
 
-def stand_in_dist(root, launcher, program, version):
+# The editor's stand-in code-server: a page that names itself as code-server's does, served on
+# the address the stub gives it.
+EDITOR_STAND_IN = """#!/bin/sh
+case "$1" in --version) echo '{version} (a stand-in for the tests)'; exit 0 ;; --install-extension) exit 0 ;; esac
+while [ $# -gt 0 ]; do [ "$1" = --bind-addr ] && addr=$2; shift; done
+page=$(mktemp -d)
+echo '<meta id="vscode-workbench-web-configuration" data-settings="{{&quot;nameLong&quot;:&quot;code-server&quot;}}">' > "$page/index.html"
+exec python3 -m http.server --bind "${{addr%:*}}" --directory "$page" "${{addr##*:}}"
+"""
+
+
+def stand_in_dist(root, launcher, program, version, script="#!/bin/sh\necho '{version} (a stand-in for the tests)'\n"):
     """A distribution as the vendor's installer leaves it, with its launcher link made
     relative: bin/<name> leads to `program`, which says the version."""
     target = root / program
     target.parent.mkdir(parents=True)
-    target.write_text(f"#!/bin/sh\necho '{version} (a stand-in for the tests)'\n")
+    target.write_text(script.format(version=version))
     target.chmod(0o755)
     (root / "bin").mkdir()
     launcher = root / "bin" / launcher

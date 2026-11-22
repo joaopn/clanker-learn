@@ -10,28 +10,34 @@
      version gains what a later one adds without being recreated.
   3. sshd is started: the tutor's way in, and the Shell's. Its host key is the one in the provisioning folder.
   4. The files server is started as the sandbox user.
-  5. The Editor's server, code-server, is started as the sandbox user, with a login's
-     environment, on port 8443 of every address, as the files server listens, so that the web
-     server, on the project's network, reaches it. It asks for no password of its own (the
-     gate is the web server's project session), sends no telemetry, looks for no update, asks no question about trusting the workspace, opens
-     /workspace, and keeps its user data in the sandbox user's home, which persists.
-  6. The setup recipe, /workspace/.learn/setup.sh, is run as the sandbox user if this
+  5. The setup recipe, /workspace/.learn/setup.sh, is run as the sandbox user if this
      container has not run it: once per container, so never after a plain stop and start
      and once after a recreate, which is how what the tutor installed comes back. Its state
      (none, running, done, failed) is in /var/lib/cl/setup, a file of the container itself,
      and its output in /var/log/cl/setup.log. Cut short by a stop, it runs again from the top
      at the next start, so a recipe must be safe to run twice.
-  7. What /workspace/.learn/services lists is started as the sandbox user, one line each,
+  6. What /workspace/.learn/services lists is started as the sandbox user, one line each,
      `name: command`, with its output in /workspace/.learn/logs/<name>.log. They are started,
      not watched: one that ends stays down until the next start.
-  8. Each agent the provisioning folder names (software.json) is deployed into the home by
+  7. Each agent the provisioning folder names (software.json) is deployed into the home by
      /opt/cl/deploy, run as the sandbox user with a time limit, one after the other: copied
      from the distributions (/opt/cl/dist, read-only) only while its launcher is not in the
      home, so a copy that updated itself is kept; its settings installed once, with the
-     project's model and effort. None of this holds up sshd, the files server, code-server
-     or a stop; what the deploy says is in the container's log.
+     project's model and effort.
+  8. Then, if software.json says the project has the editor and its distribution is there,
+     research-sandbox's deploy script from that distribution
+     (/opt/editor-dist/tools/code-server-deploy.sh) is run as the sandbox user with a time
+     limit: it copies the editor into the home when the home has none or another version,
+     installs RS's settings no-clobber and the bundled extensions and the agents' editor
+     extension when newer (its user data is under /workspace/.local/share/code-server), and
+     leaves RS's lazy-start stub on port 8443 of every address, so that the web server, on
+     the project's network, reaches it. The stub starts code-server on 127.0.0.1:8444 at the
+     first visit, with no password of its own (the gate is the web server's project session),
+     and keeps it until the container stops. A project without the editor has nothing on
+     8443. None of this holds up sshd, the files server or a stop; what the deploys say is in
+     the container's log.
 
-Then it waits, and starts sshd, the files server or code-server again if one of them ends. On a stop it
+Then it waits, and starts sshd or the files server again if one of them ends. On a stop it
 asks every other process to end, gives them a few seconds, and exits; what is left is ended
 with the container.
 """
@@ -49,7 +55,10 @@ USER = "learner"
 PROVISION = "/etc/cl-provision"
 SSHD_CONFIG = "/etc/ssh/sshd_config.d/cl.conf"
 FILES_SERVER = "/opt/cl/files_server.py"
-EDITOR_PORT = 8443
+EDITOR_PORT = 8443              # RS's stub, which the editor's deploy script starts
+EDITOR_UPSTREAM_PORT = 8444     # code-server behind it, on loopback
+EDITOR_DIST = "/opt/editor-dist"   # a link into /opt/cl/dist, read-only
+EDITOR_DEPLOY = EDITOR_DIST + "/tools/code-server-deploy.sh"
 STOP_GRACE_S = 5
 RESTART_PAUSE_S = 2
 SETUP_RECIPE = "/workspace/.learn/setup.sh"
@@ -135,12 +144,6 @@ def start_files_server(user):
                             cwd="/", env=env, stdin=subprocess.DEVNULL)
 
 
-def start_editor(user):
-    return as_user(user, ["code-server", "--bind-addr", f"0.0.0.0:{EDITOR_PORT}", "--auth", "none", "--disable-telemetry",
-                          "--disable-update-check", "--disable-workspace-trust", "--user-data-dir", os.path.join(user.pw_dir, ".local/share/code-server"),
-                          "/workspace"])
-
-
 def keep_running(services, running, tried, pause_s=RESTART_PAUSE_S, now=time.monotonic):
     """Start each service that is not running: at first, and again when it has ended, but not
     more often than every `pause_s` seconds."""
@@ -167,8 +170,9 @@ def user_env(user):
 
 def as_user(user, command, **more):
     """A process of the sandbox user's, in a session of its own, in the workspace."""
+    env = {**user_env(user), **more.pop("env", {})}
     return subprocess.Popen(command, user=user.pw_uid, group=user.pw_gid, extra_groups=os.getgrouplist(user.pw_name, user.pw_gid),
-                            cwd="/workspace", env=user_env(user), stdin=subprocess.DEVNULL, start_new_session=True, **more)
+                            cwd="/workspace", env=env, stdin=subprocess.DEVNULL, start_new_session=True, **more)
 
 
 def setup_state(path=None):
@@ -280,15 +284,45 @@ def start_listed_services(user, path=SERVICES):
     return started
 
 
+def provisioned(path=SOFTWARE_FILE):
+    """software.json, or {} where the file is missing or holds anything else."""
+    try:
+        with open(path, "rb") as fh:
+            named = json.loads(fh.read(4096))
+    except (OSError, ValueError, RecursionError):
+        return {}
+    return named if isinstance(named, dict) else {}
+
+
 def provisioned_agents(path=SOFTWARE_FILE):
     """The agents the provisioning folder names, from the closed set; none where the file is
     missing or holds anything else."""
-    try:
-        with open(path, "rb") as fh:
-            named = json.loads(fh.read(4096)).get("agents")
-    except (OSError, ValueError, RecursionError, AttributeError):
-        return []
+    named = provisioned(path).get("agents")
     return [agent for agent in AGENTS if isinstance(named, list) and agent in named]
+
+
+def provisioned_editor(path=SOFTWARE_FILE):
+    """Whether the provisioning folder says the project has the editor (true, nothing else)."""
+    return provisioned(path).get("editor") is True
+
+
+def start_editor_deploy(user):
+    """RS's deploy script from the editor's distribution, with RS's guard that the distribution
+    is populated (and our mark, that it is whole); None, and nothing in the log, where it is not.
+    The paths are the read-only distribution's, never the home's."""
+    if not os.path.exists(f"{EDITOR_DIST}/.local/bin/code-server") or not os.path.isfile(f"{EDITOR_DIST}/.cl-dist"):
+        return None
+    try:
+        return as_user(user, ["timeout", str(DEPLOY_TIMEOUT_S), "bash", EDITOR_DEPLOY],
+                       env={"CODE_SERVER_STUB_PORT": str(EDITOR_PORT), "CODE_SERVER_UPSTREAM_PORT": str(EDITOR_UPSTREAM_PORT)})
+    except OSError as exc:
+        log(f"the editor could not be deployed: {exc}")
+        return None
+
+
+def deploy_ended(process):
+    """The process while it still runs, else None (it is collected)."""
+    return process if process is not None and process.poll() is None else None
 
 
 def next_deploy(user, deploying, owed):
@@ -340,10 +374,10 @@ def main():
         set_password()   # before sshd starts
     except (OSError, subprocess.TimeoutExpired) as exc:
         log(f"the Shell password could not be set: {exc}")
-    services = {"sshd": start_sshd, "the files server": lambda: start_files_server(user), "code-server": lambda: start_editor(user)}
+    services = {"sshd": start_sshd, "the files server": lambda: start_files_server(user)}
     running, tried = {}, {}
     # The recipe first, then what the services file lists, which may need what it installed.
-    # Neither holds up sshd, the files server, code-server or a stop.
+    # Neither holds up sshd, the files server or a stop.
     setup, listed = None, None
     try:
         if setup_is_owed(setup_state()):
@@ -351,10 +385,15 @@ def main():
     except OSError as exc:
         log(f"the setup recipe could not be run: {exc}")
     owed, deploying = provisioned_agents(), None
+    editor_owed, editor_deploy = provisioned_editor(), None
     log("up")
     while not stopping:
         keep_running(services, running, tried)
         deploying = next_deploy(user, deploying, owed)
+        # The editor after the agents: its deploy installs their editor extension from the home.
+        if editor_owed and deploying is None and not owed:
+            editor_owed, editor_deploy = False, start_editor_deploy(user)
+        editor_deploy = deploy_ended(editor_deploy)
         setup = setup_ended(setup)
         if setup is None and listed is None:
             listed = start_listed_services(user)

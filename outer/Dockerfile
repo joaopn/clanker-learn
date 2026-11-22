@@ -46,6 +46,9 @@ COPY outer/guard.py outer/init.py outer/core.py outer/broker.py outer/broker_aut
 COPY versions.env /opt/cl/versions.env
 # Claude's model tiers and the efforts each takes (research-sandbox's models/catalog.json).
 COPY outer/models.json /opt/cl/models.json
+# The editor's files from research-sandbox (its deploy script, lazy-start stub and settings),
+# which the core puts into the editor's distribution when it builds one.
+COPY outer/editor/ /opt/cl/editor/
 
 # The definition of the sandbox image. The core builds it in the inner daemon the first time
 # a project needs it, and tags it by a hash of these files.

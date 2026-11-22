@@ -1,0 +1,66 @@
+// Lifted from research-sandbox (container/supervisor/code-server-settings.json), verbatim.
+{
+  "telemetry.telemetryLevel": "off",
+  "update.mode": "none",
+  // The editor is the PRIMARY updater for the Claude Code extension: check marks
+  // it outdated in the Extensions view, and the operator clicks Update. autoUpdate
+  // stays false so nothing moves unattended — the dist pin remains what a FRESH
+  // container starts at. Note the badge is not Claude-scoped: it appears for every
+  // installed extension, so the six editor-dist pins (python + the five jupyter
+  // entries) are a starting point, not enforced — an operator can click those too.
+  "extensions.autoCheckUpdates": true,
+  "extensions.autoUpdate": false,
+
+  "workbench.startupEditor": "readme",
+  "workbench.enableExperiments": false,
+  "workbench.settings.enableNaturalLanguageSearch": false,
+  "workbench.tips.enabled": false,
+  "workbench.welcomePage.walkthroughs.openOnInstall": false,
+  "workbench.colorTheme": "Monokai Dimmed",
+  "workbench.editorAssociations": {
+    "*.md": "vscode.markdown.preview.editor"
+  },
+
+  "git.enabled": true,
+  "git.autoRepositoryDetection": true,
+
+  "security.workspace.trust.enabled": false,
+
+  // The Claude Code permission keys are machine-scoped: they live in the
+  // Remote settings file (Machine/settings.json), never here.
+
+  "chat.disableAIFeatures": true,
+  "chat.commandCenter.enabled": false,
+
+  "editor.fontSize": 13,
+  "editor.minimap.enabled": false,
+  "editor.formatOnSave": false,
+  "editor.linkedEditing": true,
+  "editor.bracketPairColorization.enabled": true,
+  "editor.mouseWheelZoom": false,
+  "terminal.integrated.fontSize": 13,
+
+  "files.watcherExclude": {
+    "**/.git/**": true,
+    "**/node_modules/**": true,
+    "**/.venv/**": true,
+    "**/__pycache__/**": true,
+    "**/.ipynb_checkpoints/**": true,
+    "**/data/**": true,
+    "**/results/**": true,
+    "**/staging/**": true,
+    "**/workers/**/work/outputs/**": true
+  },
+  "search.exclude": {
+    "**/.venv": true,
+    "**/__pycache__": true,
+    "**/.ipynb_checkpoints": true,
+    "**/data": true,
+    "**/results": true,
+    "**/staging": true,
+    "**/workers/**/work/outputs": true
+  },
+  "search.followSymlinks": false,
+
+  "terminal.integrated.scrollback": 5000
+}

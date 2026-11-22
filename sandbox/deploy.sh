@@ -16,7 +16,10 @@
 #     merged into the settings JUST installed and nowhere else, with RS's jq text verbatim,
 #     so that a later choice made inside Claude (/model, /effort) is never reset; settings
 #     sets or clears them in an existing file, as RS's _write_agent_settings does;
-#   - ~/.local/bin is put on PATH in ~/.bashrc.
+#   - ~/.local/bin is put on PATH in ~/.bashrc;
+#   - update also forces the agent's editor extension (tucked in local/share/rs-agent-ext)
+#     into the project's editor, where the home has one, as RS's Update does
+#     (cli/rscore.py, _ext_install_script with force); the editor itself is not replaced.
 # The model and effort come from the provisioning folder (software.json), which the core
 # wrote from the project's record, never from the command line. What was copied (the mark)
 # is written last beside it, in ~/.local/.cl-deployed-<agent>.
@@ -115,5 +118,16 @@ fi
 # ~/.local/bin on PATH (where the agent launcher lands), as RS's start-up does.
 if ! grep -q '\.local/bin' "$home/.bashrc" 2>/dev/null; then
     echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$home/.bashrc"
+fi
+# RS's _ext_install_script, forced: the shipped version over whatever is installed (a
+# different version's install switches the active one, and --force also moves one down).
+if [ "$mode" = update ] && [ -x "$home/.local/bin/code-server" ] && [ -d "$home/.local/share/rs-agent-ext" ]; then
+    U=/workspace/.local/share/code-server; E="$U/extensions"; ext=" and forced its editor extension"
+    for v in "$home/.local/share/rs-agent-ext"/*.vsix; do
+        [ -f "$v" ] || continue
+        HOME="$home" "$home/.local/bin/code-server" --install-extension "$v" --force --extensions-dir "$E" \
+            --user-data-dir "$U" >/dev/null 2>&1 || ext=" (warning: its editor extension $(basename "$v" .vsix) could not be installed)"
+    done
+    did="$did${ext:-}"
 fi
 echo "deploy $agent: $did"

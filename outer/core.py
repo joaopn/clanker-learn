@@ -24,17 +24,28 @@ creation was cut short is finished by its next start.
 
 The software projects get (Claude Code, the editor) is fetched once into a distribution:
 
-    /data/dist/agents/claude          what Claude Code's installer left as ~/.local
-    /data/dist/agents/claude.json     its version and when it was pulled (also in .cl-dist inside)
-    /data/dist/editor, editor.json    the same for the editor (code-server)
+    /data/dist/agents/claude          RS's tree: local/ (what Claude Code's installer left as
+                                      ~/.local, its editor extension tucked inside) and
+                                      claude/settings.json
+    /data/dist/agents/claude.json     its versions and when it was pulled (also in .cl-dist inside)
+    /data/dist/editor                 RS's tree: .local/ (code-server's standalone install, RS's
+                                      list of built-in extensions removed), tools/ (RS's deploy
+                                      script and lazy-start stub), templates/ (RS's User and
+                                      Machine settings, its six extensions from Open VSX)
+    /data/dist/editor.json            the same for the editor, with the extensions' versions
     /data/dist-staging                where a distribution is built before it replaces the old
     /data/versions.local.env          versions raised by Refresh, over /opt/cl/versions.env
 
 Every project gets its own copy, in its home folder, as research-sandbox does it: the image's
-deploy script (/opt/cl/deploy, run as the sandbox user) copies a distribution into ~/.local.
-The sandbox's init runs it at every start for each agent the provisioning folder names, only
-while that agent's launcher is absent, so a copy that updated itself is kept; `agents_add` and
-`agents_update` run it in a running sandbox: the one command the core runs inside a sandbox.
+deploy script (/opt/cl/deploy, run as the sandbox user) copies an agent's distribution into
+~/.local. The sandbox's init runs it at every start for each agent the provisioning folder
+names, only while that agent's launcher is absent, so a copy that updated itself is kept;
+`agents_add` and `agents_update` run it in a running sandbox (Update also forces the agent's
+editor extension into the project's editor): the one command the core runs inside a sandbox.
+The editor is deployed by RS's own script from its distribution (tools/code-server-deploy.sh),
+which the init runs at every start of a project that has the editor, after the agents: it
+copies the editor into the home when the home has none or another version, and starts RS's
+stub on port 8443, which starts code-server on 127.0.0.1:8444 at the first visit.
 
 A sandbox is created without privilege, without a published port, without a restart policy
 (the init starts what should run, after the guard rules are in place) and without raw
@@ -64,6 +75,7 @@ import os
 import re
 import secrets
 import select
+import shlex
 import shutil
 import ssl
 import stat
@@ -116,7 +128,8 @@ SHELL_PASSWORD_LENGTH = 32
 CRYPT_HASH = re.compile(r"\$6\$[./A-Za-z0-9]{1,16}\$[./A-Za-z0-9]{86}")   # SHA-512 crypt, as /etc/shadow holds it
 SSH_PORT = 22
 FILES_SERVER_PORT = 7070      # sandbox/files_server.py
-EDITOR_PORT = 8443            # code-server, started by sandbox/sandbox_init.py
+EDITOR_PORT = 8443            # the editor: RS's lazy-start stub (outer/editor/code-server-stub.py), run by the deploy the init starts
+EDITOR_UPSTREAM_PORT = 8444   # code-server itself, behind the stub, on the sandbox's loopback
 DIST_MOUNT = "/opt/cl/dist"   # in the sandbox: /data/dist, read-only
 DEPLOY = "/opt/cl/deploy"     # in the sandbox image: sandbox/deploy.sh
 DEPLOY_TIMEOUT_S = 900        # one deploy of a distribution into a home
@@ -494,11 +507,14 @@ AGENT_SETTINGS_JSON = json.dumps(
 # Open VSX's name for this machine (RS pins linux-x64; the extension is built for both).
 EXT_PLATFORM = {"aarch64": "linux-arm64", "arm64": "linux-arm64"}.get(os.uname().machine, "linux-x64")
 # The closed table of what can be pulled. `dist` is the place under /data/dist; `local` where
-# the installer's ~/.local goes inside it ("" for the distribution itself); `launcher` the
+# the installer's ~/.local goes inside it; `launcher` the
 # program, relative to the distribution; `in_tree` where the launcher must lead, with the
 # version in it; `installer` the vendor's script and the shell and arguments it is run with.
 # An agent's tree is RS's fixed one: local/ (with the agent's editor extension tucked inside
-# it, at `ext.file`) and the agent's settings beside it (`files`).
+# it, at `ext.file`) and the agent's settings beside it (`files`). The editor's is RS's too:
+# .local/, the repository's files of outer/editor/ (`copies`), and the extensions RS bundles
+# (`extensions`, each at its own pin, fetched from Open VSX in the build container), with RS's
+# list of built-in extensions removed from the install (`strip`).
 SOFTWARE = {
     "claude": {
         "kind": "agent", "label": "Claude Code", "key": "CLAUDE_CODE_VERSION", "report": "agents",
@@ -513,11 +529,34 @@ SOFTWARE = {
     },
     "code-server": {
         "kind": "editor", "label": "the editor (code-server)", "key": "CODE_SERVER_VERSION", "report": "editor",
-        "dist": "editor", "local": "", "launcher": "bin/code-server", "in_tree": re.compile(r"lib/code-server-([^/]+)/bin/code-server"),
+        "dist": "editor", "local": ".local", "launcher": ".local/bin/code-server",
+        "in_tree": re.compile(r"\.local/lib/code-server-([^/]+)/bin/code-server"),
         "installer": "https://code-server.dev/install.sh", "shell": "sh", "args": ("--method", "standalone", "--version", "{version}"),
         "upstream": "https://github.com/coder/code-server/releases/latest",      # redirects to .../tag/v<version>
+        # RS's _CODE_SERVER_STRIP_EXTS (cli/rscore.py), verbatim: "keep grammar/themes/markdown/
+        # notebook AND the git stack ...; drop heavy language-servers and JS build/debug tooling".
+        "strip": ("typescript-language-features", "html-language-features",
+                  "css-language-features", "json-language-features", "php-language-features",
+                  "npm", "grunt", "gulp",
+                  "jake", "node-debug", "node-debug2", "debug-auto-launch",
+                  "debug-server-ready", "references-view", "extension-editing",
+                  "simple-browser"),
+        # RS's _EDITOR_EXTENSIONS, all universal Open VSX packages, each saved as <ns>.<name>.vsix.
+        "extensions": (("ms-python", "python", "PYTHON_EXT_VERSION"),
+                       ("ms-toolsai", "jupyter", "JUPYTER_VERSION"),
+                       ("ms-toolsai", "vscode-jupyter-cell-tags", "JUPYTER_CELL_TAGS_VERSION"),
+                       ("ms-toolsai", "jupyter-keymap", "JUPYTER_KEYMAP_VERSION"),
+                       ("ms-toolsai", "jupyter-renderers", "JUPYTER_RENDERERS_VERSION"),
+                       ("ms-toolsai", "vscode-jupyter-slideshow", "JUPYTER_SLIDESHOW_VERSION")),
+        "copies": {"tools/code-server-deploy.sh": ("code-server-deploy.sh", 0o755),
+                   "tools/code-server-stub.py": ("code-server-stub.py", 0o755),
+                   "templates/User/settings.json": ("code-server-settings.json", 0o644),
+                   "templates/Machine/settings.json": ("code-server-machine-settings.json", 0o644)},
     },
 }
+EDITOR_FILES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "editor")   # outer/editor, /opt/cl/editor in the image
+OPEN_VSX_VSIX_URL = "https://open-vsx.org/api/{ns}/{name}/{ver}/file/{ns}.{name}-{ver}.vsix"   # RS's _OPEN_VSX_VSIX_URL
+EXTENSIONS_DIR = "templates/extensions"   # in the editor's distribution
 AGENTS = tuple(one for one, spec in SOFTWARE.items() if spec["kind"] == "agent")
 STALE = "stale — re-pull"
 
@@ -603,9 +642,21 @@ def ext_pin(software):
     return checked_version(value, f"{ext['key']} (in {VERSIONS_FILE} or {versions_local()})")
 
 
+def extension_pins(software):
+    """{"<ns>.<name>": version} of the extensions bundled into `software`'s distribution, at
+    the pins in effect, checked; {} for software that bundles none. A pin that is not set is
+    refused, as RS's build dies on one: a distribution never ships silently without one."""
+    versions, out = load_versions(), {}
+    for ns, name, key in known_software(software).get("extensions", ()):
+        if versions.get(key) is None:
+            raise CoreError(f"No version of the extension {ns}.{name} is pinned ({key} in {VERSIONS_FILE}).")
+        out[f"{ns}.{name}"] = checked_version(versions[key], f"{key} (in {VERSIONS_FILE} or {versions_local()})")
+    return out
+
+
 def pin_keys(software):
     spec = known_software(software)
-    return [spec["key"], *([spec["ext"]["key"]] if "ext" in spec else [])]
+    return [spec["key"], *([spec["ext"]["key"]] if "ext" in spec else []), *(key for _, _, key in spec.get("extensions", ()))]
 
 
 def write_pins(lines):
@@ -733,8 +784,10 @@ def pulled(software):
         out = {"version": checked_version(mark["version"], "The pulled version"), "pulled_at": str(mark.get("pulled_at", ""))}
         if "ext" in spec:
             out["ext_version"] = checked_version(mark["ext_version"], "The pulled extension's version")
+        if "extensions" in spec:
+            out["extensions"] = {str(one)[:80]: checked_version(version, "A bundled extension's version") for one, version in mark["extensions"].items()}
         return out
-    except (OSError, ValueError, KeyError, TypeError, CoreError):
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, CoreError):
         return None
 
 
@@ -798,25 +851,37 @@ def fresh_folder(path, owner=None):
 
 
 def arrange_tree(software, captured):
-    """The distribution's tree from the ~/.local an installer left: that folder itself, or, for
-    an agent, RS's fixed tree around it (local/, and the agent's settings beside it). What the
-    installer left in state/ (its locks) is not part of it."""
+    """RS's fixed tree around the ~/.local an installer left: for an agent local/ and the
+    agent's settings beside it; for the editor .local/, the repository's tools and settings,
+    and the extensions the build fetched into ext/ beside the ~/.local, as RS's
+    _editor_build_dist assembles it. What the installer left in state/ (its locks) is not part
+    of it."""
     spec = known_software(software)
     if os.path.islink(captured) or not os.path.isdir(captured):   # before anything is written into it: never through a link
         raise CoreError("the installer left no folder of its own (a link, or nothing)")
     remove_path(os.path.join(captured, "state"))
-    if not spec["local"]:
-        return captured
     tree = os.path.join(os.path.dirname(captured), "tree")
     fresh_folder(tree)
     os.rename(captured, os.path.join(tree, spec["local"]))
     for relative, text in spec.get("files", {}).items():
         os.makedirs(os.path.dirname(os.path.join(tree, relative)), mode=0o755, exist_ok=True)
         write_file(os.path.join(tree, relative), text, 0o644)
+    for relative, (source, mode) in spec.get("copies", {}).items():
+        os.makedirs(os.path.dirname(os.path.join(tree, relative)), mode=0o755, exist_ok=True)
+        shutil.copyfile(os.path.join(EDITOR_FILES, source), os.path.join(tree, relative))
+        os.chmod(os.path.join(tree, relative), mode)
+    if "extensions" in spec:
+        fetched = os.path.join(os.path.dirname(captured), "ext")
+        os.makedirs(os.path.join(tree, EXTENSIONS_DIR), mode=0o755)
+        for ns, name, _ in spec["extensions"]:
+            source = os.path.join(fetched, f"{ns}.{name}.vsix")
+            if os.path.islink(source) or not os.path.isfile(source):
+                raise CoreError(f"the build fetched no {ns}.{name}.vsix")
+            os.rename(source, os.path.join(tree, EXTENSIONS_DIR, f"{ns}.{name}.vsix"))
     return tree
 
 
-def install_dist(software, tree, version, say, ext_version=None):
+def install_dist(software, tree, version, say, ext_version=None, extensions=None):
     """Mark a checked tree and put it in the distribution's place by renames: the old one is
     moved aside only once the new one is whole, and removed only after the new one is in. The
     folders above are never replaced: running sandboxes have /data/dist mounted."""
@@ -831,10 +896,14 @@ def install_dist(software, tree, version, say, ext_version=None):
         ext_file = os.path.join(tree, spec["local"], spec["ext"]["file"])
         if os.path.islink(ext_file) or not os.path.isfile(ext_file) or not os.path.getsize(ext_file):
             raise CoreError(f"the distribution has no editor extension ({spec['local']}/{spec['ext']['file']})")
-        for relative in spec.get("files", {}):
-            if not os.path.isfile(os.path.join(tree, relative)) or os.path.islink(os.path.join(tree, relative)):
-                raise CoreError(f"the distribution has no {relative}")
         mark["ext_version"] = checked_version(ext_version, "The extension's version")
+    wanted = [*spec.get("files", {}), *spec.get("copies", {}), *(f"{EXTENSIONS_DIR}/{ns}.{name}.vsix" for ns, name, _ in spec.get("extensions", ()))]
+    for relative in wanted:
+        path = os.path.join(tree, relative)
+        if os.path.islink(path) or not os.path.isfile(path) or not os.path.getsize(path):
+            raise CoreError(f"the distribution has no {relative}")
+    if "extensions" in spec:
+        mark["extensions"] = {str(one): checked_version(v, f"The version of the extension {str(one)[:80]}") for one, v in dict(extensions or {}).items()}
     write_json(os.path.join(tree, MARK), mark)   # last: a tree without it was cut short, and is not copied
     os.makedirs(os.path.dirname(p["root"]), mode=0o755, exist_ok=True)
     remove_path(p["old"])   # left by a swap that was cut short
@@ -860,11 +929,13 @@ def build_dist(software, version, say=say_nothing, ext_version=None):
     """Run the installer of `software` at `version` in a throwaway container of the sandbox
     image, on the fenced build network, with no capability, as the sandbox's user, its home the
     staging folder; for an agent, fetch its editor extension (at `ext_version`, else its pin)
-    into the ~/.local it left, as RS does; check what it left, and install it. Three attempts,
-    as RS."""
+    into the ~/.local it left, as RS does; for the editor, remove RS's list of built-in
+    extensions from the install and fetch the bundled extensions at their pins, as RS's
+    _editor_build_dist does; check what it left, and install it. Three attempts, as RS."""
     spec, p = known_software(software), dist_paths(software)
     checked_version(version, f"The version of {spec['label']}")
     ext_version = (ext_version or ext_pin(software)) if "ext" in spec else None
+    extensions = extension_pins(software)
     image = ensure_image(say, "sandbox")
     if not there_is("network", BUILD_NET):
         docker("network", "create", BUILD_NET)
@@ -883,6 +954,16 @@ def build_dist(software, version, say=say_nothing, ext_version=None):
         else:
             mounts += ["-e", "CL_EXT_URL=" + spec["ext"]["url"].format(version=ext_version)]
             script += f'curl -fsSL --compressed -o {place} "$CL_EXT_URL"'
+    if "strip" in spec:
+        # RS's lines (cli/rscore.py, _editor_build_dist): the names and versions are the closed
+        # table's and checked pins, nothing a request brings.
+        strip = "; ".join(f'rm -rf "$EXT_DIR/{one}" || true' for one in spec["strip"])
+        script += ('; EXT_DIR="$(find ~/.local/lib -maxdepth 6 -type d -name extensions | head -n1)"; '
+                   '[ -n "$EXT_DIR" ] || { echo "code-server extensions dir not found" >&2; exit 1; }; ' + strip)
+    if extensions:
+        script += '; mkdir -p "$HOME/ext"; ' + "; ".join(
+            f'curl -fsSL --compressed -o "$HOME/ext/{ns}.{name}.vsix" ' + shlex.quote(OPEN_VSX_VSIX_URL.format(ns=ns, name=name, ver=extensions[f"{ns}.{name}"]))
+            for ns, name, _ in spec["extensions"])
     last = ""
     try:
         for attempt in range(1, DIST_ATTEMPTS + 1):
@@ -901,7 +982,7 @@ def build_dist(software, version, say=say_nothing, ext_version=None):
                 last = f"the installer failed (exit {done.returncode}): " + (done.stderr.strip() or done.stdout.strip())[-500:]
                 continue
             try:
-                return install_dist(software, arrange_tree(software, os.path.join(p["staging"], ".local")), version, say, ext_version)
+                return install_dist(software, arrange_tree(software, os.path.join(p["staging"], ".local")), version, say, ext_version, extensions)
             except CoreError as exc:
                 last = str(exc)
     finally:
@@ -922,7 +1003,8 @@ def take_preloaded(software, say=say_nothing):
             given = json.loads(fh.read(4096))
         version = checked_version(given["version"], f"The version in {p['preload_json']}")
         ext_version = checked_version(given["ext_version"], f"The extension's version in {p['preload_json']}") if "ext" in spec else None
-    except (OSError, ValueError, KeyError, TypeError) as exc:
+        extensions = given.get("extensions", extension_pins(software)) if "extensions" in spec else None
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
         raise CoreError(f"{p['preload_json']} cannot be read ({type(exc).__name__}).") from exc
     say(f"taking {spec['label']} {version} from {p['preload']}")
     os.makedirs(f"{DATA}/dist-staging", mode=0o700, exist_ok=True)
@@ -930,7 +1012,7 @@ def take_preloaded(software, say=say_nothing):
     try:
         tree = os.path.join(p["staging"], "tree")
         shutil.copytree(p["preload"], tree, symlinks=True)
-        return install_dist(software, tree, version, say, ext_version)
+        return install_dist(software, tree, version, say, ext_version, extensions)
     finally:
         shutil.rmtree(p["staging"], ignore_errors=True)
 
@@ -1089,16 +1171,19 @@ def editor_refresh(say=say_nothing):
     return software_refresh("code-server", say)
 
 
-def dist_status_word(have, version, ext_version=None):
+def dist_status_word(have, version, ext_version=None, extensions=None):
     if have is None:
         return "not pulled"
-    return "up to date" if have["version"] == version and have.get("ext_version") == ext_version else STALE
+    same = have["version"] == version and have.get("ext_version") == ext_version and have.get("extensions") == extensions
+    return "up to date" if same else STALE
 
 
 def software_status():
     """One row per software, for Settings -> Software: what is pulled, the version in effect
     and the repository's, whether the local override sets it (so "Use repo version" can be
-    offered), a status word, and whether it is being built now. Reads files only."""
+    offered), a status word, and whether it is being built now. The editor's row also lists
+    its bundled extensions (RS's sub-rows): each one's pin key, the version in effect, the
+    repository's and the one pulled. Reads files only."""
     rows, now = [], building_now()
     try:
         base, problem = parse_pins(VERSIONS_FILE), ""
@@ -1109,19 +1194,28 @@ def software_status():
         row = {"id": software, "kind": spec["kind"], "row": f"{spec['kind']}: {software}", "label": spec["label"],
                "key": spec["key"], "pulled": pulled(software), "version": None, "repo_version": base.get(spec["key"]),
                "overridden": spec["key"] in override, "building": now == software}
-        ext_version = None
+        ext_version = extensions = None
         if "ext" in spec:
             row.update(ext_key=spec["ext"]["key"], ext_version=None, ext_repo_version=base.get(spec["ext"]["key"]))
             row["overridden"] = row["overridden"] or spec["ext"]["key"] in override
+        if "extensions" in spec:
+            had = (row["pulled"] or {}).get("extensions", {})
+            row["extensions"] = [{"id": f"{ns}.{name}", "key": key, "version": None, "repo_version": base.get(key),
+                                  "pulled": had.get(f"{ns}.{name}")} for ns, name, key in spec["extensions"]]
+            row["overridden"] = row["overridden"] or any(key in override for _, _, key in spec["extensions"])
         try:
             row["version"] = pin(software)
             if "ext" in spec:
                 row["ext_version"] = ext_version = ext_pin(software)
+            if "extensions" in spec:
+                extensions = extension_pins(software)
+                for one in row["extensions"]:
+                    one["version"] = extensions[one["id"]]
         except CoreError as exc:
             row["problem"] = problem or str(exc)
         # A version that cannot be read is never "up to date"; an agent is stale when either
-        # its pin or its extension's moved since the pull.
-        row["status"] = dist_status_word(row["pulled"], row["version"], ext_version)
+        # its pin or its extension's moved since the pull, the editor when any bundled pin did.
+        row["status"] = dist_status_word(row["pulled"], row["version"], ext_version, extensions)
         rows.append(row)
     return rows
 
@@ -1254,7 +1348,7 @@ def write_provisioning(record):
         "ssh_host_ed25519_key": (read_text(host_key), 0o600),
         "ssh_host_ed25519_key.pub": (host_public, 0o644),
         "shell_password_hash": (crypt_hash(password) + "\n", 0o600),
-        # What the sandbox's init deploys at start, whether it starts the editor, and the model
+        # What the sandbox's init deploys at start (the agents, and the editor if true), and the model
         # and effort the deploy script writes into Claude Code's settings.
         SOFTWARE_FILE: (json.dumps({"agents": record["agents"], "editor": record["editor"],
                                     "claude": {"model": record["claude_model"], "effort": record["claude_effort"]}}) + "\n", 0o644),
@@ -1445,12 +1539,13 @@ def listening_sockets(text, v6):
 
 def detected_ports(tcp_text, tcp6_text):
     """The rows of `port_detect`, from the two tables: one per port something listens on other
-    than on loopback, the sandbox's own services (sshd, the files server) left out."""
+    than on loopback, the sandbox's own services (sshd, the files server, and code-server behind
+    the editor's stub, should it ever listen elsewhere than on loopback) left out."""
     inodes = {}
     for text, v6 in ((tcp_text, False), (tcp6_text, True)):
         for address, port, inode in listening_sockets(text, v6):
             mapped = getattr(address, "ipv4_mapped", None) or address
-            if mapped.is_loopback or port in (SSH_PORT, FILES_SERVER_PORT):
+            if mapped.is_loopback or port in (SSH_PORT, FILES_SERVER_PORT, EDITOR_UPSTREAM_PORT):
                 continue
             inodes.setdefault(port, set()).add(inode)
     return [{"port": port, "inodes": sorted(inodes[port]), "label": str(port)} for port in sorted(inodes)]
@@ -1547,7 +1642,7 @@ def port_add(name, port, label, passthrough=False, host_port=None, env=None):
     label, and the project's entries after the change."""
     valid_name(name)
     port = port_number(port, "port")
-    own = {SSH_PORT: "sshd", FILES_SERVER_PORT: "the files server", EDITOR_PORT: "the editor"}
+    own = {SSH_PORT: "sshd", FILES_SERVER_PORT: "the files server", EDITOR_PORT: "the editor", EDITOR_UPSTREAM_PORT: "the editor"}
     if port in own:
         raise CoreError(f"Port {port} is the sandbox's own ({own[port]}).")
     if not isinstance(label, str) or not label.strip() or len(label.strip()) > LABEL_CHARS or not label.strip().isprintable():
@@ -1740,7 +1835,8 @@ def tail_of(command, limit, timeout):
 
 def deploy_agents(name, agents):
     """Deploy each of `agents` into the running sandbox of `name`, in the deploy script's update
-    mode: the program is overwritten, settings and logins are left alone. Refused while one of
+    mode: the program is overwritten (and its editor extension forced into the project's
+    editor, where it has one), settings and logins are left alone. Refused while one of
     them is being built, or is not pulled. Returns {agent: version deployed}."""
     p, deployed = paths(name), {}
     for agent in agents:
@@ -1790,7 +1886,9 @@ def agents_add(name, agent="claude"):
 
 def agents_update(name):
     """Update in a project's Config box: deploy the pulled version of every agent the running
-    project has. The editor is not touched: a newer one reaches a project at its next start."""
+    project has; the deploy script also forces each agent's editor extension into the
+    project's editor, as RS's Update does. The editor itself is not replaced: a newer one
+    reaches a project at its next start."""
     valid_name(name)
     with locked(name):
         record = not_being_destroyed(read_record(name))

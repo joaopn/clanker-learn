@@ -1674,6 +1674,15 @@ def test_the_sandbox_user_gets_the_password_from_its_hash_and_keeps_its_own_with
 # --- the software projects get: pins, distributions, the build lane ---------------------------
 
 CLAUDE, EDITOR = "2.1.330", "4.126.0"
+EXT_PINS = {"PYTHON_EXT_VERSION": "2026.4.0", "JUPYTER_VERSION": "2025.9.1", "JUPYTER_CELL_TAGS_VERSION": "0.1.9",
+            "JUPYTER_KEYMAP_VERSION": "1.1.2", "JUPYTER_RENDERERS_VERSION": "1.3.0", "JUPYTER_SLIDESHOW_VERSION": "0.1.6"}
+
+
+def editor_files(root):
+    """What the editor's distribution holds beside .local/ (the build fetches the extensions into ext/)."""
+    for ns, name, _ in core.SOFTWARE["code-server"]["extensions"]:
+        (root / "ext").mkdir(parents=True, exist_ok=True)
+        (root / "ext" / f"{ns}.{name}.vsix").write_text("a stand-in")
 
 
 def vsix(local):
@@ -1724,6 +1733,8 @@ class Builds:
         stand_in(pathlib.Path(staging) / ".local", software, version, absolute=True)
         if software == "claude":   # the extension, fetched after the installer
             vsix(pathlib.Path(staging) / ".local")
+        else:
+            editor_files(pathlib.Path(staging))
         return answer(0)
 
     def runs(self):
@@ -1736,7 +1747,8 @@ def dists(monkeypatch, tmp_path):
     monkeypatch.setattr(core, "LOCKS", str(tmp_path / "locks"))
     monkeypatch.setattr(core, "PRELOAD", str(tmp_path / "preload"))
     base = tmp_path / "versions.env"
-    base.write_text(f"# the repository's\nCLAUDE_CODE_VERSION={CLAUDE}\nCODE_SERVER_VERSION={EDITOR}\nCLAUDE_CODE_EXT_VERSION={CLAUDE}\n")
+    base.write_text(f"# the repository's\nCLAUDE_CODE_VERSION={CLAUDE}\nCODE_SERVER_VERSION={EDITOR}\nCLAUDE_CODE_EXT_VERSION={CLAUDE}\n"
+                    + "".join(f"{k}={v}\n" for k, v in EXT_PINS.items()))
     monkeypatch.setattr(core, "VERSIONS_FILE", str(base))
     builds = Builds()
     monkeypatch.setattr(core, "docker", builds)
@@ -1751,15 +1763,15 @@ def local_pins(tmp_path):
 
 def test_the_repository_ships_both_pins_and_the_image_has_them():
     repo = pathlib.Path(__file__).resolve().parents[2]
-    assert core.parse_pins(str(repo / "versions.env")) == {"CLAUDE_CODE_VERSION": CLAUDE, "CODE_SERVER_VERSION": EDITOR, "CLAUDE_CODE_EXT_VERSION": CLAUDE}
+    assert core.parse_pins(str(repo / "versions.env")) == {"CLAUDE_CODE_VERSION": CLAUDE, "CODE_SERVER_VERSION": EDITOR, "CLAUDE_CODE_EXT_VERSION": CLAUDE, **EXT_PINS}
     assert "COPY versions.env /opt/cl/versions.env" in (repo / "outer" / "Dockerfile").read_text()
 
 
 def test_the_local_override_wins_key_by_key(dists, tmp_path):
-    assert core.load_versions() == {"CLAUDE_CODE_VERSION": CLAUDE, "CODE_SERVER_VERSION": EDITOR, "CLAUDE_CODE_EXT_VERSION": CLAUDE}
+    assert core.load_versions() == {"CLAUDE_CODE_VERSION": CLAUDE, "CODE_SERVER_VERSION": EDITOR, "CLAUDE_CODE_EXT_VERSION": CLAUDE, **EXT_PINS}
     (tmp_path / "data").mkdir()
     (tmp_path / "data" / "versions.local.env").write_text("# mine\n\nCLAUDE_CODE_VERSION = 2.1.400\n")
-    assert core.load_versions() == {"CLAUDE_CODE_VERSION": "2.1.400", "CODE_SERVER_VERSION": EDITOR, "CLAUDE_CODE_EXT_VERSION": CLAUDE}
+    assert core.load_versions() == {"CLAUDE_CODE_VERSION": "2.1.400", "CODE_SERVER_VERSION": EDITOR, "CLAUDE_CODE_EXT_VERSION": CLAUDE, **EXT_PINS}
     assert (core.pin("claude"), core.pin("code-server")) == ("2.1.400", EDITOR)
 
 
@@ -1869,9 +1881,9 @@ def test_a_pull_runs_the_installer_without_privileges_checks_marks_and_swaps(dis
 def test_the_editor_is_installed_standalone_at_its_pin(dists, tmp_path):
     core.editor_pull()
     run, = dists.runs()
-    assert run[-6] == 'set -euo pipefail; curl -fsSL "$0" | sh -s -- "$@"'
+    assert run[-6].startswith('set -euo pipefail; curl -fsSL "$0" | sh -s -- "$@"; EXT_DIR=')
     assert run[-5:] == ("https://code-server.dev/install.sh", "--method", "standalone", "--version", EDITOR)
-    assert os.readlink(tmp_path / "data" / "dist" / "editor" / "bin" / "code-server") == f"../lib/code-server-{EDITOR}/bin/code-server"
+    assert os.readlink(tmp_path / "data" / "dist" / "editor" / ".local" / "bin" / "code-server") == f"../lib/code-server-{EDITOR}/bin/code-server"
     assert core.pulled("code-server")["version"] == EDITOR
 
 
@@ -2020,7 +2032,12 @@ def preloaded(tmp_path, software, version):
         (root / "claude").mkdir()
         (root / "claude" / "settings.json").write_text("{}")
     else:
-        stand_in(root, software, version)
+        stand_in(root / ".local", software, version)
+        editor_files(root)
+        for relative in core.SOFTWARE["code-server"]["copies"]:
+            (root / relative).parent.mkdir(parents=True, exist_ok=True)
+            (root / relative).write_text("a stand-in")
+        (root / "ext").rename(root / "templates" / "extensions")
     (tmp_path / "preload" / "dist" / f"{place}.json").write_text(json.dumps({"version": version, "ext_version": version}))
 
 
