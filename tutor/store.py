@@ -20,7 +20,7 @@ import sqlite3
 import unicodedata
 import uuid
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 SCHEMA_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "schema.sql")
 NOW = "strftime('%Y-%m-%dT%H:%M:%fZ','now')"
 LESSONS_DIR = "/workspace/.learn/lessons"
@@ -180,7 +180,30 @@ ALTER TABLE lessons ADD COLUMN plan_seen TEXT NOT NULL DEFAULT '';
 PRAGMA user_version = 5;
 COMMIT;
 """
-MIGRATIONS = {1: MIGRATE_1_TO_2, 2: MIGRATE_2_TO_3, 3: MIGRATE_3_TO_4, 4: MIGRATE_4_TO_5}
+# Version 5 to 6 (brief sets): several briefs, one per project. A set holds goals, preferences
+# and the background (`records.set_id`; the other kinds stay global, NULL); every existing one
+# goes into set 1, "Default", which a project with no row in `project_sets` uses.
+MIGRATE_5_TO_6 = """
+BEGIN;
+CREATE TABLE brief_sets (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    name       TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+INSERT INTO brief_sets (id, name) VALUES (1, 'Default');
+ALTER TABLE records ADD COLUMN set_id INTEGER;
+UPDATE records SET set_id = 1 WHERE kind IN ('goal', 'preference', 'background');
+CREATE INDEX records_of_set ON records (set_id, kind);
+CREATE TABLE project_sets (
+    project TEXT NOT NULL,
+    created TEXT NOT NULL,
+    set_id  INTEGER NOT NULL REFERENCES brief_sets (id),
+    PRIMARY KEY (project, created)
+);
+PRAGMA user_version = 6;
+COMMIT;
+"""
+MIGRATIONS = {1: MIGRATE_1_TO_2, 2: MIGRATE_2_TO_3, 3: MIGRATE_3_TO_4, 4: MIGRATE_4_TO_5, 5: MIGRATE_5_TO_6}
 AGENTS = ("claude", "pi")
 AGENT_NAMES = {"claude": "Claude Code", "pi": "pi"}
 DEFAULT_AGENT = "claude"

@@ -265,7 +265,7 @@ async def plan_change_propose(ctx, args):
 
 # --- the knowledge base (knowledge.py) ----------------------------------------------------------
 
-LINE = {"type": "string", "minLength": 1, "maxLength": knowledge.LINE_MAX}
+LINE = {"type": "string", "minLength": 1}
 QUOTE = {"type": "string", "minLength": 1, "maxLength": 1000}
 EVIDENCE_IDS = {"type": "array", "maxItems": 20, "items": {"type": "integer"}}
 RESTS_ON = {"type": "object", "properties": {"evidence": EVIDENCE_IDS, "quote": QUOTE}, "additionalProperties": False}
@@ -281,15 +281,17 @@ def this_project_insights(ctx):
 
 
 @tool("brief_get", "read", "The learner's brief as it is now (their goals, how they want to be taught, their background, the global "
-      "insights they approved, the lessons done recently in any project) and this project's insights in force, with their numbers. "
-      "The opening context of this conversation had the brief as it was then.", NO_ARGS)
+      "insights they approved, the lessons done recently in the projects that use this project's brief set) and this project's "
+      "insights in force, with their numbers. The opening context of this conversation had the brief as it was then.", NO_ARGS)
 async def brief_get(ctx, _args):
-    text, cut, _parts = knowledge.brief(ctx["db"])
+    turn = ctx["turn"]
+    text, cut, _parts = knowledge.brief(ctx["db"], knowledge.set_of(ctx["db"], turn.project, turn.created))
     return {"brief": text, "cut": cut, "this_project_insights": this_project_insights(ctx)}
 
 
 @tool("records_search", "read", "Search what you may read of the learner's records for every word of `query`: the lesson summaries of "
-      "every project, the goals, preferences, background and global insights, and this project's insights (retired ones too).",
+      "every project, the goals, preferences and background of this project's brief set, the global insights, and this project's "
+      "insights (retired ones too).",
       {"type": "object", "properties": {"query": {"type": "string", "minLength": 1, "maxLength": 200}}, "required": ["query"],
        "additionalProperties": False})
 async def records_search(ctx, args):
@@ -334,14 +336,17 @@ async def insight_retire(ctx, args):
 def in_their_words(ctx, kind, args):
     turn, db = ctx["turn"], ctx["db"]
     text = knowledge.one_line(args["text"])
-    same = next((row for row in knowledge.records(db, kind) if knowledge.collapsed(row["text"]) == knowledge.collapsed(text)), None)
+    set_id = knowledge.set_of(db, turn.project, turn.created)
+    same = next((row for row in knowledge.records(db, kind, set_id=set_id) if knowledge.collapsed(row["text"]) == knowledge.collapsed(text)), None)
     if same is not None:
         raise ToolError(f"That {kind} is recorded already ({same['id']}).")
     quote_id = knowledge.quote_evidence(db, turn, args["quote"])
     row = knowledge.add(db, kind, text, knowledge.by_tutor(turn), project=turn.project, created=turn.created,
-                        rests_on={"evidence": [quote_id], "insights": []})
+                        rests_on={"evidence": [quote_id], "insights": []}, set_id=set_id)
+    name = knowledge.brief_set(db, set_id)["name"]
     return {kind: row["id"], "quote_evidence": quote_id,
-            "said": f"Recorded: every tutor of every project is told this {kind} in the learner's brief; the learner can edit or delete it."}
+            "said": f"Recorded in the learner's brief set “{name}”: every tutor of every project that uses it is told this {kind}; "
+                    "the learner can edit or delete it."}
 
 
 QUOTED = {"type": "object", "properties": {"text": LINE, "quote": QUOTE}, "required": ["text", "quote"], "additionalProperties": False}

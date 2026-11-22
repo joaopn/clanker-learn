@@ -344,9 +344,9 @@ def opening_context(db, row, fresh_reason=None, earlier=0, taught_by=None):
         parts.append(f"This lesson's files are in {folder}/: keep notes.md there current as you teach (what was covered, the exercise in "
                      "progress, what is open); transcript.md is the conversation, written by clanker-learn after every answer. When the "
                      "objective is met, close the lesson with lesson_close.")
-    # What every tutor is told of the learner, then what only this project's tutors are told:
-    # another project's insights never enter it.
-    parts.append(knowledge.brief(db)[0])
+    # What every tutor of a project on this brief set is told of the learner, then what only this
+    # project's tutors are told: another project's insights never enter it.
+    parts.append(knowledge.brief(db, knowledge.set_of(db, row["project"], row["created"]))[0])
     parts.append(knowledge.project_insights_text(db, row["project"], row["created"]))
     if fresh_reason and taught_by:
         parts.append(f"You are taking this conversation up afresh ({fresh_reason}): the learner's messages 1 to {earlier} here, and the "

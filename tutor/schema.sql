@@ -1,5 +1,5 @@
--- The tutor service's database: one file, /data/tutor/tutor.db, at user_version 5. A file at
--- version 1 to 4 is brought to 5 in place at start (store.MIGRATIONS); any other version is
+-- The tutor service's database: one file, /data/tutor/tutor.db, at user_version 6. A file at
+-- version 1 to 5 is brought to 6 in place at start (store.MIGRATIONS); any other version is
 -- refused.
 
 -- A lesson belongs to a project as the pair (name, created): a new project with an old name
@@ -152,7 +152,8 @@ CREATE TABLE prompts (
 -- `rests_on_json` is {"evidence": [ids], "insights": [ids]}; an insight a tutor changed is
 -- `retired`, with `replaced_by` the one that took its place (whose `replaces` names it).
 -- `by_json` is who wrote it: {"who": "learner"} or {"who": "tutor", project, created,
--- lesson_id, run_id}.
+-- lesson_id, run_id}. `set_id` is the brief set a goal, a preference or the background (one
+-- per set) belongs to; NULL for the other kinds, which are not part of a set.
 CREATE TABLE records (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     kind            TEXT NOT NULL,
@@ -168,9 +169,29 @@ CREATE TABLE records (
     reason          TEXT NOT NULL DEFAULT '',
     by_json         TEXT NOT NULL,
     created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+    updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    set_id          INTEGER
 );
 CREATE INDEX records_of_kind ON records (kind, state);
+CREATE INDEX records_of_set ON records (set_id, kind);
+
+-- The brief sets: each holds its own goals, preferences and background (records.set_id); the
+-- global insights are every set's. Set 1, "Default", always exists and cannot be deleted.
+CREATE TABLE brief_sets (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    name       TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+INSERT INTO brief_sets (id, name) VALUES (1, 'Default');
+
+-- The brief set each project uses, by its name and creation time; a project with no row here
+-- uses Default. A destroyed project's row goes (knowledge.project_removed).
+CREATE TABLE project_sets (
+    project TEXT NOT NULL,
+    created TEXT NOT NULL,
+    set_id  INTEGER NOT NULL REFERENCES brief_sets (id),
+    PRIMARY KEY (project, created)
+);
 
 -- What the system itself saw: a check that ran (`check`), a quoted sentence of the learner's
 -- (`quote`), an answered question (`answer`), a closed lesson (`completion`).
@@ -248,4 +269,4 @@ CREATE TABLE settings (
     value TEXT NOT NULL
 );
 
-PRAGMA user_version = 5;
+PRAGMA user_version = 6;

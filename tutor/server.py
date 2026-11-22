@@ -19,8 +19,9 @@ routes below, as this one answers none of its.
 
 Every project has a Goals conversation and a study plan; a tutor's proposal of a plan, or of
 a change of it, is a card the learner edits and approves or dismisses here (plans.py). The
-knowledge base (knowledge.py) is read and changed here for the Knowledge page: the brief, the
-records, the global proposals, the lesson summaries, the change log and its undo; and the
+knowledge base (knowledge.py) is read and changed here for the Knowledge page: the brief sets
+(and the one each project uses), a set's brief, the records, the global proposals, the lesson
+summaries, the change log and its undo; and the
 learner answers a lesson's question cards and presses Check on its exercises (cards.py).
 
 The HTTP contract (paths, bodies, the envelope) is the one the web server's relay is built
@@ -369,10 +370,24 @@ def text_in(body, key="text", required=True):
     return value
 
 
+def set_in(source, key="set"):
+    """A brief set's id from a query or a body (a number, or its text), Default when absent."""
+    value = source.get(key)
+    if value is None:
+        return knowledge.DEFAULT_SET
+    if isinstance(value, str) and value.isdigit():
+        value = int(value)
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise Refusal("validation", f"`{key}` must be a brief set's number.")
+    return value
+
+
 async def get_brief(request):
     db = request.app["db"]
-    text, cut, parts = knowledge.brief(db)
+    set_id = set_in(request.query)
+    text, cut, parts = knowledge.brief(db, set_id)
     return ok({"text": text, "cut": cut, "open_proposals": knowledge.open_global_count(db),
+               "set": knowledge.brief_set_out(db, knowledge.brief_set(db, set_id)),
                "parts": {"goals": [knowledge.record_out(r) for r in parts["goals"]],
                          "preferences": [knowledge.record_out(r) for r in parts["preferences"]],
                          "background": knowledge.record_out(parts["background"]) if parts["background"] else None,
@@ -387,13 +402,13 @@ async def list_records(request):
     project = created = None
     if "project" in request.query:
         project, created = project_pair(request.query)
-    rows = knowledge.records(request.app["db"], kind, project, created, request.query.get("all") == "1")
+    rows = knowledge.records(request.app["db"], kind, project, created, request.query.get("all") == "1", set_in(request.query))
     return ok({"records": [knowledge.record_out(row) for row in rows]})
 
 
 async def add_record(request):
     body = await body_of(request)
-    row = knowledge.learner_add(request.app["db"], body.get("kind"), text_in(body))
+    row = knowledge.learner_add(request.app["db"], body.get("kind"), text_in(body), set_in(body))
     return ok({"record": knowledge.record_out(row)})
 
 
@@ -422,8 +437,48 @@ async def delete_record(request):
 
 
 async def put_background(request):
-    row = knowledge.set_background(request.app["db"], text_in(await body_of(request)))
+    body = await body_of(request)
+    row = knowledge.set_background(request.app["db"], text_in(body), set_in(body))
     return ok({"record": knowledge.record_out(row) if row else None})
+
+
+async def list_sets(request):
+    db = request.app["db"]
+    return ok({"sets": [knowledge.brief_set_out(db, row) for row in knowledge.brief_sets(db)]})
+
+
+async def add_set(request):
+    db = request.app["db"]
+    body = await body_of(request)
+    copy_from = set_in(body, "copy_from") if body.get("copy_from") is not None else None
+    return ok({"set": knowledge.brief_set_out(db, knowledge.create_set(db, text_in(body, "name"), copy_from))})
+
+
+async def edit_set(request):
+    db = request.app["db"]
+    body = await body_of(request)
+    return ok({"set": knowledge.brief_set_out(db, knowledge.rename_set(db, number(request, "id"), text_in(body, "name")))})
+
+
+async def delete_set(request):
+    return ok(knowledge.delete_set(request.app["db"], number(request, "id")))
+
+
+async def get_project_set(request):
+    db = request.app["db"]
+    project, created = project_pair(request.query)
+    return ok({"project": project, "created": created, "set": knowledge.brief_set_out(db, knowledge.brief_set(db, knowledge.set_of(db, project, created)))})
+
+
+async def put_project_set(request):
+    """A project's brief set; its lessons are told that set's brief from their next start."""
+    db = request.app["db"]
+    body = await body_of(request)
+    project, created = project_pair(body)
+    if body.get("set") is None:
+        raise Refusal("validation", "`set` must be a brief set's number.")
+    row = knowledge.give_set(db, project, created, set_in(body))
+    return ok({"project": project, "created": created, "set": knowledge.brief_set_out(db, row)})
 
 
 async def get_evidence(request):
@@ -615,6 +670,9 @@ def build_app(db, secret):
         web.post("/instructions/reset", reset_instructions),
         web.get("/activity", activity),
         web.get("/knowledge/brief", get_brief),
+        web.get("/knowledge/sets", list_sets), web.post("/knowledge/sets", add_set),
+        web.patch("/knowledge/sets/{id}", edit_set), web.delete("/knowledge/sets/{id}", delete_set),
+        web.get("/knowledge/project-set", get_project_set), web.put("/knowledge/project-set", put_project_set),
         web.get("/knowledge/records", list_records), web.post("/knowledge/records", add_record),
         web.get("/knowledge/records/{id}", get_record), web.patch("/knowledge/records/{id}", edit_record),
         web.delete("/knowledge/records/{id}", delete_record),

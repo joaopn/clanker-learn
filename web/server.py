@@ -1529,7 +1529,8 @@ async def _tutor_body(request: web.Request) -> dict | None | web.Response:
 async def tutor_project_lessons_handler(request: web.Request) -> web.Response:
     """GET|POST /broker/tutor/project/{name}/lessons — a project's lessons, and a new one
     ({title, objective}); GET /broker/tutor/project/{name}/plan — its plan; GET
-    /broker/tutor/project/{name}/insights[?all=1] — its insights. The project is
+    /broker/tutor/project/{name}/insights[?all=1] — its insights; GET|PUT
+    /broker/tutor/project/{name}/brief-set — the brief set it uses, and another ({set}). The project is
     named upstream by the name and the creation time of the broker's `status`, never by what
     the browser sends; an unknown project is the broker's refusal, answered as the project
     routes answer it."""
@@ -1537,7 +1538,7 @@ async def tutor_project_lessons_handler(request: web.Request) -> web.Response:
     if refused is not None:
         return refused
     body = None
-    if request.method == "POST":
+    if request.method in ("POST", "PUT"):
         body = await _json_body(request)
         if body is None:
             return _bad_request()
@@ -1548,6 +1549,10 @@ async def tutor_project_lessons_handler(request: web.Request) -> web.Response:
     project, created = result.get("name"), result.get("created")
     if not isinstance(project, str) or not isinstance(created, str):
         return web.json_response({"ok": False, "error": {"kind": "failed"}}, status=500)
+    if request.path.endswith("/brief-set"):
+        if request.method == "GET":
+            return await _tutor_call("GET", "/knowledge/project-set", query={"project": project, "created": created})
+        return await _tutor_call("PUT", "/knowledge/project-set", body={"set": body.get("set"), "project": project, "created": created})
     if request.method == "GET" and request.path.endswith("/insights"):
         # The project's insights (with `all=1`, the retired ones too).
         query = {"kind": "insight", "project": project, "created": created}
@@ -2244,6 +2249,14 @@ def build_app() -> web.Application:
     # /projects/removed is this server's own call after a destroy, never the browser's.)
     app.router.add_get("/broker/tutor/project/{name}/insights", tutor_project_lessons_handler)
     app.router.add_get("/broker/tutor/knowledge/brief", _tutor_route("/knowledge/brief"))
+    brief_sets = _tutor_route("/knowledge/sets")
+    app.router.add_get("/broker/tutor/knowledge/sets", brief_sets)
+    app.router.add_post("/broker/tutor/knowledge/sets", brief_sets)
+    brief_set = _tutor_route("/knowledge/sets/{id}")
+    app.router.add_patch("/broker/tutor/knowledge/sets/{id}", brief_set)
+    app.router.add_delete("/broker/tutor/knowledge/sets/{id}", brief_set)
+    app.router.add_get("/broker/tutor/project/{name}/brief-set", tutor_project_lessons_handler)
+    app.router.add_put("/broker/tutor/project/{name}/brief-set", tutor_project_lessons_handler)
     records = _tutor_route("/knowledge/records")
     app.router.add_get("/broker/tutor/knowledge/records", records)
     app.router.add_post("/broker/tutor/knowledge/records", records)

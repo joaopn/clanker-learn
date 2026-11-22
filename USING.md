@@ -134,14 +134,14 @@ A backup holds your projects' workspaces and home folders, the tutor's conversat
 
 ## What the tutor keeps about you: the Knowledge page
 
-clanker-learn keeps a small knowledge base about you, shared by every project. **Knowledge**, under the project list, shows all of it, and you can change or delete any of it. Its dot is lit when a tutor proposes something that waits for you.
+clanker-learn keeps a small knowledge base about you, shared by every project (each project's own part aside). **Knowledge**, under the project list, shows all of it, and you can change or delete any of it. Its dot is lit when a tutor proposes something that waits for you.
 
-**Your brief** is what every tutor is told about you when a lesson starts, in any project. It has these parts:
+**Your briefs** are what a tutor is told about you when a lesson starts. You can keep several **brief sets** (one for work and one for a hobby, or one per person who learns here): the "Brief set" card on the Knowledge page picks the one shown, and makes a new one (empty, or a copy of the one shown), renames it or deletes it (only when no project uses it; its goals, preferences and background go with it). Each project uses one set: chosen in the New project box ("Brief"), and changed in the project's Config box, where a lesson takes the change at its next start. "Default" holds what there was before sets existed, and is used by every project not given another; it cannot be deleted. A brief is never shortened, whatever its length; a long one takes more of each lesson's context, which the line under the conversation shows. A set has these parts:
 
-- **Your background**: what you know already and what you work with, in a box you write. Only you write it; every tutor reads it as you wrote it from its next lesson.
+- **Your background**: what you know already and what you work with, in a box you write, of any length. Only you write it; every tutor reads it as you wrote it from its next lesson.
 - **Your goals** and **how you want to be taught**. A tutor records one only with a sentence you typed in a lesson, quoted exactly (12 characters at least), and never one it inferred. Each line says who recorded it, and "what it rests on" shows your sentence. You can add your own, in your own words, and edit or delete any.
-- **How you learn**: the global insights you approved (below).
-- **Recently**: the lessons done lately, in any project, one line each; open one for its summary.
+- **How you learn**: the global insights you approved (below). These are not part of a set: every set's brief has the same ones.
+- **Recently**: the last ten lessons done in the projects that use the set, one line each; open one for its summary.
 
 "As a tutor reads it" shows the exact text a tutor is given, put together from the records by the program, never written by a model.
 

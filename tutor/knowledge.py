@@ -4,9 +4,10 @@ tutors are told.
 Records (goals, preferences, the background text, a project's insights, global insights), the
 evidence the system itself saw (a check that ran, a quote, an answered question, a closed
 lesson), the change log with before and after and its undo, the proposals of global insights,
-the brief rendered from the records, and what is kept or forgotten of a destroyed project. All
-of it is global to the installation; a record remembers the project (name and creation time)
-it came from, where it has one.
+the brief rendered from the records, the brief sets, and what is kept or forgotten of a destroyed
+project. Goals, preferences and the background belong to a brief set, and each project uses one
+set (Default when it was given none); everything else is global to the installation. A record
+remembers the project (name and creation time) it came from, where it has one.
 
 The rules are gaggiclanker's (the maintainer's project, AGPL like this one); its knowledge code
 is tied to its own domain, so they are taken, not its files:
@@ -21,7 +22,7 @@ is tied to its own domain, so they are taken, not its files:
 - an owner's insights are told only to that owner's conversations (InsightsRepository.for_recipe),
   and a general one only once a person has confirmed it (InsightsRepository.select reads
   confirmed = 1).
-New here: the change log and undo, the brief's rendering and its cap, the word overlap that
+New here: the change log and undo, the brief's rendering, the brief sets, the word overlap that
 finds similar insights.
 """
 import contextlib
@@ -31,11 +32,11 @@ import re
 import store
 
 QUOTE_MIN = 12
-LINE_MAX = 500
-BACKGROUND_MAX = 4000
 REASON_MAX = 1000
-BRIEF_MAX = 8000
 RECENT_MAX = 10
+SET_NAME_MAX = 80
+DEFAULT_SET = 1
+SET_KINDS = ("goal", "preference", "background")   # what a brief set holds; the other kinds are global
 SEARCH_MAX = 30
 SIMILAR_MAX = 3
 INSIGHT_KINDS = ("misconception", "strength", "worked", "did_not_work")
@@ -89,9 +90,9 @@ def by_tutor(turn):
     return {"who": "tutor", "project": turn.project, "created": turn.created, "lesson_id": turn.lesson_id, "run_id": turn.run_id}
 
 
-def line_of(text, what="A record", limit=LINE_MAX):
-    if not isinstance(text, str) or not text.strip() or len(text.strip()) > limit:
-        raise KnowledgeError(f"{what} is 1 to {limit} characters.")
+def line_of(text, what="A record", limit=None):
+    if not isinstance(text, str) or not text.strip() or (limit is not None and len(text.strip()) > limit):
+        raise KnowledgeError(f"{what} is 1 to {limit} characters." if limit is not None else f"{what} must not be empty.")
     return one_line(text)
 
 
@@ -181,11 +182,16 @@ def record_out(row):
     return {"id": row["id"], "kind": row["kind"], "text": row["text"], "insight_kind": row["insight_kind"], "project": row["project"],
             "created": row["created"], "project_removed": bool(row["project_removed"]), "rests_on": json.loads(row["rests_on_json"]),
             "state": row["state"], "replaces": row["replaces"], "replaced_by": row["replaced_by"], "reason": row["reason"],
-            "by": json.loads(row["by_json"]), "created_at": row["created_at"], "updated_at": row["updated_at"]}
+            "by": json.loads(row["by_json"]), "created_at": row["created_at"], "updated_at": row["updated_at"], "set_id": row["set_id"]}
 
 
-def records(db, kind, project=None, created=None, include_retired=False):
+def records(db, kind, project=None, created=None, include_retired=False, set_id=None):
+    """A kind's records; a goal's, a preference's or the background's of one brief set
+    (`set_id`, Default when it is not given)."""
     sql, params = "SELECT * FROM records WHERE kind = ?", [kind]
+    if kind in SET_KINDS:
+        sql += " AND set_id = ?"
+        params.append(DEFAULT_SET if set_id is None else set_id)
     if project is not None:
         sql += " AND project = ? AND created = ?"
         params += [project, created]
@@ -194,10 +200,13 @@ def records(db, kind, project=None, created=None, include_retired=False):
     return db.all(sql + " ORDER BY id", params)
 
 
-def insert_record(db, kind, text, by, project=None, created=None, insight_kind=None, rests_on=None, replaces=None):
-    return db.execute("INSERT INTO records (kind, text, insight_kind, project, created, rests_on_json, replaces, by_json) "
-                      "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                      (kind, text, insight_kind, project, created, json.dumps(rests_on or EMPTY_RESTS), replaces, json.dumps(by))).lastrowid
+def insert_record(db, kind, text, by, project=None, created=None, insight_kind=None, rests_on=None, replaces=None, set_id=None):
+    if kind in SET_KINDS and set_id is None:
+        set_id = DEFAULT_SET
+    return db.execute("INSERT INTO records (kind, text, insight_kind, project, created, rests_on_json, replaces, by_json, set_id) "
+                      "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                      (kind, text, insight_kind, project, created, json.dumps(rests_on or EMPTY_RESTS), replaces, json.dumps(by),
+                       set_id if kind in SET_KINDS else None)).lastrowid
 
 
 def log_change(db, action, by, items, note="", undoes=None):
@@ -216,10 +225,14 @@ def add(db, kind, text, by, action="add", note="", **fields):
     return row
 
 
-def learner_add(db, kind, text):
+def learner_add(db, kind, text, set_id=None):
+    """A line of the learner's: a goal or a preference into a brief set (Default when none is
+    given), a global insight into no set."""
     if kind not in LINE_KINDS:
         raise KnowledgeError(f"The learner adds a {', a '.join(LINE_KINDS)} here (the background has its own route).")
-    return add(db, kind, line_of(text), LEARNER)
+    if kind in SET_KINDS:
+        set_id = brief_set_or_refuse(db, DEFAULT_SET if set_id is None else set_id)["id"]
+    return add(db, kind, line_of(text), LEARNER, set_id=set_id)
 
 
 def edit(db, record_id, by, text=None, insight_kind=None):
@@ -227,10 +240,9 @@ def edit(db, record_id, by, text=None, insight_kind=None):
     with atomic(db):
         before = record_or_refuse(db, record_id)
         if text is not None:
-            limit = BACKGROUND_MAX if before["kind"] == "background" else LINE_MAX
             text = text.strip() if before["kind"] == "background" else one_line(text)
-            if not text or len(text) > limit:
-                raise KnowledgeError(f"The text is 1 to {limit} characters.")
+            if not text:
+                raise KnowledgeError("The text must not be empty.")
             db.execute(f"UPDATE records SET text = ?, updated_at = {store.NOW} WHERE id = ?", (text, record_id))
         if insight_kind is not None:
             if insight_kind not in INSIGHT_KINDS:
@@ -256,18 +268,20 @@ def record_or_refuse(db, record_id):
     return row
 
 
-def set_background(db, text):
-    """The background text, written by the learner only; empty removes it."""
-    if not isinstance(text, str) or len(text.strip()) > BACKGROUND_MAX:
-        raise KnowledgeError(f"The background is at most {BACKGROUND_MAX} characters.")
-    current = records(db, "background")
+def set_background(db, text, set_id=None):
+    """A brief set's background text (one per set; Default when no set is given), written by
+    the learner only, of any length; empty removes it."""
+    if not isinstance(text, str):
+        raise KnowledgeError("The background must be text.")
+    set_id = brief_set_or_refuse(db, DEFAULT_SET if set_id is None else set_id)["id"]
+    current = records(db, "background", set_id=set_id)
     if not text.strip():
         if current:
             delete(db, current[0]["id"], LEARNER)
         return None
     if current:
         return edit(db, current[0]["id"], LEARNER, text=text)
-    return add(db, "background", text.strip(), LEARNER)
+    return add(db, "background", text.strip(), LEARNER, set_id=set_id)
 
 
 def replace(db, old_id, text, by, rests_on, insight_kind=None, kind="insight", note="", source=None):
@@ -276,7 +290,7 @@ def replace(db, old_id, text, by, rests_on, insight_kind=None, kind="insight", n
     with atomic(db):
         old = record(db, old_id)
         project, created = source or (old["project"], old["created"])
-        new_id = insert_record(db, kind, text, by, project, created, insight_kind or old["insight_kind"], rests_on, old_id)
+        new_id = insert_record(db, kind, text, by, project, created, insight_kind or old["insight_kind"], rests_on, old_id, old["set_id"])
         db.execute(f"UPDATE records SET state = 'retired', replaced_by = ?, updated_at = {store.NOW} WHERE id = ?", (new_id, old_id))
         log_change(db, "replace", by, [(old_id, snapshot(old), snapshot(record(db, old_id))), (new_id, None, snapshot(record(db, new_id)))], note)
     return record(db, new_id)
@@ -301,6 +315,14 @@ def own_insight(db, turn, insight_id):
 
 
 # --- the change log and undo --------------------------------------------------------------------
+
+def same_record(now, then):
+    """A record as it is now against a snapshot of it in the change log; a snapshot taken before
+    a column was added (brief sets' `set_id`) is compared on the columns it has."""
+    if now is None or then is None:
+        return now is then
+    return all(now.get(column) == value for column, value in then.items())
+
 
 def change_out(row):
     items = json.loads(row["items_json"])
@@ -327,7 +349,7 @@ def undo(db, change_id):
     items = json.loads(row["items_json"])
     with atomic(db):
         for item in items:
-            if snapshot(record(db, item["record"])) != item["after"]:
+            if not same_record(snapshot(record(db, item["record"])), item["after"]):
                 raise Conflict(f"Record {item['record']} changed after this change: undo the later changes first, or edit it by hand.")
         done = []
         for item in items:
@@ -335,9 +357,14 @@ def undo(db, change_id):
             if item["before"] is None:
                 db.execute("DELETE FROM records WHERE id = ?", (item["record"],))
             else:
-                columns = list(item["before"])
+                before = dict(item["before"])
+                if "set_id" not in before:   # a change logged before brief sets: its goals and the like were Default's
+                    before["set_id"] = DEFAULT_SET if before["kind"] in SET_KINDS else None
+                if before["set_id"] is not None and brief_set(db, before["set_id"]) is None:
+                    raise Conflict(f"Record {item['record']} was in a brief set that is deleted.")
+                columns = list(before)
                 db.execute(f"INSERT OR REPLACE INTO records ({', '.join(columns)}) VALUES ({', '.join('?' for _ in columns)})",
-                           [item["before"][c] for c in columns])
+                           [before[c] for c in columns])
             done.append((item["record"], now, snapshot(record(db, item["record"]))))
         new_id = log_change(db, "undo", LEARNER, done, f"undid change {change_id} ({row['action']})", change_id)
     return change_out(db.one("SELECT * FROM changes WHERE id = ?", (new_id,)))
@@ -350,10 +377,15 @@ def summary_out(row):
             "title": row["title"], "one_line": row["one_line"], "summary": row["summary"], "closed_at": row["closed_at"]}
 
 
-def summaries(db, query=None, limit=None):
-    """Every project's lessons that are done, newest first; `query` keeps those whose title,
-    one line or summary hold every word of it."""
-    rows = db.all("SELECT * FROM lessons WHERE state = 'done' AND kind = 'lesson' ORDER BY closed_at DESC, id DESC")
+def summaries(db, query=None, limit=None, set_id=None):
+    """Every project's lessons that are done, newest first (with `set_id`, only those of the
+    projects that use that brief set); `query` keeps those whose title, one line or summary
+    hold every word of it."""
+    sql, params = "SELECT * FROM lessons WHERE state = 'done' AND kind = 'lesson'", []
+    if set_id is not None:
+        sql += f" AND {SET_OF_LESSON} = ?"
+        params.append(set_id)
+    rows = db.all(sql + " ORDER BY closed_at DESC, id DESC", params)
     if query:
         rows = [row for row in rows if matches(query, row["title"], row["one_line"], row["summary"])]
     return rows[:limit] if limit else rows
@@ -378,48 +410,29 @@ def insight_line(row, with_id=False):
     return f"- {number}{kind}{row['text']}"
 
 
-def brief(db):
-    """The brief, rendered by code from the records, the same records always giving the same
-    text: goals, preferences, the background, the global insights, and the last lessons done in
-    any project. Over BRIEF_MAX, lines are cut from the end of the least needed part first
-    (recently, then the global insights, preferences, goals; the background last), and a line
-    counts what was cut. Returns (text, cut, parts)."""
-    parts = {"goals": records(db, "goal"), "preferences": records(db, "preference"),
-             "background": (records(db, "background") or [None])[0], "global_insights": records(db, "global")}
-    done = summaries(db)
-    parts["recently"] = done[:RECENT_MAX]
-    cut = len(done) - len(parts["recently"])
-    sections = {
-        "goals": ("Their goals:", [f"- {row['text']}" for row in parts["goals"]], "none recorded yet"),
-        "preferences": ("How they want to be taught:", [f"- {row['text']}" for row in parts["preferences"]], "none recorded yet"),
-        "background": ("Their background, as they wrote it:", parts["background"]["text"].splitlines() if parts["background"] else [],
-                       "not written yet"),
-        "global_insights": ("How they learn (insights they approved for every tutor):", [insight_line(row) for row in parts["global_insights"]],
-                            "none yet"),
-        "recently": ("Recently (lessons done, in any project, newest first):",
-                     [f"- {(row['closed_at'] or '')[:10]}, {where(row)}: “{row['title']}”: {row['one_line']}" for row in parts["recently"]],
-                     "no lesson done yet"),
-    }
-    order = ("goals", "preferences", "background", "global_insights", "recently")
-    cut_order = ("recently", "global_insights", "preferences", "goals", "background")
-
-    def render():
-        out = ["The learner's brief (every tutor of every project is told the same):"]
-        for key in order:
-            title, lines, empty = sections[key]
-            out += [f"{title} {empty}."] if not lines else [title, *lines]
-        if cut:
-            out.append(f"({cut} more line(s) were cut to keep this short: records_search finds them.)")
-        return "\n".join(out)
-    text = render()
-    while len(text) > BRIEF_MAX:
-        key = next((k for k in cut_order if sections[k][1]), None)
-        if key is None:
-            break
-        sections[key][1].pop()
-        cut += 1
-        text = render()
-    return text, cut, parts
+def brief(db, set_id=DEFAULT_SET):
+    """A brief set's brief, rendered by code from the records, the same records always giving the
+    same text: the set's goals, preferences and background, the global insights (every set's),
+    and the last RECENT_MAX lessons done in the projects that use the set. Never cut: the rest
+    of the lessons is found by records_search. Returns (text, cut, parts); `cut` is always 0,
+    kept for the callers that show it."""
+    the_set = brief_set_or_refuse(db, set_id)
+    parts = {"goals": records(db, "goal", set_id=set_id), "preferences": records(db, "preference", set_id=set_id),
+             "background": (records(db, "background", set_id=set_id) or [None])[0], "global_insights": records(db, "global"),
+             "recently": summaries(db, limit=RECENT_MAX, set_id=set_id)}
+    sections = (
+        ("Their goals:", [f"- {row['text']}" for row in parts["goals"]], "none recorded yet"),
+        ("How they want to be taught:", [f"- {row['text']}" for row in parts["preferences"]], "none recorded yet"),
+        ("Their background, as they wrote it:", parts["background"]["text"].splitlines() if parts["background"] else [], "not written yet"),
+        ("How they learn (insights they approved for every tutor):", [insight_line(row) for row in parts["global_insights"]], "none yet"),
+        ("Recently (lessons done in the projects that use this brief, newest first):",
+         [f"- {(row['closed_at'] or '')[:10]}, {where(row)}: “{row['title']}”: {row['one_line']}" for row in parts["recently"]],
+         "no lesson done yet"),
+    )
+    out = [f"The learner's brief, from their brief set “{the_set['name']}” (every tutor of every project that uses this set is told the same):"]
+    for title, lines, empty in sections:
+        out += [f"{title} {empty}."] if not lines else [title, *lines]
+    return "\n".join(out), 0, parts
 
 
 def project_insights_text(db, project, created):
@@ -431,14 +444,17 @@ def project_insights_text(db, project, created):
 
 
 def search(db, turn, query):
-    """records_search: every project's lesson summaries, the goals, preferences, background and
-    global insights, and THIS project's insights; never another project's insights."""
+    """records_search: every project's lesson summaries, the goals, preferences and background
+    of the brief set this project uses, the global insights, and THIS project's insights; never
+    another project's insights, nor another set's records."""
+    set_id = set_of(db, turn.project, turn.created)
+
     def found(rows, *fields):
         return [row for row in rows if matches(query, *(row[f] for f in fields))][:SEARCH_MAX]
     return {"lessons": [{k: v for k, v in summary_out(row).items() if k != "created"} for row in summaries(db, query, SEARCH_MAX)],
-            "goals": [record_brief(r) for r in found(records(db, "goal"), "text")],
-            "preferences": [record_brief(r) for r in found(records(db, "preference"), "text")],
-            "background": [record_brief(r) for r in found(records(db, "background"), "text")],
+            "goals": [record_brief(r) for r in found(records(db, "goal", set_id=set_id), "text")],
+            "preferences": [record_brief(r) for r in found(records(db, "preference", set_id=set_id), "text")],
+            "background": [record_brief(r) for r in found(records(db, "background", set_id=set_id), "text")],
             "global_insights": [record_brief(r) for r in found(records(db, "global"), "text")],
             "this_project_insights": [record_brief(r) for r in found(records(db, "insight", turn.project, turn.created, True), "text")]}
 
@@ -642,5 +658,111 @@ def project_removed(db, project, created, forget):
             db.execute("UPDATE lessons SET project_removed = 1, module_id = NULL WHERE project = ? AND created = ?", pair)
             counts["summaries_kept"] = len(kept)
         db.execute("DELETE FROM modules WHERE project = ? AND created = ?", pair)
+        # Its brief set stays named while its done lessons are kept (they stay in that set's
+        # Recently); the set's count of projects leaves it out (set_users).
+        if forget or not counts.get("summaries_kept"):
+            db.execute("DELETE FROM project_sets WHERE project = ? AND created = ?", pair)
     counts["lessons_before"] = len(lesson_ids)
     return counts
+
+
+# --- brief sets ---------------------------------------------------------------------------------
+# A set holds goals, preferences and a background (records.set_id); each project uses one
+# (project_sets; Default, set 1, when it has no row there). The global insights are every set's.
+
+SET_OF_LESSON = (f"coalesce((SELECT set_id FROM project_sets WHERE project_sets.project = lessons.project "
+                 f"AND project_sets.created = lessons.created), {DEFAULT_SET})")
+
+
+def brief_set(db, set_id):
+    return db.one("SELECT * FROM brief_sets WHERE id = ?", (set_id,))
+
+
+def brief_set_or_refuse(db, set_id):
+    row = brief_set(db, set_id) if isinstance(set_id, int) and not isinstance(set_id, bool) else None
+    if row is None:
+        raise Missing(f"There is no brief set {set_id}.")
+    return row
+
+
+def set_users(db, set_id):
+    """The projects given this set, as (name, created) rows; a removed project whose lessons are
+    kept (its lesson rows carry project_removed) is not one."""
+    return db.all("SELECT project, created FROM project_sets WHERE set_id = ? AND NOT EXISTS (SELECT 1 FROM lessons WHERE "
+                  "lessons.project = project_sets.project AND lessons.created = project_sets.created AND lessons.project_removed = 1) "
+                  "ORDER BY project", (set_id,))
+
+
+def brief_set_out(db, row):
+    return {"id": row["id"], "name": row["name"], "default": row["id"] == DEFAULT_SET, "created_at": row["created_at"],
+            "projects": len(set_users(db, row["id"]))}
+
+
+def brief_sets(db):
+    return db.all("SELECT * FROM brief_sets ORDER BY id")
+
+
+def set_name_of(db, name, but=None):
+    if not isinstance(name, str) or not name.strip() or len(one_line(name)) > SET_NAME_MAX:
+        raise KnowledgeError(f"A brief set's name is 1 to {SET_NAME_MAX} characters.")
+    name = one_line(name)
+    same = db.one("SELECT id FROM brief_sets WHERE name = ? COLLATE NOCASE", (name,))
+    if same is not None and same["id"] != but:
+        raise KnowledgeError(f"There is a brief set called “{name}” already.")
+    return name
+
+
+def create_set(db, name, copy_from=None):
+    """A new brief set: empty, or with a copy of another set's goals, preferences and
+    background (each copy logged as an addition, so the History can undo it)."""
+    with atomic(db):
+        source = brief_set_or_refuse(db, copy_from) if copy_from is not None else None
+        set_id = db.execute("INSERT INTO brief_sets (name) VALUES (?)", (set_name_of(db, name),)).lastrowid
+        if source is not None:
+            for kind in SET_KINDS:
+                for row in records(db, kind, set_id=source["id"]):
+                    add(db, kind, row["text"], json.loads(row["by_json"]), note=f"copied from the brief set “{source['name']}”",
+                        project=row["project"], created=row["created"], rests_on=json.loads(row["rests_on_json"]), set_id=set_id)
+    return brief_set(db, set_id)
+
+
+def rename_set(db, set_id, name):
+    row = brief_set_or_refuse(db, set_id)
+    db.execute("UPDATE brief_sets SET name = ? WHERE id = ?", (set_name_of(db, name, but=row["id"]), row["id"]))
+    return brief_set(db, row["id"])
+
+
+def delete_set(db, set_id):
+    """A brief set no project uses, with its records and the change log's entries about them
+    (they cannot be undone: their set is gone). Default is never deleted."""
+    row = brief_set_or_refuse(db, set_id)
+    if row["id"] == DEFAULT_SET:
+        raise KnowledgeError("The brief set “Default” cannot be deleted: every project that was given no other set uses it.")
+    users = set_users(db, row["id"])
+    if users:
+        names = ", ".join(f"“{u['project']}”" for u in users)
+        raise KnowledgeError(f"The brief set “{row['name']}” is used by {len(users)} project(s) ({names}): give them another brief set "
+                             "in their Config box first.")
+    with atomic(db):
+        gone = {r["id"] for r in db.all("SELECT id FROM records WHERE set_id = ?", (row["id"],))}
+        db.execute("DELETE FROM records WHERE set_id = ?", (row["id"],))
+        # Removed projects that used it: their kept lessons fall to Default.
+        db.execute("DELETE FROM project_sets WHERE set_id = ?", (row["id"],))
+        for change in db.all("SELECT id, items_json FROM changes"):
+            if any(item["record"] in gone for item in json.loads(change["items_json"])):
+                db.execute("DELETE FROM changes WHERE id = ?", (change["id"],))
+        db.execute("DELETE FROM brief_sets WHERE id = ?", (row["id"],))
+    return {"deleted": row["id"], "records": len(gone)}
+
+
+def set_of(db, project, created):
+    """The brief set a project uses: the one it was given, Default otherwise."""
+    row = db.one("SELECT set_id FROM project_sets WHERE project = ? AND created = ?", (project, created))
+    return row["set_id"] if row is not None else DEFAULT_SET
+
+
+def give_set(db, project, created, set_id):
+    """A project's brief set chosen; its lessons are told that set's brief from their next start."""
+    row = brief_set_or_refuse(db, set_id)
+    db.execute("INSERT OR REPLACE INTO project_sets (project, created, set_id) VALUES (?, ?, ?)", (project, created, row["id"]))
+    return row

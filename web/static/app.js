@@ -3740,8 +3740,6 @@ const INSIGHT_CLASS = { misconception: "k-bad", strength: "k-good", worked: "k-g
 const RECORD_WORDS = { goal: "a goal", preference: "a preference", background: "your background", insight: "an insight", global: "a global insight" };
 const CHANGE_WORDS = { add: "added", edit: "edited", delete: "deleted", replace: "replaced", retire: "retired", approve: "approved", undo: "undid a change to" };
 const KB_VIEWS = new Set(["brief", "global", "lessons", "history"]);
-const LINE_MAX = 500;
-const BACKGROUND_MAX = 4000;
 
 const kbKey = (project, created) => `p:${project}|${created}`;
 const removedMark = (x) => (x && x.project_removed ? " (removed)" : "");
@@ -3836,7 +3834,7 @@ function recordRow(rec, opts) {
             restsOn(rec, o.openRests), said), act);
     };
     const edit = () => {
-        const text = h("textarea", { class: "kb-edit", rows: 2, maxlength: LINE_MAX, "aria-label": "The text" });
+        const text = h("textarea", { class: "kb-edit", rows: 2, "aria-label": "The text" });
         text.value = String(rec.text);
         const kind = rec.kind === "insight" ? h("select", { "aria-label": "Its kind" },
             Object.entries(INSIGHT_KINDS).map(([k, v]) => h("option", { value: k, selected: rec.insight_kind === k }, v))) : null;
@@ -3859,16 +3857,17 @@ function recordRow(rec, opts) {
     return el;
 }
 
-// A line the learner adds in their own words: a goal, a preference, a global insight.
-function addRow(kind, placeholder, onChanged) {
-    const input = h("input", { type: "text", maxlength: LINE_MAX, placeholder, autocomplete: "off" });
+// A line the learner adds in their own words: a goal, a preference (into the brief set `setId`),
+// a global insight.
+function addRow(kind, placeholder, onChanged, setId) {
+    const input = h("input", { type: "text", placeholder, autocomplete: "off" });
     const said = h("div", { class: "bad small", hidden: true });
     const go = h("button", { type: "submit" }, "Add");
     return h("form", { class: "addrow", method: "post", action: "#", onsubmit: async (ev) => {
         ev.preventDefault();
         if (!input.value.trim()) return;
         go.disabled = true;
-        const r = await tutorApi("POST", "/knowledge/records", { kind, text: input.value });
+        const r = await tutorApi("POST", "/knowledge/records", setId === undefined ? { kind, text: input.value } : { kind, text: input.value, set: Number(setId) });
         go.disabled = false;
         if (!r.body.ok) { said.textContent = errText(r.body); said.hidden = false; return; }
         onChanged();
@@ -3965,7 +3964,7 @@ function drawKbNav() {
     const projects = d.projects.map((p) => item(p.key, `${p.project}${p.live ? "" : " (removed)"}`,
         d.insights.filter((r) => r.state === "active" && kbKey(r.project, r.created) === p.key).length));
     fill(nav, h("div", { class: "kh" }, "ABOUT YOU, EVERYWHERE"),
-        item("brief", "Your brief"), item("global", "Global insights", d.globals, S.kbOpen > 0),
+        item("brief", "Your briefs"), item("global", "Global insights", d.globals, S.kbOpen > 0),
         h("div", { class: "kh" }, "PER PROJECT"), projects.length ? projects : h("div", { class: "kn none-kn" }, "No project yet."),
         h("div", { class: "kh" }, "EVERYTHING"), item("lessons", "Lessons done", d.summaries.length), item("history", "History"));
 }
@@ -4009,45 +4008,129 @@ async function renderKnowledge() {
     fill(body, view);
 }
 
+// ---- brief sets: each holds goals, preferences and a background; a project uses one (Default
+// when it was given none); the global insights are every set's.
+
+async function briefSets() {
+    const r = await tutorApi("GET", "/knowledge/sets");
+    return { sets: kbList(r, "sets"), r };
+}
+
+const setUse = (st) => (st.default ? `used by every project not given another${st.projects ? `; given to ${st.projects}` : ""}`
+    : `${st.projects} project${st.projects === 1 ? "" : "s"}`);
+
+// A "Brief" select of the sets, `current` (an id) chosen, Default when none.
+function briefSetSelect(sets, current) {
+    const pick = String(current || ((sets.find((st) => st.default) || sets[0] || {}).id || ""));
+    return h("select", { "aria-label": "Brief set" },
+        sets.map((st) => h("option", { value: String(st.id), selected: String(st.id) === pick }, String(st.name))));
+}
+
+function briefSetDialog(title, init, withCopy, onDone) {
+    const name = h("input", { type: "text", autocomplete: "off", maxlength: 80 });
+    name.value = init || "";
+    const said = h("p", { class: "bad", hidden: true });
+    const empty = h("input", { type: "radio", name: "bs-from", checked: true });
+    const copy = h("input", { type: "radio", name: "bs-from" });
+    const go = h("button", { class: "primary", type: "submit" }, "Save");
+    const form = h("form", { method: "post", action: "#", onsubmit: async (ev) => {
+        ev.preventDefault();
+        if (!name.value.trim()) return;
+        go.disabled = true;
+        const err = await onDone(name.value.trim(), copy.checked);
+        go.disabled = false;
+        if (err) { said.textContent = err; said.hidden = false; return; }
+        closeModal();
+    } }, formRow("Name", name),
+    withCopy ? h("div", { class: "radios" }, h("label", {}, empty, " empty"), h("label", {}, copy, ` a copy of “${withCopy}” (its goals, preferences and background)`)) : null,
+    said, h("div", { class: "btns" }, h("button", { type: "button", onclick: closeModal }, "Cancel"), go));
+    openModal(title, form, []);
+    name.focus();
+}
+
 async function briefView(again) {
-    const r = await tutorApi("GET", "/knowledge/brief");
+    const { sets, r: rs } = await briefSets();
+    if (!sets || !sets.length) return [h("h1", {}, "Your briefs"), h("p", { class: "bad" }, errText(rs.body))];
+    const shown = sets.find((st) => st.id === S.kb.set) || sets.find((st) => st.default) || sets[0];
+    S.kb.set = shown.id;
+    const r = await tutorApi("GET", `/knowledge/brief?set=${enc(shown.id)}`);
     const res = r.body.ok && r.body.result;
-    if (!res || !res.parts) return [h("h1", {}, "Your brief"), h("p", { class: "bad" }, errText(r.body))];
+    if (!res || !res.parts) return [h("h1", {}, "Your briefs"), h("p", { class: "bad" }, errText(r.body))];
     const parts = res.parts;
+    const setId = shown.id;
+    // The set picker: which brief is shown and edited here, and New, Rename, Delete.
+    const picker = briefSetSelect(sets, setId);
+    picker.addEventListener("change", () => { S.kb.set = picker.value; again(); });
+    const pickSaid = h("span", { class: "note grow" }, setUse(shown));
+    const newSet = h("button", { onclick: () => briefSetDialog("New brief set", "", shown.name, async (name, copy) => {
+        const r2 = await tutorApi("POST", "/knowledge/sets", copy ? { name, copy_from: Number(setId) } : { name });
+        if (!r2.body.ok) return errText(r2.body);
+        S.kb.set = r2.body.result.set.id;
+        toast(`The brief set “${name}” is made. Choose it for a project in its Config box or in the New project box.`);
+        again();
+        return null;
+    }) }, "New");
+    const renameSet = h("button", { onclick: () => briefSetDialog(`Rename “${shown.name}”`, shown.name, null, async (name) => {
+        const r2 = await tutorApi("PATCH", `/knowledge/sets/${enc(setId)}`, { name });
+        if (!r2.body.ok) return errText(r2.body);
+        again();
+        return null;
+    }) }, "Rename");
+    const deleteSet = h("button", { disabled: !!shown.default, title: shown.default ? "Default cannot be deleted: every project not given another set uses it." : null,
+        onclick: () => {
+            const said = h("p", { class: "bad", hidden: true });
+            const go = h("button", { class: "danger", onclick: async () => {
+                go.disabled = true;
+                const r2 = await tutorApi("DELETE", `/knowledge/sets/${enc(setId)}`);
+                go.disabled = false;
+                if (!r2.body.ok) { said.textContent = errText(r2.body); said.hidden = false; return; }
+                closeModal();
+                S.kb.set = null;
+                toast(`The brief set “${shown.name}” is deleted.`);
+                again();
+            } }, "Delete");
+            openModal(`Delete “${shown.name}”`, [h("p", {}, "Its goals, preferences and background go with it, for good: the History cannot undo this."),
+                h("p", { class: "note" }, "A set that a project uses cannot be deleted: give the project another set in its Config box first."), said],
+            [h("button", { onclick: closeModal }, "Cancel"), go]);
+        } }, "Delete");
+    const setBar = h("div", { class: "card" }, h("div", { class: "card-head" }, "Brief set", h("span", { class: "grow head-note" }, "each project uses one; chosen in the New project box and the project's Config box")),
+        h("div", { class: "form" }, h("div", { class: "row-btns" }, picker, pickSaid, newSet, renameSet, deleteSet)));
     const toggle = h("div", { class: "seg-toggle" },
         h("button", { class: S.kb.raw ? "" : "on", onclick: () => { S.kb.raw = false; again(); } }, "Overview"),
         h("button", { class: S.kb.raw ? "on" : "", onclick: () => { S.kb.raw = true; again(); } }, "As a tutor reads it"));
+    const title = `Your brief: ${shown.name}`;
     if (S.kb.raw) {
-        return [h("div", { class: "kb-top" }, h("div", {}, h("h1", {}, "Your brief"),
-                h("div", { class: "sub" }, "The exact text every tutor is given at the start of each lesson, in every project. It is put together from the records by the program, never written by a model.")), toggle),
+        return [h("div", { class: "kb-top" }, h("div", {}, h("h1", {}, title),
+                h("div", { class: "sub" }, "The exact text every tutor of a project that uses this brief set is given at the start of each lesson. It is put together from the records by the program, never written by a model, and never cut.")), toggle),
+            setBar,
             h("div", { class: "card" }, h("div", { class: "card-head" }, "As a tutor reads it", h("span", { class: "grow head-note" }, `${String(res.text).length} characters`)),
-                h("pre", { class: "rawbrief" }, String(res.text)),
-                res.cut ? h("div", { class: "note pad-note" }, `${res.cut} line(s) were left out to keep it short. A tutor can still find them with its search.`) : null),
+                h("pre", { class: "rawbrief" }, String(res.text))),
             h("p", { class: "note" }, "A project's tutor is also told that project's own insights, after this text.")];
     }
-    // The background: a box the learner writes.
-    const bg = h("textarea", { class: "kb-bg", rows: 5, maxlength: BACKGROUND_MAX, placeholder: "Comfortable with Python and SQL, new to streaming…", "aria-label": "Your background" });
+    // The background: a box the learner writes, of any length.
+    const bg = h("textarea", { class: "kb-bg", rows: 5, placeholder: "Comfortable with Python and SQL, new to streaming…", "aria-label": "Your background" });
     bg.value = parts.background ? String(parts.background.text) : "";
     const bgSaid = h("span", { class: "note grow" }, parts.background ? `Saved ${fmtWhen(parts.background.updated_at)}.` : "Not written yet.");
     const bgSave = h("button", { class: "primary", onclick: async () => {
         bgSave.disabled = true;
-        const r2 = await tutorApi("PUT", "/knowledge/background", { text: bg.value });
+        const r2 = await tutorApi("PUT", "/knowledge/background", { text: bg.value, set: Number(setId) });
         bgSave.disabled = false;
         if (!r2.body.ok) { bgSaid.className = "bad grow"; bgSaid.textContent = errText(r2.body); return; }
-        toast(bg.value.trim() ? "Your background is saved. Every tutor reads it from its next lesson." : "Your background is removed.");
+        toast(bg.value.trim() ? "Your background is saved. The tutors of this set's projects read it from their next lesson." : "Your background is removed.");
         again();
     } }, "Save");
     bg.addEventListener("input", () => { bgSaid.className = "note grow"; bgSaid.textContent = "Not saved yet."; });
     const lines = (rows, kind, empty, placeholder) => [
         rows.length ? rows.map((x) => recordRow(x, { onChanged: again, openRests: true, withProject: true })) : h("div", { class: "none" }, empty),
-        addRow(kind, placeholder, again)];
+        addRow(kind, placeholder, again, setId)];
     const recently = Array.isArray(parts.recently) ? parts.recently : [];
     const globalsIn = Array.isArray(parts.global_insights) ? parts.global_insights : [];
     return [
-        h("div", { class: "kb-top" }, h("div", {}, h("h1", {}, "Your brief"),
-            h("div", { class: "sub" }, "What every tutor knows about you before a lesson starts, in any project. A tutor records a goal or a preference only from a sentence you wrote; you can write, change or delete any of them.")), toggle),
+        h("div", { class: "kb-top" }, h("div", {}, h("h1", {}, title),
+            h("div", { class: "sub" }, "What every tutor of a project that uses this brief set knows about you before a lesson starts. A tutor records a goal or a preference only from a sentence you wrote, into its project's set; you can write, change or delete any of them.")), toggle),
+        setBar,
         h("div", { class: "card" }, h("div", { class: "card-head" }, "Your background", h("span", { class: "grow head-note" }, "in your own words; only you write it")),
-            h("div", { class: "form" }, h("p", { class: "note" }, "What you know already and what you work with. Every tutor reads it as you wrote it."), bg,
+            h("div", { class: "form" }, h("p", { class: "note" }, "What you know already and what you work with. Every tutor of this set's projects reads it as you wrote it."), bg,
                 h("div", { class: "row-btns kb-btns" }, bgSaid, bgSave))),
         h("div", { class: "two" },
             h("div", { class: "card" }, h("div", { class: "card-head" }, "Your goals"),
@@ -4056,10 +4139,10 @@ async function briefView(again) {
                 lines(parts.preferences || [], "preference", "None yet.", "Add a preference in your own words…"))),
         h("div", { class: "two" },
             h("div", { class: "card" }, h("div", { class: "card-head" }, "How you learn",
-                h("span", { class: "grow head-note" }, h("button", { class: "link", onclick: () => showKnowledge("global") }, `global insights (${globalsIn.length})`))),
+                h("span", { class: "grow head-note" }, h("button", { class: "link", onclick: () => showKnowledge("global") }, `global insights (${globalsIn.length}), in every set`))),
                 globalsIn.length ? globalsIn.map((g) => h("div", { class: "rowline" }, h("span", { class: "grow" }, String(g.text))))
                     : h("div", { class: "none" }, "None yet. A tutor proposes them; you approve them.")),
-            h("div", { class: "card" }, h("div", { class: "card-head" }, "Recently", h("span", { class: "grow head-note" }, "lessons done, in any project")),
+            h("div", { class: "card" }, h("div", { class: "card-head" }, "Recently", h("span", { class: "grow head-note" }, "lessons done, in this set's projects")),
                 recently.length ? recently.map((sm) => summaryRow(sm, true)) : h("div", { class: "none" }, "No lesson done yet."))),
         h("p", { class: "note" }, "A project's tutor is also told that project's own insights. The lessons' summaries and your background stand in for a list of what you know."),
     ];
@@ -4078,7 +4161,7 @@ function globalProposalRow(p, again) {
         const sm = S.kb.navData && S.kb.navData.summaries.find((x) => String(x.lesson_id) === String(p.lesson_id));
         return sm ? `“${sm.title}”` : "a lesson";
     })();
-    const text = p.action === "retire" ? null : h("textarea", { class: "kb-edit", rows: 2, maxlength: LINE_MAX, "aria-label": "The insight, as every tutor would read it" });
+    const text = p.action === "retire" ? null : h("textarea", { class: "kb-edit", rows: 2, "aria-label": "The insight, as every tutor would read it" });
     if (text) text.value = String(p.text || "");
     const similar = Array.isArray(p.similar) ? p.similar : [];
     const approve = h("button", { class: "primary", onclick: async () => {
@@ -4953,6 +5036,18 @@ function newProjectDialog() {
     const agentsBody = h("div", {}, h("p", { class: "note" }, "Asking which software is pulled…"));
     const editorBody = h("div", {});
     let chosen = () => ({ agents: [], editor: false, claude_model: "", claude_effort: "" });
+    // The brief set its tutors are told (Default preselected); given once the project is made.
+    const briefBody = h("div", {}, h("p", { class: "note" }, "Asking which brief sets there are…"));
+    let briefPick = null;
+    (async () => {
+        const { sets, r: rs } = await briefSets();
+        if (!sets || !sets.length) {
+            fill(briefBody, h("p", { class: "note" }, `The brief sets could not be read (${errText(rs.body)}): the project uses Default.`));
+            return;
+        }
+        briefPick = briefSetSelect(sets, null);
+        fill(briefBody, briefPick, h("p", { class: "note" }, "What its tutors are told about you: that set's goals, preferences and background, and the global insights."));
+    })();
     (async () => {
         const [sw, cat] = await Promise.all([api("GET", "/broker/software"), modelCatalog()]);
         const rows = sw.body.ok && Array.isArray(sw.body.result) ? sw.body.result : [];
@@ -5009,6 +5104,7 @@ function newProjectDialog() {
             return;
         }
         const project = name.value.trim();
+        const briefSet = briefPick ? briefPick.value : null;
         S.current = S.creating = project;
         S.page = null;
         saveLayout();
@@ -5017,11 +5113,17 @@ function newProjectDialog() {
         let made = false;
         await followOp(r.body.op_id, `Creating ${project}`, { onEnd: (ok) => { made = ok; } });
         if (S.creating === project) S.creating = null;
+        // Its brief set, through the tutor service; without it the project uses Default.
+        if (made && S.loggedIn) {
+            const rb = briefSet ? await tutorApi("PUT", `/project/${enc(project)}/brief-set`, { set: Number(briefSet) }) : null;
+            if (!rb || !rb.body.ok) toast(`${project} uses the brief set Default: ${rb ? errText(rb.body) : "the brief sets could not be read"}. Change it in its Config box.`, true);
+        }
         // A new project opens on Goals: the conversation that agrees a study plan.
         if (made && S.loggedIn && projectRow(project) && S.current === project) openGoals(project);
     } }, formRow("Name", name),
     h("details", { class: "more", open: true }, h("summary", {}, "Agents"), agentsBody),
     h("div", { class: "field" }, h("span", {}, "Editor"), editorBody),
+    h("div", { class: "field" }, h("span", {}, "Brief"), briefBody),
     h("details", { class: "more" }, h("summary", {}, "Limits (optional)"), limits.rows), said,
     h("div", { class: "btns" }, h("button", { type: "button", onclick: closeModal }, "Cancel"), go));
     openModal("New project", form, []);
@@ -5179,6 +5281,8 @@ function projectDialog(name) {
     const running = p.state === "running";
     const agentsBox = h("details", { class: "more agents-box", open: true }, h("summary", {}, "Agents"));
     agentsSection(name, p, agentsBox);
+    const briefBox = h("details", { class: "more", open: true }, h("summary", {}, "Brief"));
+    briefSection(name, briefBox);
     openModal(name, [
         h("div", { class: "kv" }, h("span", { class: "k" }, "Sandbox"),
             h("span", {}, h("span", { class: `dot inline ${st.cls}` }), " ", st.text, " ",
@@ -5189,10 +5293,35 @@ function projectDialog(name) {
         h("p", { class: "note" }, "Recreate makes a new sandbox from the current image, with the same workspace and home folder; its setup recipe runs again."),
         p.problem ? h("p", { class: "bad" }, String(p.problem)) : null,
         agentsBox,
+        briefBox,
         h("details", { class: "more" }, h("summary", {}, "Limits"), limitsForm),
         h("details", { class: "more danger-zone" }, h("summary", {}, "Destroy"), destroyForm),
         said,
     ], [h("button", { onclick: closeModal }, "Close")]);
+}
+
+// The Config box's Brief: the brief set the project's tutors are told, changed at once (a lesson
+// takes it at its next start).
+function briefSection(name, box) {
+    const body = h("div", {}, h("p", { class: "note" }, "Asking…"));
+    box.append(body);
+    (async () => {
+        const [{ sets, r: rs }, cur] = await Promise.all([briefSets(), tutorApi("GET", `/project/${enc(name)}/brief-set`)]);
+        const now = cur.body.ok && cur.body.result && cur.body.result.set;
+        if (!sets || !sets.length || !now) { fill(body, h("p", { class: "bad" }, errText((sets && sets.length ? cur : rs).body))); return; }
+        const pick = briefSetSelect(sets, now.id);
+        const said = h("p", { class: "note" }, "A lesson takes a new brief set at its next start; Knowledge → Your briefs shows and edits each set.");
+        pick.addEventListener("change", async () => {
+            pick.disabled = true;
+            const r = await tutorApi("PUT", `/project/${enc(name)}/brief-set`, { set: Number(pick.value) });
+            pick.disabled = false;
+            if (!r.body.ok) { said.className = "bad"; said.textContent = errText(r.body); pick.value = String(now.id); return; }
+            now.id = r.body.result.set.id;
+            said.className = "note";
+            said.textContent = `${name} now uses the brief set “${r.body.result.set.name}”: a lesson takes it at its next start.`;
+        });
+        fill(body, h("div", { class: "field" }, h("span", {}, "Brief set"), pick), said);
+    })();
 }
 
 async function runAction(name, verb) {
