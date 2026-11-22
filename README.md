@@ -13,7 +13,7 @@ It is for one person who wants to learn something hands-on (a database, a langua
 
 ## What it needs
 
-- A Linux machine with Docker. It runs as one container, which holds a Docker daemon of its own for the sandboxes. Only x86-64 has been run so far.
+- A Linux machine with Docker and Docker Compose. It runs as one container, which holds a Docker daemon of its own for the sandboxes. Only x86-64 has been run so far.
 - A Claude subscription, for Claude Code. You log in once per project, or set one token for every project in Settings. For pi instead, or as well: an account with a provider pi supports, logged in once per project, in its Shell.
 - The internet: at the first start clanker-learn builds its images and fetches Claude Code and the editor, and the sandboxes reach the internet while you work.
 
@@ -22,18 +22,15 @@ It is for one person who wants to learn something hands-on (a database, a langua
 From a copy of this repository:
 
 ```
-docker build -t clanker-learn -f outer/Dockerfile .
-docker run -d --name clanker-learn --stop-timeout 60 --privileged -e CL_MODE=privileged \
-    -p 127.0.0.1:7788:7788 -p 127.0.0.1:8080:8080 \
-    -p 127.0.0.1:11100-11164:11100-11164 -p 127.0.0.1:11200-11299:11200-11299 \
-    -v clanker-learn-docker:/var/lib/docker -v clanker-learn-data:/data \
-    clanker-learn
-docker logs clanker-learn
+./setup
+docker compose up
 ```
+
+`./setup` writes your settings into `.env` (the defaults, and the mode: see below). `docker compose up` builds the image and starts clanker-learn; its log shows the set-up code. Add `-d` to run it in the background, and read the log with `docker compose logs`.
 
 Open `https://127.0.0.1:7788` in a browser on the same machine, accept its self-made certificate, and type the set-up code that the log shows to choose your password. Then press `+ New project`.
 
-This runs the container privileged, which makes it root-equivalent on your machine; Settings and a line under the project list say so. [INSTALL.md](INSTALL.md) says what that gives up, and how to run it on sysbox instead.
+clanker-learn runs on [sysbox](https://github.com/nestybox/sysbox) where it is installed. Where it is not, `./setup` says so and sets privileged mode instead, which makes the container root-equivalent on your machine; Settings and a line under the project list say so. [INSTALL.md](INSTALL.md) says what that gives up.
 
 ## How far it is built
 

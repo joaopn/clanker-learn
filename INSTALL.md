@@ -1,68 +1,64 @@
 # Installing and running clanker-learn
 
-clanker-learn runs as one Docker container on a Linux machine. Inside it are a Docker daemon of its own, which runs a sandbox for each of your projects, and the services that make the page: a broker, a web server and the tutor service. Nothing is installed on the machine itself but the image and two volumes.
+clanker-learn runs as one Docker container on a Linux machine, started with Docker Compose from a copy of this repository. Inside it are a Docker daemon of its own, which runs a sandbox for each of your projects, and the services that make the page: a broker, a web server and the tutor service. Nothing is installed on the machine itself but the image and two volumes.
 
 What you need:
 
-- A Linux machine with Docker. Only x86-64 has been run so far; arm64 has not.
+- A Linux machine with Docker and Docker Compose. It has been run with Docker 29.5.3 and Compose 5.7.0. Only x86-64 has been run so far; arm64 has not.
 - A Claude subscription, for Claude Code; or, for pi, an account with a provider pi supports, logged in inside each project that uses it.
 - The internet, for the first start and while you work.
 - A few gigabytes of disk: each project has its own copy of Claude Code (about 400 MB), of pi if you give it pi (about 270 MB), and of the editor (about 350 MB), besides what you install in it.
 
 ## Two ways to run it
 
-The container needs to run a Docker daemon of its own. Docker allows that in two ways, and you say which one with `CL_MODE`.
+The container needs to run a Docker daemon of its own. Docker allows that in two ways, and `CL_MODE` in `.env` says which one. `./setup` (below) chooses for you.
 
-**Privileged** (`--privileged -e CL_MODE=privileged`) is the way that has been tested. It works with Docker alone. What it gives up: a privileged container is root-equivalent on the machine. Anything that gets out of a sandbox into clanker-learn's container can take the machine. What stands between a sandbox and the machine is an ordinary container boundary (the sandbox's own) and clanker-learn's guard rules (see [SECURITY.md](SECURITY.md)).
+**Sysbox** (`CL_MODE=sysbox`, the default) needs [sysbox](https://github.com/nestybox/sysbox) installed on the machine; the container then runs on its runtime, `sysbox-runc`. It runs in a user namespace of its own: root inside it is not root on the machine, so something that gets out of a sandbox is still confined. It is the safer way, but it has not yet been run on a real machine. One thing is not known there: whether a restart of clanker-learn keeps what was installed in each sandbox outside its workspace and home folder. If it does not, recreating a project brings that back through its setup recipe (see [USING.md](USING.md)).
 
-**Sysbox** (`--runtime=sysbox-runc -e CL_MODE=sysbox`) needs [sysbox](https://github.com/nestybox/sysbox) installed on the machine. The container then runs in a user namespace of its own: root inside it is not root on the machine, so something that gets out of a sandbox is still confined. It is supported by the code, and is the safer way, but it has not yet been run on a real machine. One thing is not known there: whether a restart of clanker-learn keeps what was installed in each sandbox outside its workspace and home folder. If it does not, recreating a project brings that back through its setup recipe (see [USING.md](USING.md)).
+**Privileged** (`CL_MODE=privileged`) is the fallback for a machine without sysbox, and the way that has been tested. It works with Docker alone. What it gives up: a privileged container is root-equivalent on the machine. Anything that gets out of a sandbox into clanker-learn's container can take the machine. What stands between a sandbox and the machine is an ordinary container boundary (the sandbox's own) and clanker-learn's guard rules (see [SECURITY.md](SECURITY.md)).
 
 The page says which of the two it runs in: Settings, under "How it runs". In privileged mode it also says what that means, and a quiet line, "privileged mode", at the bottom of the project list leads there.
 
-## Build the image
+To change the mode later, set `CL_MODE` in `.env` and run `docker compose up -d`: the container is made again, on the same volumes.
+
+## Set it up
 
 From a copy of this repository:
 
 ```
 git clone <the repository's address> clanker-learn
 cd clanker-learn
-docker build -t clanker-learn -f outer/Dockerfile .
+./setup
 ```
 
-The build takes a few minutes the first time and needs the internet.
+`./setup` writes `.env`, this machine's settings, from `.env.example`. It asks Docker whether it has sysbox's runtime (`sysbox-runc`) and sets `CL_MODE=sysbox` if it has, `CL_MODE=privileged` if not, and says which and why. It never overwrites an `.env` that exists: run again, it says the file is kept and which mode it holds, and warns when it holds sysbox while Docker has no sysbox runtime. `.env` is not part of the repository (git ignores it), so `git pull` leaves it alone.
 
 ## Start it
 
-Privileged:
+In the copy of the repository:
 
 ```
-docker run -d --name clanker-learn --stop-timeout 60 --privileged -e CL_MODE=privileged \
-    -p 127.0.0.1:7788:7788 -p 127.0.0.1:8080:8080 \
-    -p 127.0.0.1:11100-11164:11100-11164 -p 127.0.0.1:11200-11299:11200-11299 \
-    -v clanker-learn-docker:/var/lib/docker -v clanker-learn-data:/data \
-    clanker-learn
+docker compose up
 ```
 
-On sysbox:
+The first time, this builds the image (a few minutes, with the internet), then starts the container and shows its log, set-up code included. `Ctrl-C` stops it. To run it in the background instead:
 
 ```
-docker run -d --name clanker-learn --stop-timeout 60 --runtime=sysbox-runc -e CL_MODE=sysbox \
-    -p 127.0.0.1:7788:7788 -p 127.0.0.1:8080:8080 \
-    -p 127.0.0.1:11100-11164:11100-11164 -p 127.0.0.1:11200-11299:11200-11299 \
-    -v clanker-learn-docker:/var/lib/docker -v clanker-learn-data:/data \
-    clanker-learn
+docker compose up -d
 ```
 
-What the command gives it:
+What `compose.yaml` gives the container:
 
-- `-v clanker-learn-data:/data` keeps everything that is yours: projects, conversations, the password, settings. `-v clanker-learn-docker:/var/lib/docker` keeps the inner Docker's images and the sandboxes' containers. Both are named volumes, so they outlive the container.
-- `7788` is the page. `8080` is a small status answer (`state.json`) that says how the start is going. `11100-11164` are the ports the web-app tabs are served on, one port per tab. `11200-11299` are for raw TCP ports you name by hand in a project; these have no login in front of them.
+- Two named volumes: `clanker-learn-data`, mounted at `/data`, keeps everything that is yours: projects, conversations, the password, settings. `clanker-learn-docker`, mounted at `/var/lib/docker`, keeps the inner Docker's images and the sandboxes' containers. They outlive the container.
+- The ports: `7788` is the page. `8080` is a small status answer (`state.json`) that says how the start is going. `11100-11164` are the ports the web-app tabs are served on, one port per tab. `11200-11299` are for raw TCP ports you name by hand in a project; these have no login in front of them.
 - Every port is published on the machine's loopback address only (`127.0.0.1`), so the page can be reached from that machine and no other.
-- `--stop-timeout 60` gives clanker-learn time to stop the sandboxes cleanly when the container is stopped.
+- A minute to stop (`stop_grace_period`), so that clanker-learn can stop the sandboxes cleanly.
+- The restart policy `unless-stopped`: after a reboot of the machine, or a restart of Docker, it starts again by itself, unless you stopped it. The projects that were running come back by themselves.
+- Control groups of its own (`cgroup: private`), and its own processes, network and init.
 
-Leave out `--pid=host`, `--network=host`, `--cgroupns=host`, `--init`, another entrypoint and `--network=container:…`: with them clanker-learn would act on the machine's own processes, network or control groups, so it refuses to start (see "When it refuses to start", below).
+Do not add `pid: host`, `network_mode`, `init:` or another entrypoint to it: with them clanker-learn would act on the machine's own processes or network, so it refuses to start (see "When it refuses to start", below).
 
-The container does not start by itself when the machine boots. Start it again with `docker start clanker-learn`; the projects that were running come back by themselves.
+The container is called `clanker-learn`, so every `docker exec clanker-learn …` below works from anywhere on the machine. The `docker compose …` commands are run in the copy of the repository.
 
 ## The first start
 
@@ -86,8 +82,10 @@ curl -s http://127.0.0.1:8080/state.json
 `state` is `ready` once the container is up, and `broker` is `up` once the broker answers (if it ends, clanker-learn starts it again). `web` says `preparing: …`, then `up`; `tutor` the same. `sandbox_image` says `preparing: …`, then `ready`. `agents` (Claude Code) and `editor` say `pulling`, then `ready: <version>`. A step that failed says `down: <why>` or `failed: <why>`. The log says the same as it happens:
 
 ```
-docker logs clanker-learn
+docker compose logs
 ```
+
+(or `docker logs clanker-learn` from anywhere; add `-f` to either to follow it).
 
 ## The first password
 
@@ -96,7 +94,7 @@ Open `https://127.0.0.1:7788` in a browser on the same machine. The certificate 
 While no password is set, the page asks for a set-up code and a new password of at least 8 characters. The code is in the container's log:
 
 ```
-docker logs clanker-learn
+docker compose logs
 ```
 
 Look for the line `No password is set yet. The set-up code is …`. The code is new at every start and is good until the container stops or a password is set. Ten wrong codes within a minute shut it for a minute.
@@ -117,22 +115,20 @@ printf '%s' 'the new password' | docker exec -i clanker-learn cl passwd
 
 ## Settings
 
-Settings are given to the run command with `-e NAME=value`.
+The settings are in `.env`, in the copy of the repository; `compose.yaml` holds their defaults and `.env.example` lists them, each with its default. Change one in `.env` and run `docker compose up -d`: the container is made again with it, on the same volumes. A setting given in the shell's environment (`CL_WEB=off docker compose up -d`) wins over `.env`.
 
-- `CL_MODE`: `privileged` or `sysbox`. It has no default.
+- `CL_MODE`: `sysbox` (the default) or `privileged`; `./setup` sets it.
+- `CL_BIND`: the address every port is published on, `127.0.0.1` by default. To reach the page from another machine, give one specific address of this one (its LAN or tailnet address).
 - `CL_WEB`: `on` (the default) or `off`. Off, there is no page: no web server runs, no tutor service, no set-up code. Projects and the `cl` command work all the same.
 - `CL_WEB_PORT`: the page's port, `7788` by default.
 - `CL_ORIGIN_PORTS`: the web-app tabs' ports, `11100-11164` by default (65 tabs at once).
 - `CL_PASSTHROUGH_PORTS`: the raw TCP ports, `11200-11299` by default.
 - `CL_STATUS_PORT`: the status answer's port, `8080` by default.
+- `CL_DATA_VOLUME`, `CL_DOCKER_VOLUME`: the names of the two volumes, `clanker-learn-data` and `clanker-learn-docker` by default.
 
-Publish each port on the same number outside as inside: the page builds the tabs' addresses from these numbers. For example, the page on 8443:
+Each port is published on the same number outside the container as inside, from the one setting (the page builds the tabs' addresses from these numbers). For example, the page on 8443 is the line `CL_WEB_PORT=8443` in `.env`.
 
-```
--e CL_WEB_PORT=8443 -p 127.0.0.1:8443:8443
-```
-
-The ports are numbers from 1024 to 65535, and none may overlap another. A wrong web setting leaves the rest working: `state.json` says `web: down` with the reason. A wrong `CL_STATUS_PORT` refuses the start; the status answer is then on 8080 and says why.
+The ports are numbers from 1024 to 65535, and none may overlap another. A wrong web setting leaves the rest working: `state.json` says `web: down` with the reason. A `CL_STATUS_PORT` that is not a port number stops `docker compose up` before the container exists (`invalid containerPort: …`).
 
 ## Where everything is kept
 
@@ -223,60 +219,85 @@ An update is a new image on the same volumes. Make a backup first. Then, in your
 
 ```
 git pull
-docker build -t clanker-learn -f outer/Dockerfile .
-docker stop clanker-learn
-docker rm clanker-learn
+docker compose up -d
 ```
 
-and run the same `docker run` command as before. Your projects, conversations, password and settings are on the volumes and stay.
+`docker compose up` builds the image again and, when it changed, makes the container again from it. Your projects, conversations, password and settings are on the volumes and in `.env`, and stay. The same goes for a change you make to the code yourself: `docker compose up -d` rebuilds and makes the container again; with nothing changed, the build is cached and the running container is left alone.
 
 At the first start after an update, the images of the web server, the tutor service and the sandboxes are built again if their definition changed, and the web server's and the tutor service's containers are made again. The tutor's database is brought up to date by the tutor service. The fetched Claude Code, pi and editor stay; if the new version of the repository names newer versions, Settings, Software, says so, and Pull fetches them. Existing projects keep their containers until you recreate them: Recreate gives a project a container from the new sandbox image, keeps its workspace and home folder, and runs its setup recipe. Something a newer sandbox image makes possible (pi, for a project made before it) is refused in a project made before it, with the sentence that the project must be recreated first.
 
+A setting added to `.env.example` by an update is not added to an `.env` that exists: its default in `compose.yaml` applies until you set it.
+
+## Moving an install made with `docker run`
+
+An earlier version of these instructions started clanker-learn with `docker build` and `docker run`. To move such an install to Compose, remove its container (the volumes stay), then set up and start as above:
+
+```
+docker rm -f clanker-learn
+./setup
+docker compose up -d
+```
+
+The volumes keep their names, `clanker-learn-data` and `clanker-learn-docker`, so the new container finds every project, conversation and the password. At each `docker compose up`, Compose warns that each volume "already exists but was not created by Docker Compose"; that is expected, and it uses them all the same. If the old install ran privileged on a machine that has sysbox, `./setup` now chooses sysbox; set `CL_MODE=privileged` in `.env` to keep the old mode.
+
 ## Stopping and uninstalling
 
+In the copy of the repository:
+
 ```
-docker stop clanker-learn
-docker start clanker-learn
+docker compose stop
+docker compose start
 ```
 
-Stopping stops every sandbox first. Starting brings back the projects that were running.
+Stopping stops every sandbox first. Starting brings back the projects that were running. A stopped clanker-learn stays stopped after a reboot, until you start it.
+
+```
+docker compose down
+```
+
+removes the container (and the network Compose made for it) and keeps the volumes; `docker compose up -d` makes it again, with everything that was there.
 
 To uninstall, copy out any backup you want to keep, then remove the container, the two volumes and the image:
 
 ```
-docker rm -f clanker-learn
-docker volume rm clanker-learn-docker clanker-learn-data
-docker image rm clanker-learn
+docker compose down -v --rmi local
 ```
 
-Removing the volumes removes every project, conversation and backup for good.
+**`-v` removes the volumes, and with them every project, conversation and backup, for good.**
+
+An install moved from `docker run` (above) has volumes Compose did not make, and `-v` leaves them (`Volume … Skipped Volume was not created by Docker Compose`). Remove them by name: `docker volume rm clanker-learn-data clanker-learn-docker`.
 
 ## When it refuses to start
+
+Two faults stop it before the container exists, and Compose says so itself:
+
+- **`unknown or invalid runtime name: sysbox-runc`** (Docker's own words, at `docker compose up`): `.env` says `CL_MODE=sysbox` but Docker has no sysbox runtime. Install sysbox, or set `CL_MODE=privileged` in `.env`. A container that was already running is left as it was.
+- **`open …/modes/<value>.yaml: no such file or directory`**: `CL_MODE` is neither `sysbox` nor `privileged`. Correct it in `.env` (or in the shell's environment, which wins over `.env`).
 
 At every start clanker-learn checks that it has a container of its own, applies its guard rules, starts its Docker daemon, checks the rules again and runs a self-test container. If any of that fails, it ends everything it started, so that nothing runs without the rules, and stays in the state `refused` with the reason. The reason is in the log and in the status answer:
 
 ```
-docker logs clanker-learn
+docker compose logs
 curl -s http://127.0.0.1:8080/
 ```
 
 The refusals and what to do:
 
-- **`CL_MODE is not set`** (or is something else): add `-e CL_MODE=privileged` with `--privileged`, or `-e CL_MODE=sysbox` with `--runtime=sysbox-runc`.
-- **`This container runs neither on sysbox nor privileged`**: the container cannot run a Docker daemon. Add `--privileged`, or `--runtime=sysbox-runc`.
-- **`CL_MODE=sysbox was declared, but this container is not in a user namespace`**: the run command said sysbox but did not use it. Add `--runtime=sysbox-runc`, or run privileged.
-- **`This container does not have its own process namespace and init`**: it was started with `--pid=host`, `--init` or another entrypoint. Leave them out. Nothing was started.
-- **`This container's network already holds a Docker daemon's networks`**: it was started with `--network=host`, or on the network of another container. Leave that out. Nothing was started and the status port was not opened (it would have been someone else's), so only the log says why. This is told by the machine's Docker bridges (`docker0`, `br-…`): on a machine whose Docker has none, `--network=host` goes unnoticed.
-- **`This container does not have its own control groups`**: it was started with `--cgroupns=host`, which is also Docker's default on a machine with cgroup v1. Add `--cgroupns=private`.
-- **`CL_STATUS_PORT is …`**: give a port number from 1 to 65535.
+- **`CL_MODE is not set`** (or is something else): the container was not started with this repository's `compose.yaml`. Set `CL_MODE=sysbox` or `CL_MODE=privileged` in `.env` (`./setup` writes it) and start it with `docker compose up -d`.
+- **`This container runs neither on sysbox nor privileged`**: the container cannot run a Docker daemon; it was started without the mode files in `modes/`. Start it with `docker compose up -d`.
+- **`CL_MODE=sysbox was declared, but this container is not in a user namespace`**: it said sysbox but did not run on it. Start it with `docker compose up -d`, which runs it on `sysbox-runc`, or set `CL_MODE=privileged` in `.env`.
+- **`This container does not have its own process namespace and init`**: it was started with `pid: host`, `init:` or another entrypoint. Take them out of `compose.yaml`. Nothing was started.
+- **`This container's network already holds a Docker daemon's networks`**: it was started with `network_mode: host`, or on the network of another container. Take that out of `compose.yaml`. Nothing was started and the status port was not opened (it would have been someone else's), so only the log says why. This is told by the machine's Docker bridges (`docker0`, `br-…`): on a machine whose Docker has none, a host network goes unnoticed.
+- **`This container does not have its own control groups`**: it was started without `cgroup: private`, which `compose.yaml` sets (without it, Docker's default on a machine with cgroup v1 is the machine's). Put it back.
+- **`CL_STATUS_PORT is …`**: give a port number from 1 to 65535 (Compose itself stops most wrong values first).
 - **`The guard rules that fence the sandboxes could not be applied`** (or `are not in place after applying them`): the reason in brackets says what failed. Nothing was started.
 - **`The inner Docker daemon did not start`**, **`was not ready after 90 seconds`**, **`could not run a container`**: the log holds the daemon's last lines, which say why.
-- While it runs, **`The guard rules … were lost and could not be restored`** or **`The inner Docker daemon stopped`**: every sandbox was stopped. Restart clanker-learn.
+- While it runs, **`The guard rules … were lost and could not be restored`** or **`The inner Docker daemon stopped`**: every sandbox was stopped. Restart clanker-learn with `docker compose restart`.
 
-A refused container stays refused until it is stopped. Once the cause is fixed, remove it and run the command again (the volumes stay):
+A refused container stays refused until it is stopped. Once the cause is fixed, make it again (the volumes stay):
 
 ```
-docker rm -f clanker-learn
+docker compose up -d --force-recreate
 ```
 
-A wrong web setting is not a refusal: projects and the `cl` command work, and `state.json` says `web: down` with the reason. Fix the setting, remove the container and run it again.
+A wrong web setting is not a refusal: projects and the `cl` command work, and `state.json` says `web: down` with the reason. Fix the setting in `.env` and run `docker compose up -d`.
