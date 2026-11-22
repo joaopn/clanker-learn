@@ -1362,9 +1362,10 @@ async def _tutor_body(request: web.Request) -> dict | None | web.Response:
 
 async def tutor_project_lessons_handler(request: web.Request) -> web.Response:
     """GET|POST /broker/tutor/project/{name}/lessons — a project's lessons, and a new one
-    ({title}). The project is named upstream by the name and the creation time of the
-    broker's `status`, never by what the browser sends; an unknown project is the broker's
-    refusal, answered as the project routes answer it."""
+    ({title, objective}); GET /broker/tutor/project/{name}/plan — its plan. The project is
+    named upstream by the name and the creation time of the broker's `status`, never by what
+    the browser sends; an unknown project is the broker's refusal, answered as the project
+    routes answer it."""
     refused = await _tutor_gate(request)
     if refused is not None:
         return refused
@@ -1381,8 +1382,9 @@ async def tutor_project_lessons_handler(request: web.Request) -> web.Response:
     if not isinstance(project, str) or not isinstance(created, str):
         return web.json_response({"ok": False, "error": {"kind": "failed"}}, status=500)
     if request.method == "GET":
-        return await _tutor_call("GET", "/lessons", query={"project": project, "created": created})
-    return await _tutor_call("POST", "/lessons", body={**{k: body[k] for k in ("title",) if k in body},
+        what = "/plan" if request.path.endswith("/plan") else "/lessons"
+        return await _tutor_call("GET", what, query={"project": project, "created": created})
+    return await _tutor_call("POST", "/lessons", body={**{k: body[k] for k in ("title", "objective") if k in body},
                                                         "project": project, "created": created})
 
 
@@ -1969,6 +1971,15 @@ def build_app() -> web.Application:
     settings = _tutor_route("/settings")
     app.router.add_get("/broker/tutor/settings", settings)
     app.router.add_put("/broker/tutor/settings", settings)
+    # Plans: a project's plan, a proposal and the learner's decision on it; the tutor's instructions.
+    app.router.add_get("/broker/tutor/project/{name}/plan", tutor_project_lessons_handler)
+    app.router.add_get("/broker/tutor/proposals/{id}", _tutor_route("/proposals/{id}"))
+    app.router.add_post("/broker/tutor/proposals/{id}/approve", _tutor_route("/proposals/{id}/approve"))
+    app.router.add_post("/broker/tutor/proposals/{id}/dismiss", _tutor_route("/proposals/{id}/dismiss"))
+    instructions = _tutor_route("/instructions")
+    app.router.add_get("/broker/tutor/instructions", instructions)
+    app.router.add_put("/broker/tutor/instructions", instructions)
+    app.router.add_post("/broker/tutor/instructions/reset", _tutor_route("/instructions/reset"))
     return app
 
 
