@@ -1747,7 +1747,7 @@ _HOST_PORT = re.compile(r"[0-9]{1,5}")
 # The page's content-security header, but for the two directives that name the host. Styles
 # may be inline because xterm's renderer writes <style> elements into the terminal (its
 # colours, its font, the cell grid); with style-src 'self' alone the browser refuses them.
-PAGE_SOURCES = ("default-src 'none'", "script-src 'self'", "style-src 'self' 'unsafe-inline'", "img-src 'self'")
+PAGE_SOURCES = ("default-src 'none'", "script-src 'self'", "style-src 'self' 'unsafe-inline'")
 PAGE_REFUSES = ("object-src 'none'", "base-uri 'none'", "form-action 'none'", "frame-ancestors 'none'")
 
 
@@ -1785,20 +1785,23 @@ def browser_host(header: str | None) -> tuple[str, str] | None:
 def content_security_policy(host_header: str | None) -> str:
     """The page's content-security header for the host the browser used: its own scripts,
     styles and images only, nothing inline but styles (RS allows them too), fetches and the
-    terminal's WebSocket to itself, frames from any port of that host (the web-app tabs) and
-    from nowhere when the Host header is not a plain host. No form is ever sent by the browser
+    terminal's WebSocket to itself, frames and images from any port of that host (the web-app
+    tabs; a lesson's pages and pictures, from the project's files server on its own origin
+    port) and from nowhere when the Host header is not a plain host. No form is ever sent by the browser
     itself (form-action 'none'): the page's forms are read by its script, so a password never
     lands in an address even if the script did not load."""
     found = browser_host(host_header)
+    images = "img-src 'self'"
     if found is None:
         frames, sockets = "frame-src 'none'", "connect-src 'self'"
     else:
         host, port = found
         frames = f"frame-src https://{host}:*"
+        images = f"img-src 'self' https://{host}:*"
         # 'self' admits wss: to the same host and port in browsers that follow CSP 3; the
         # address is also named, for those that do not.
         sockets = f"connect-src 'self' wss://{host}{':' + port if port else ''}"
-    return "; ".join((*PAGE_SOURCES, sockets, frames, *PAGE_REFUSES))
+    return "; ".join((*PAGE_SOURCES, images, sockets, frames, *PAGE_REFUSES))
 
 
 async def index_handler(request: web.Request) -> web.StreamResponse:

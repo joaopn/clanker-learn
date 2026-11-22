@@ -813,7 +813,8 @@ THE_PAGES_OWN = {
 def test_security_the_page_runs_its_own_scripts_only_and_frames_only_the_host_the_browser_used(fake, host, frames, sockets):
     # No inline script, no eval, nothing from another origin; fetches and the terminal to itself;
     # frames from any port of that host (the web-app tabs) and nowhere else.
-    assert directives(page_policy(host)) == {**THE_PAGES_OWN, "connect-src": ["'self'", sockets], "frame-src": [frames]}
+    assert directives(page_policy(host)) == {**THE_PAGES_OWN, "connect-src": ["'self'", sockets], "frame-src": [frames],
+                                             "img-src": ["'self'", frames]}
 
 
 @pytest.mark.parametrize("host, frames, sockets", [
@@ -821,7 +822,8 @@ def test_security_the_page_runs_its_own_scripts_only_and_frames_only_the_host_th
     ("[2001:db8::7]", "https://[2001:db8::7]:*", "wss://[2001:db8::7]"),
 ])
 def test_security_an_ipv6_host_is_framed_in_brackets(fake, host, frames, sockets):
-    assert directives(page_policy(host)) == {**THE_PAGES_OWN, "connect-src": ["'self'", sockets], "frame-src": [frames]}
+    assert directives(page_policy(host)) == {**THE_PAGES_OWN, "connect-src": ["'self'", sockets], "frame-src": [frames],
+                                             "img-src": ["'self'", frames]}
 
 
 HOSTILE_HOSTS = [

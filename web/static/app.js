@@ -177,6 +177,8 @@ const S = {
     tutorError: null,      // why the tutor service could not be asked, or null
     tutorSettings: null,   // Settings -> Tutor: {claude_token_set}, as last read
     tutorSettingsError: null,
+    filesOrigins: new Map(), // project -> the promise of its files server's address (what a lesson shows)
+    editorFile: {},        // project -> {path, line}: the file its Editor is to open next
 };
 
 const tabOf = (project) => S.tabs[project] || "shell";
@@ -369,7 +371,7 @@ function teardownApp() {
     Object.assign(S, { loggedIn: false, projects: [], ops: [], current: null, creating: null, tabs: {}, services: {}, panes: {}, shell: null, listError: null,
                        page: null, software: null, softwareError: null, builds: {}, checking: new Set(), models: null,
                        expanded: new Set(), lessons: {}, lessonOf: {}, activity: new Set(), tutorError: null,
-                       tutorSettings: null, tutorSettingsError: null });
+                       tutorSettings: null, tutorSettingsError: null, filesOrigins: new Map(), editorFile: {} });
 }
 
 async function refreshProjects() {
@@ -409,6 +411,7 @@ async function refreshServices(name) {
     const r = await api("GET", projectPath(name, "/services"));
     if (!S.loggedIn || !r.body.ok || typeof r.body.services !== "object") return;
     S.services[name] = r.body.services;
+    markFileLinks(name);
     if (name === S.current) render();
 }
 
@@ -776,7 +779,11 @@ function makeWebPane(name, id, row) {
     const link = h("a", { class: "newtab", target: "_blank", rel: "noopener noreferrer", hidden: true }, "open in a new tab ↗");
     const reload = h("button", { hidden: true, title: "Load the frame again" }, "Reload");
     const retry = h("button", { hidden: true }, "Try again");
-    const bar = h("div", { class: "appbar" }, h("span", { class: "applabel" }, label), said, link, reload, retry);
+    // The file a lesson's link asked the Editor to open, with a copy of its path.
+    const fileWhere = h("code", {});
+    const fileNote = h("span", { class: "filenote", hidden: true }, "file ", fileWhere,
+        h("button", { class: "small", title: "Copy the path", onclick: () => { if (navigator.clipboard) navigator.clipboard.writeText(fileWhere.textContent).catch(() => {}); } }, "copy"));
+    const bar = h("div", { class: "appbar" }, h("span", { class: "applabel" }, label), said, fileNote, link, reload, retry);
     const goneNote = h("div", { class: "gone-note", hidden: true },
         h("span", {}, "This app no longer listens in the sandbox. Its frame is kept until you close it."),
         h("button", { onclick: () => { dropPane(paneKey(name, id)); S.tabs[name] = "shell"; render(); } }, "Close the tab"));
@@ -784,6 +791,14 @@ function makeWebPane(name, id, row) {
         h("div", { class: "frame-hint" }, "If the frame stays empty, the browser has not accepted this address's certificate yet: open it in a new tab once, accept it there, then reload the frame."));
     const el = h("div", { class: "pane web-pane" }, bar, goneNote, body);
     const pane = { kind: "web", el, label, url: null, iframe: null };
+    const takeFile = () => {
+        const file = id === "editor" ? S.editorFile[name] : null;
+        if (!file) return null;
+        delete S.editorFile[name];
+        fileWhere.textContent = `/workspace/${file.path}${file.line ? `:${file.line}` : ""}`;
+        fileNote.hidden = false;
+        return file;
+    };
 
     async function open() {
         retry.hidden = true;
@@ -802,14 +817,7 @@ function makeWebPane(name, id, row) {
         link.hidden = false;
         reload.hidden = false;
         said.textContent = `port ${row.default_port} of the sandbox, at ${pane.url}`;
-        // RS's frame: the least the apps need (code-server: scripts, its own origin for
-        // cookies, forms, popups, modals, downloads), no top navigation.
-        pane.iframe = h("iframe", {
-            src: pane.url,
-            title: label,
-            sandbox: "allow-scripts allow-same-origin allow-forms allow-popups allow-popups-to-escape-sandbox allow-modals allow-downloads",
-            allow: "fullscreen; clipboard-read; clipboard-write",
-        });
+        pane.iframe = h("iframe", { src: editorAddress(pane.url, takeFile()), title: label, sandbox: WEB_FRAME_SANDBOX, allow: WEB_FRAME_ALLOW });
         body.append(pane.iframe);
         renderTabbar();
     }
@@ -817,6 +825,8 @@ function makeWebPane(name, id, row) {
     retry.addEventListener("click", open);
     pane.update = () => { goneNote.hidden = !!(S.services[name] || {})[id]; };
     pane.close = () => { if (pane.iframe) pane.iframe.remove(); pane.iframe = null; };
+    // Opened again at the file (the editor reloads); a frame still opening takes it when it opens.
+    pane.openFile = () => { if (pane.iframe) { const file = takeFile(); if (file) pane.iframe.src = editorAddress(pane.url, file); } };
     open();
     return pane;
 }
@@ -1115,6 +1125,12 @@ function contextFooter(usage) {
 // is not safe; an image is never fetched and becomes a link to its address; a fenced block is
 // plain text in a <pre>; a single newline is a line break; a wide table scrolls in its
 // message. Only the elements named below are ever made, and only text goes into them.
+// Departures, for what a conversation shows (the next section): a `mermaid`, `vega-lite` or
+// `page` block, a picture and a link whose address is a relative path in the workspace.
+//
+// ctx: {project, blocks, draft}. `blocks` keeps the elements of diagrams, plots, pictures and
+// pages across the redraws of one answer (it is redrawn at each frame while it is written);
+// `draft`: the answer is still being written, so a block not closed yet stays code.
 
 const MD = window.markdownit ? window.markdownit({ html: false, linkify: true, breaks: true, typographer: false }) : null;
 const MD_BLOCK_TAGS = new Set(["p", "h1", "h2", "h3", "h4", "h5", "h6", "ul", "ol", "li", "blockquote", "table", "thead", "tbody", "tr", "th", "td"]);
@@ -1126,15 +1142,16 @@ function safeHref(href) {
     return u.protocol === "http:" || u.protocol === "https:" || u.protocol === "mailto:" ? u.href : null;
 }
 
-function mdRender(text) {
+function mdRender(text, ctx) {
     const frag = document.createDocumentFragment();
     if (!MD) { frag.append(h("p", { class: "plain-text" }, text)); return frag; }
     let tokens;
     try { tokens = MD.parse(String(text), {}); } catch (_) { frag.append(h("p", { class: "plain-text" }, text)); return frag; }
+    ctx = ctx ? { ...ctx, used: new Map(), lines: ctx.draft ? String(text).split("\n") : null } : null;
     const stack = [frag];
     const top = () => stack[stack.length - 1];
     for (const t of tokens) {
-        if (t.type === "inline") { mdInline(top(), t.children || []); continue; }
+        if (t.type === "inline") { mdInline(top(), t.children || [], ctx); continue; }
         if (t.nesting === 1) {
             if (t.hidden) { stack.push(top()); continue; }   // a tight list's paragraph: its text goes in the item
             const tag = MD_BLOCK_TAGS.has(t.tag) ? t.tag : "div";
@@ -1153,7 +1170,7 @@ function mdRender(text) {
         } else if (t.nesting === -1) {
             if (stack.length > 1) stack.pop();
         } else if (t.type === "fence" || t.type === "code_block") {
-            top().append(h("pre", { class: "md-pre" }, t.content.replace(/\n$/, "")));
+            top().append(fenceEl(t, ctx));
         } else if (t.type === "hr") {
             top().append(document.createElement("hr"));
         } else if (t.content) {
@@ -1163,7 +1180,7 @@ function mdRender(text) {
     return frag;
 }
 
-function mdInline(parent, children) {
+function mdInline(parent, children, ctx) {
     const stack = [parent];
     const top = () => stack[stack.length - 1];
     let inLink = 0;
@@ -1179,8 +1196,12 @@ function mdInline(parent, children) {
                 break;
             }
             case "link_open": {
-                const href = safeHref(t.attrGet("href"));
-                const el = href ? h("a", { href, target: "_blank", rel: "noopener noreferrer" }) : h("span", { class: "md-nolink" });
+                const raw = t.attrGet("href");
+                const href = safeHref(raw);
+                // Not a safe address: a file of the workspace (opened in the Editor), or the words only.
+                const file = !href && ctx && ctx.project ? workspaceTarget(raw, true) : null;
+                const el = href ? h("a", { href, target: "_blank", rel: "noopener noreferrer" })
+                    : file ? fileLinkEl(ctx.project, file) : h("span", { class: "md-nolink" });
                 top().append(el);
                 stack.push(el);
                 inLink++;
@@ -1191,7 +1212,13 @@ function mdInline(parent, children) {
                 if (stack.length > 1) stack.pop();
                 break;
             case "image": {
-                // Never fetched: a link to it, its alt text as the words (inside a link, the words only).
+                // A relative path in the workspace: the picture, from the project's files server.
+                const file = ctx && ctx.project && !inLink ? workspaceTarget(t.attrGet("src"), false) : null;
+                if (file) {
+                    top().append(kept(ctx, `img\n${file.path}\n${t.content}`, () => pictureEl(ctx.project, file, t.content)));
+                    break;
+                }
+                // Anything else is never fetched: a link to it, its alt text as the words (inside a link, the words only).
                 const label = t.content || t.attrGet("src") || "image";
                 const href = safeHref(t.attrGet("src"));
                 top().append(href && !inLink ? h("a", { href, target: "_blank", rel: "noopener noreferrer", class: "md-img", title: "An image, not shown here: open it in a new tab" }, `image: ${label}`)
@@ -1202,6 +1229,382 @@ function mdInline(parent, children) {
                 if (t.content) top().append(t.content);   // html_inline cannot occur; anything else as text
         }
     }
+}
+
+// ---- what a conversation shows: diagrams, plots, pictures, pages, files to read --------------
+//
+// What the tutor writes is data shown on this origin, never code run on it (a sandbox whose
+// content steers its tutor decides what the tutor writes):
+// - a `mermaid` block is drawn by Mermaid at its strict level, without HTML labels, and the
+//   picture it makes is copied here element by element from an allow-list: no script, no
+//   handler, no link, no foreign content, no address but the picture's own `#` references;
+// - a `vega-lite` block is drawn by Vega with its expression interpreter (no code generated at
+//   run time) and a loader that refuses every address: only the data inside the specification;
+// - a picture `![alt](path)` and a `page` block name a file of the workspace by a relative path,
+//   fetched from the project's files server on the project's own origin port (a page is framed
+//   there as a web-app tab is): never from this origin, never from an address the tutor wrote;
+// - a link to a relative path opens that file in the project's Editor.
+// The libraries are loaded the first time a conversation needs one, not with the page.
+
+const FILES_PORT = 7070;   // sandbox/files_server.py
+// RS's frame for a sandbox's web app (the web-app tabs and a lesson's pages): what the apps
+// need (code-server: scripts, its own origin for cookies, forms, popups, modals, downloads),
+// no top navigation.
+const WEB_FRAME_SANDBOX = "allow-scripts allow-same-origin allow-forms allow-popups allow-popups-to-escape-sandbox allow-modals allow-downloads";
+const WEB_FRAME_ALLOW = "fullscreen; clipboard-read; clipboard-write";
+
+const vendorLoads = new Map();
+function loadScript(file) {
+    if (!vendorLoads.has(file)) {
+        vendorLoads.set(file, new Promise((resolve, reject) => {
+            const s = document.createElement("script");
+            s.src = `/static/vendor/${file}`;
+            s.async = false;
+            s.onload = () => resolve();
+            s.onerror = () => { vendorLoads.delete(file); s.remove(); reject(new Error(`${file} could not be loaded`)); };
+            document.head.append(s);
+        }));
+    }
+    return vendorLoads.get(file);
+}
+async function loadScripts(...files) { for (const f of files) await loadScript(f); }
+
+const firstLine = (e) => String((e && e.message) || e || "unknown error").split("\n").find((l) => l.trim()) || "unknown error";
+
+// A relative path inside the workspace as the tutor wrote it: {path, line} (line from "#L<n>"
+// when withLine), or null. Refused: a scheme, a host, a leading "/" or "\", an empty segment
+// ("//"), a ".." that leaves the workspace, a query, control characters.
+function workspaceTarget(raw, withLine) {
+    if (typeof raw !== "string" || !raw || raw.length > 1024) return null;
+    let path = raw, line = null;
+    const hash = raw.indexOf("#");
+    if (hash >= 0) {
+        const m = withLine ? /^L(\d{1,7})(?:-L?\d{1,7})?$/.exec(raw.slice(hash + 1)) : null;
+        if (!m) return null;
+        line = Number(m[1]) || null;
+        path = raw.slice(0, hash);
+    }
+    if (/^[A-Za-z][A-Za-z0-9+.-]*:/.test(path) || /^[/\\]/.test(path) || /[\\?]/.test(path)) return null;
+    let decoded;
+    try { decoded = decodeURIComponent(path); } catch (_) { return null; }
+    if (/[\x00-\x1f\x7f\\?#]/.test(decoded) || decoded.startsWith("/")) return null;
+    const out = [];
+    for (const seg of decoded.split("/")) {
+        if (seg === "") return null;
+        if (seg === ".") continue;
+        if (seg === "..") { if (!out.length) return null; out.pop(); continue; }
+        out.push(seg);
+    }
+    return out.length ? { path: out.join("/"), line } : null;
+}
+
+// The project's files server at its own origin port, as an address ending in "/": asked once
+// per project (the project's session minted first, as a web tab does), asked again after a
+// failure; null when the project does not run.
+function filesBase(name) {
+    if (!isRunning(name)) return Promise.resolve(null);
+    if (!S.filesOrigins.has(name)) {
+        const asked = (async () => {
+            const session = await api("POST", projectPath(name, "/session"));
+            if (!session.body.ok) throw new Error(errText(session.body));
+            const origin = await api("POST", projectPath(name, "/origin"), { port: FILES_PORT });
+            if (!origin.body.ok) throw new Error(errText(origin.body));
+            const port = origin.body.origin_port;
+            if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error("the web server named no address for the files");
+            return appUrl(port);
+        })();
+        S.filesOrigins.set(name, asked);
+        asked.catch(() => { if (S.filesOrigins.get(name) === asked) S.filesOrigins.delete(name); });
+    }
+    return S.filesOrigins.get(name);
+}
+const filesUrl = (base, path) => base + path.split("/").map(enc).join("/");
+
+// The element of a diagram, plot, picture or page, made once per answer: kept in ctx.blocks
+// under its kind and source, the n-th of the same in one answer as its own.
+function kept(ctx, key, make) {
+    if (!ctx || !ctx.blocks) return make();
+    const n = ctx.used.get(key) || 0;
+    ctx.used.set(key, n + 1);
+    if (!ctx.blocks.has(key)) ctx.blocks.set(key, []);
+    const list = ctx.blocks.get(key);
+    if (!list[n]) list[n] = make();
+    return list[n];
+}
+
+// A fenced block whose closing line has been written (while an answer is being written, the
+// last block may not be closed yet).
+function fenceClosed(t, lines) {
+    if (!lines || !t.map) return true;
+    const [start, end] = t.map;
+    if (end - 1 <= start) return false;
+    const m = /^\s*([`~]{3,})\s*$/.exec(lines[end - 1] || "");
+    return !!m && m[1][0] === t.markup[0] && m[1].length >= t.markup.length;
+}
+
+const codeEl = (src) => h("pre", { class: "md-pre" }, src.replace(/\n$/, ""));
+const notShown = (src, why) => h("div", { class: "md-failed" }, codeEl(src), h("div", { class: "md-why" }, why));
+
+function fenceEl(t, ctx) {
+    const src = t.content;
+    const lang = t.type === "fence" ? (t.info || "").trim().split(/\s+/)[0].toLowerCase() : "";
+    if (!ctx || !ctx.project || !["mermaid", "vega-lite", "page"].includes(lang)) return codeEl(src);
+    if (ctx.draft && !fenceClosed(t, ctx.lines)) return codeEl(src);
+    const make = lang === "mermaid" ? () => diagramEl(src) : lang === "vega-lite" ? () => plotEl(src) : () => pageEl(ctx.project, src);
+    return kept(ctx, `${lang}\n${src}`, make);
+}
+
+// ---- diagrams: Mermaid at its strict level
+
+const MERMAID_SECURE = ["secure", "securityLevel", "startOnLoad", "maxTextSize", "suppressErrorRendering", "maxEdges",
+                        "htmlLabels", "flowchart", "dompurifyConfig", "themeCSS", "theme"];   // what a diagram's own directive may not change
+let mermaidReady = null;
+let mermaidQueue = Promise.resolve();
+let mermaidSeq = 0;
+
+function mermaidLib() {
+    if (!mermaidReady) {
+        mermaidReady = loadScripts("mermaid.min.js").then(() => {
+            const m = window.mermaid;
+            if (!m || typeof m.render !== "function") throw new Error("Mermaid did not load");
+            m.initialize({ startOnLoad: false, securityLevel: "strict", htmlLabels: false, flowchart: { htmlLabels: false },
+                           theme: "dark", suppressErrorRendering: true, maxTextSize: 50000, secure: MERMAID_SECURE });
+            return m;
+        });
+        mermaidReady.catch(() => { mermaidReady = null; });
+    }
+    return mermaidReady;
+}
+
+function diagramEl(src) {
+    const box = h("div", { class: "md-diagram" }, codeEl(src), h("div", { class: "md-why" }, "Drawing the diagram…"));
+    // One at a time: Mermaid draws in a scratch element of the document.
+    mermaidQueue = mermaidQueue.then(async () => {
+        const id = `cl-mermaid-${++mermaidSeq}`;
+        try {
+            const m = await mermaidLib();
+            const { svg } = await m.render(id, src);
+            const pic = cleanSvg(svg);
+            if (!pic) throw new Error("it made no picture");
+            box.replaceChildren(pic);
+        } catch (e) {
+            for (const left of [document.getElementById(`d${id}`), document.getElementById(id)]) if (left) left.remove();
+            box.replaceChildren(notShown(src, `This diagram could not be drawn: ${firstLine(e)}`));
+        }
+    });
+    return box;
+}
+
+const SVG_NS = "http://www.w3.org/2000/svg";
+const XLINK_NS = "http://www.w3.org/1999/xlink";
+const SVG_KEEP = new Set(["svg", "g", "path", "rect", "circle", "ellipse", "line", "polyline", "polygon", "text", "tspan", "defs", "marker",
+    "style", "title", "desc", "clipPath", "linearGradient", "radialGradient", "stop", "pattern", "mask", "symbol", "use", "filter",
+    "feDropShadow", "feGaussianBlur", "feOffset", "feFlood", "feComposite", "feMerge", "feMergeNode", "feBlend", "feColorMatrix", "feMorphology"]);
+// CSS that could make the browser fetch something: any url() but a "#" reference, @import,
+// image-set(), and escapes (which could spell either).
+const cssFetches = (css) => /url\s*\(|@import|image-set\s*\(|\\/i.test(css.replace(/url\(\s*(['"]?)#[\w:.-]*\1\s*\)/g, ""));
+
+// Mermaid's picture, rebuilt from an inert parse: only the elements above, no on* attribute,
+// href only to "#", no attribute or style that names an address. null when there is no <svg>.
+function cleanSvg(markup) {
+    const doc = new DOMParser().parseFromString(String(markup), "text/html");   // inert: nothing in it runs or loads
+    const root = doc.querySelector("svg");
+    if (!root) return null;
+    const copy = (src) => {
+        if (src.nodeType === Node.TEXT_NODE) return document.createTextNode(src.data);
+        if (src.nodeType !== Node.ELEMENT_NODE || src.namespaceURI !== SVG_NS) return null;
+        if (src.localName === "a") {   // a link: its content without the link
+            const frag = document.createDocumentFragment();
+            for (const c of src.childNodes) { const k = copy(c); if (k) frag.append(k); }
+            return frag;
+        }
+        if (!SVG_KEEP.has(src.localName)) return null;
+        const el = document.createElementNS(SVG_NS, src.localName);
+        if (src.localName === "style") {
+            if (cssFetches(src.textContent)) return null;
+            el.textContent = src.textContent;
+            return el;
+        }
+        for (const a of src.attributes) {
+            const n = a.name.toLowerCase();
+            if (n.startsWith("on") || n.startsWith("xmlns") || cssFetches(a.value)) continue;
+            if (n === "href" || n === "xlink:href") {
+                if (a.value.startsWith("#")) el.setAttributeNS(n === "href" ? null : XLINK_NS, n, a.value);
+                continue;
+            }
+            try { el.setAttribute(a.name, a.value); } catch (_) { /* a name the DOM refuses: left out */ }
+        }
+        for (const c of src.childNodes) { const k = copy(c); if (k) el.append(k); }
+        return el;
+    };
+    return copy(root);
+}
+
+// ---- plots: Vega-Lite, the data inside the specification only
+
+const PLOT_CONFIG = {   // for the page's dark background; a specification's own config wins
+    background: "transparent",
+    view: { stroke: "#555" },
+    axis: { labelColor: "#bbb", titleColor: "#ddd", gridColor: "#3a3a3a", domainColor: "#777", tickColor: "#777" },
+    legend: { labelColor: "#bbb", titleColor: "#ddd" },
+    header: { labelColor: "#bbb", titleColor: "#ddd" },
+    title: { color: "#e0e0e0", subtitleColor: "#aaa" },
+};
+let vegaReady = null;
+
+function vegaLib() {
+    if (!vegaReady) {
+        vegaReady = loadScripts("vega.min.js", "vega-lite.min.js", "vega-interpreter.js").then(() => {
+            const { vega, vegaLite, vegaInterpreter } = window;
+            if (!vega || !vegaLite || !vegaInterpreter) throw new Error("Vega did not load");
+            return { vega, vegaLite, interpreter: vegaInterpreter.expressionInterpreter };
+        });
+        vegaReady.catch(() => { vegaReady = null; });
+    }
+    return vegaReady;
+}
+
+// A loader that loads nothing: no data file, no picture, no link followed. Each address it
+// was asked for is told to onRefuse.
+function refusingLoader(vega, onRefuse) {
+    const loader = vega.loader();
+    const refuse = (uri) => {
+        onRefuse(typeof uri === "string" ? uri : "an address");
+        return Promise.reject(new Error("a plot in a conversation loads nothing"));
+    };
+    loader.load = loader.sanitize = loader.http = loader.file = refuse;
+    return loader;
+}
+
+// A control bound to an element elsewhere on the page ("bind": {"element": selector}) would be
+// put there: every control stays under its plot.
+function unbindElsewhere(v) {
+    if (Array.isArray(v)) { v.forEach(unbindElsewhere); return; }
+    if (!v || typeof v !== "object") return;
+    if (v.bind && typeof v.bind === "object") delete v.bind.element;
+    Object.values(v).forEach(unbindElsewhere);
+}
+
+let plotTip = null;
+function plotTooltip(handler, event, item, value) {
+    if (!plotTip) { plotTip = h("div", { class: "plot-tip", hidden: true }); document.body.append(plotTip); }
+    if (value === null || value === undefined || value === "") { plotTip.hidden = true; return; }
+    const say = (v) => (v !== null && typeof v === "object" ? JSON.stringify(v) : String(v));
+    fill(plotTip, typeof value === "object" && !Array.isArray(value)
+        ? Object.entries(value).map(([k, v]) => h("div", {}, h("span", { class: "k" }, k), " ", say(v)))
+        : h("div", {}, say(value)));
+    plotTip.hidden = false;
+    const x = Math.min(event.clientX + 14, window.innerWidth - plotTip.offsetWidth - 8);
+    const y = event.clientY + 14 + plotTip.offsetHeight > window.innerHeight ? event.clientY - plotTip.offsetHeight - 10 : event.clientY + 14;
+    plotTip.style.left = `${Math.max(4, x)}px`;
+    plotTip.style.top = `${Math.max(4, y)}px`;
+}
+
+function plotEl(src) {
+    const box = h("div", { class: "md-plot" }, codeEl(src), h("div", { class: "md-why" }, "Drawing the plot…"));
+    const failed = (why) => box.replaceChildren(notShown(src, `This plot could not be drawn: ${why}`));
+    let view = null;
+    // An address asked for, now or later (a picture mark asks when it is drawn): the plot goes.
+    const onRefuse = (uri) => {
+        if (view) { view.finalize(); view = null; }
+        failed(`it names an address to load (${uri.slice(0, 120)}), and a plot here shows only the data inside its specification.`);
+    };
+    (async () => {
+        let spec;
+        try { spec = JSON.parse(src); } catch (e) { throw new Error(`its specification is not JSON (${firstLine(e)})`); }
+        if (!spec || typeof spec !== "object" || Array.isArray(spec)) throw new Error("its specification is not a JSON object");
+        unbindElsewhere(spec);
+        const { vega, vegaLite, interpreter } = await vegaLib();
+        const compiled = vegaLite.compile(spec, { config: PLOT_CONFIG }).spec;
+        let refused = false;
+        const loader = refusingLoader(vega, (uri) => { refused = true; onRefuse(uri); });
+        const holder = h("div", { class: "md-plot-view" });
+        view = new vega.View(vega.parse(compiled, null, { ast: true }), {
+            expr: interpreter, loader, logLevel: vega.Error, renderer: "canvas", container: holder, hover: true, tooltip: plotTooltip });
+        await view.runAsync();
+        if (!refused && view) box.replaceChildren(holder);
+    })().catch((e) => { if (view) { view.finalize(); view = null; } failed(firstLine(e)); });
+    return box;
+}
+
+// ---- pictures and pages: files of the workspace, from the project's own origin
+
+function pictureEl(name, file, alt) {
+    const box = h("span", { class: "md-picture" });
+    const said = (why) => box.replaceChildren(h("span", { class: "md-gone" }, `picture ${file.path}: ${why}`));
+    if (!isRunning(name)) { said("the project is stopped"); return box; }
+    box.append(h("span", { class: "md-gone" }, `picture ${file.path}…`));
+    filesBase(name).then((base) => {
+        if (!base) return said("the project is stopped");
+        const url = filesUrl(base, file.path);
+        const img = h("img", { alt: alt || file.path, title: alt || file.path, referrerpolicy: "no-referrer" });
+        img.addEventListener("load", () => box.replaceChildren(h("a", { href: url, target: "_blank", rel: "noopener noreferrer" }, img)));
+        img.addEventListener("error", () => said(isRunning(name) ? "not found in the workspace" : "the project is stopped"));
+        img.src = url;
+    }, (e) => said(`not shown (${firstLine(e)})`));
+    return box;
+}
+
+function pageEl(name, src) {
+    const lines = src.split("\n").map((l) => l.trim()).filter(Boolean);
+    const file = lines.length === 1 ? workspaceTarget(lines[0], false) : null;
+    if (!file || !/\.html?$/i.test(file.path)) return notShown(src, "This page is not shown: a page block holds one relative path to an .html file in /workspace.");
+    const said = h("span", { class: "grow" }, "Opening…");
+    const link = h("a", { class: "newtab", target: "_blank", rel: "noopener noreferrer", hidden: true }, "open in a new tab ↗");
+    const area = h("div", { class: "md-page-area" });
+    const box = h("div", { class: "md-page" }, h("div", { class: "md-page-bar" }, h("code", {}, file.path), said, link), area);
+    const stopped = () => { said.textContent = ""; area.replaceChildren(h("div", { class: "md-gone" }, "the project is stopped: its page is shown while it runs")); };
+    if (!isRunning(name)) { stopped(); return box; }
+    filesBase(name).then((base) => {
+        if (!base) return stopped();
+        const url = filesUrl(base, file.path);
+        link.href = url;
+        link.hidden = false;
+        said.textContent = "";
+        area.replaceChildren(h("iframe", { src: url, title: file.path, sandbox: WEB_FRAME_SANDBOX, allow: WEB_FRAME_ALLOW }));
+    }, (e) => { said.textContent = `not shown (${firstLine(e)})`; });
+    return box;
+}
+
+// ---- a file to read: opened in the project's Editor
+
+// A project without the editor shows the path after the words instead (class noeditor, set
+// again when its services are known: markFileLinks).
+function fileLinkEl(name, file) {
+    const where = `/workspace/${file.path}${file.line ? `:${file.line}` : ""}`;
+    const el = h("a", { class: "md-file", href: "#", "data-path": where, "data-project": name, title: `Open ${where} in the Editor`,
+                        onclick: (ev) => { ev.preventDefault(); openInEditor(name, file); } });
+    const rows = S.services[name];
+    if (rows && !rows.editor) el.classList.add("noeditor");
+    return el;
+}
+
+function markFileLinks(name) {
+    const none = !(S.services[name] || {}).editor;
+    for (const a of document.querySelectorAll("a.md-file")) {
+        if (a.dataset.project === name) a.classList.toggle("noeditor", none);
+    }
+}
+
+function openInEditor(name, file) {
+    if (!(S.services[name] || {}).editor) { toast(`This project has no editor. The file is /workspace/${file.path}`); return; }
+    S.editorFile[name] = file;
+    if (S.current !== name) selectProject(name);
+    const pane = S.panes[paneKey(name, "editor")];
+    if (pane && pane.openFile) pane.openFile();
+    showTab(name, "editor");
+}
+
+// code-server (VS Code for the web) opens a file named in its address: `payload` holds
+// ["openFile", <the file's vscode-remote URI>], and with ["gotoLineMode", "true"] a ":<line>"
+// at its end is the line to show (VS Code's workbench, filesToOpenOrCreate).
+function editorAddress(base, file) {
+    if (!file) return base;
+    const authority = new URL(base).host;
+    const uri = `vscode-remote://${authority}/workspace/${file.path.split("/").map(enc).join("/")}${file.line ? `:${file.line}` : ""}`;
+    const payload = [["openFile", uri]];
+    if (file.line) payload.push(["gotoLineMode", "true"]);
+    return `${base}?folder=${enc("/workspace")}&payload=${enc(JSON.stringify(payload))}`;
 }
 
 // ---- the stream of an answer (ported from gaggiclanker, web/src/lib/sse.ts) ----------------
@@ -1377,7 +1780,8 @@ function makeLessonPane(name, id) {
     const sysline = (text, cls) => { inner.append(syslineEl(text, cls)); toBottom(); };
     const emptyNote = () => inner.querySelector(".empty");
 
-    function messageEl(m) {
+    // blocks: the drawn elements of the answer this message was being written as, kept.
+    function messageEl(m, blocks) {
         const you = m.role === "user";
         const body = h("div", { class: you ? "body" : "body md" });
         const traces = h("div", { class: "traces" });
@@ -1389,7 +1793,7 @@ function makeLessonPane(name, id) {
         }
         traces.hidden = !traces.childElementCount;
         if (you) body.textContent = String(m.text || "");
-        else body.append(mdRender(String(m.text || "")));
+        else body.append(mdRender(String(m.text || ""), { project: name, blocks: blocks || null }));
         const el = h("div", { class: `msg ${you ? "you" : "tutor"}`, "data-run": m.run_id === undefined || m.run_id === null ? null : String(m.run_id) },
             h("div", { class: "av" }, you ? "Y" : "T"),
             // The tools a stretch of the answer used come after its text, as they were run.
@@ -1403,6 +1807,7 @@ function makeLessonPane(name, id) {
         const d = messageEl({ role: "assistant", text: "" });
         d.text = "";
         d.toolIds = [];
+        d.blocks = new Map();
         // The mark that it is being written comes last, under the tools it runs.
         d.tail = h("div", {}, h("span", { class: "pulse typing", title: "The tutor is working" }));
         d.el.querySelector(".mc").append(d.tail);
@@ -1417,7 +1822,7 @@ function makeLessonPane(name, id) {
             turn.paintQueued = false;
             const d = turn.draft;
             if (!d) return;
-            d.body.replaceChildren(mdRender(d.text));
+            d.body.replaceChildren(mdRender(d.text, { project: name, blocks: d.blocks, draft: true }));
             toBottom();
         });
     }
@@ -1428,7 +1833,7 @@ function makeLessonPane(name, id) {
         const d = turn.draft;
         if (d) {
             if (!d.text && !d.toolIds.length) d.el.remove();
-            else { d.body.replaceChildren(mdRender(d.text)); d.tail.remove(); }
+            else { d.body.replaceChildren(mdRender(d.text, { project: name, blocks: d.blocks })); d.tail.remove(); }
         }
         turn.draft = null;
         tell("");
@@ -1466,9 +1871,9 @@ function makeLessonPane(name, id) {
                 // stay in a new draft.
                 const m = d.message;
                 if (!m || typeof m !== "object") break;
-                const stored = messageEl(m);
-                const have = new Set((Array.isArray(m.tools) ? m.tools : []).map((t) => t && t.id));
                 const draft = turn.draft;
+                const stored = messageEl(m, draft && draft.blocks);
+                const have = new Set((Array.isArray(m.tools) ? m.tools : []).map((t) => t && t.id));
                 turn.draft = null;
                 if (draft) draft.el.replaceWith(stored.el); else inner.append(stored.el);
                 const left = draft ? draft.toolIds.filter((t) => !have.has(t)) : [];

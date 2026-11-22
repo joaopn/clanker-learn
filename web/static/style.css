@@ -332,6 +332,44 @@ ul.plain { margin: 6px 0 6px 20px; line-height: 1.5; }
 .md .al-center { text-align: center; }
 .md a.md-img { text-decoration: none; }
 
+/* ---- what a conversation shows: diagrams, plots, pictures, pages, files ---- */
+.md .md-diagram, .md .md-plot, .md .md-page, .md .md-failed { margin: 0 0 10px; }
+.md .md-diagram { overflow-x: auto; }
+.md .md-diagram > svg { display: block; max-width: 100%; height: auto; }
+.md .md-plot { overflow-x: auto; }
+.md .md-plot-view canvas { display: block; }
+.md .md-why { font-size: 12.5px; color: var(--fg-muted); margin: -6px 0 0; }
+.md .md-failed .md-why { color: var(--warn-fg); }
+.md .md-failed pre.md-pre { margin-bottom: 10px; }
+.md .md-picture { display: inline-block; max-width: 100%; vertical-align: top; }
+.md .md-picture img { display: block; max-width: 100%; height: auto; border-radius: 4px; }
+.md .md-gone { display: inline-block; padding: 6px 10px; border: 1px dashed var(--border-strong); border-radius: 6px; color: var(--fg-muted); font-size: 13px; }
+.md .md-page { border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
+.md .md-page-bar { display: flex; gap: 10px; align-items: center; padding: 5px 10px; font-size: 12.5px; background: var(--bg-card); min-width: 0; }
+.md .md-page-bar code { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.md .md-page-bar .grow { flex: 1; color: var(--fg-muted); }
+.md .md-page-bar .newtab { white-space: nowrap; }
+.md .md-page-area { height: 440px; background: #fff; }
+.md .md-page-area .md-gone { margin: 12px; background: var(--bg-base); }
+.md .md-page-area iframe { display: block; width: 100%; height: 100%; border: 0; }
+.md a.md-file { text-decoration: underline dotted; }
+.md a.md-file::after { content: " ⧉"; font-size: 11px; color: var(--fg-faint); }
+.md a.md-file.noeditor { color: inherit; text-decoration: none; cursor: default; }
+.md a.md-file.noeditor::after { content: " (" attr(data-path) ")"; color: var(--fg-muted); font-family: var(--mono); font-size: 12.5px; }
+.md .vega-bindings { margin-top: 6px; font-size: 13px; }
+.md .vega-bind { margin: 4px 0; }
+.md .vega-bind-name { margin-right: 6px; color: var(--fg-muted); }
+.md .vega-bind input[type=range] { vertical-align: middle; }
+.plot-tip { position: fixed; z-index: 60; pointer-events: none; max-width: 320px; padding: 5px 8px; border-radius: 5px;
+            background: #111; border: 1px solid var(--border-strong); color: var(--fg-base); font-size: 12px; line-height: 1.45; }
+.plot-tip .k { color: var(--fg-muted); }
+.appbar .filenote { display: inline-flex; gap: 6px; align-items: center; white-space: nowrap; color: var(--fg-muted); font-size: 12.5px; min-width: 0; }
+.appbar .filenote code { overflow: hidden; text-overflow: ellipsis; }
+.appbar .filenote button { padding: 2px 8px; font-size: 12px; }
+@media (max-width: 700px) {
+    .md .md-page-area { height: 360px; }
+}
+
 /* ---- Settings -> Tutor ---- */
 .tutor-set .form p { margin: 8px 0; line-height: 1.45; }
 .tutor-state { font-weight: 600; }

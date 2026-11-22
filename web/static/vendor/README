@@ -27,3 +27,45 @@ its tokens itself.) The files, unchanged, and their SHA-256:
 
 The three scripts end with a sourceMappingURL comment; the maps are not kept (a browser's
 developer tools may ask for them and get a 404).
+
+What a conversation shows (diagrams and plots). These are large, so the page does not load
+them with itself: it adds a script element for them the first time a conversation holds a
+diagram or a plot. Taken from the npm registry the same way, the tarballs checked against:
+
+  mermaid 12.3.0           sha512-4113TdXeLAsMruJ79OpFL5O8+LTFXhQqZ260rF3tgUmiNAtRm4Uume04I+65PRN6yZ69J4f8rVYWW8zRk65UYw==
+  vega 6.4.0               sha512-rHXCq2LpEWCLMjXBEj7hocY9G0/i5TGYRayGGSj06VTF4+l2IG2Z7oeZKCjWbUh/7hTE/mVhbaOPB72wCElh6g==
+  vega-lite 6.5.0          sha512-fMXF6s0MrIg0UTWnLIfeFtgSLzVhyzSKobzGrh5rhS+mL6FOYFG3m7ouJ4U23gj65EK+gl9FIIT5w7wLNaAzkA==
+  vega-interpreter 2.3.2   sha512-JDAoi3taFcCDLujZG84TNNUXdkAZ5WsSHssx8lWVYaxb9Slsjk7v7PtRIYXpSlUwLaKGRBqoJ9KDs36Z0eMEIw==
+
+(The newest of each, 2026-11-22. mermaid's single-file build bundles its dependencies, among
+them d3, DOMPurify, dagre, cytoscape, KaTeX and lodash, whose licence comments it keeps.)
+The files and their SHA-256:
+
+  mermaid.min.js     mermaid 12.3.0, dist/mermaid.min.js, unchanged
+                     336df803d87a38b70a01e736e666c8f7601d2ce42f5e47c8fafe5d721074b9a3
+  LICENSE.mermaid    mermaid 12.3.0, LICENSE (MIT)
+                     ec9fb67dcb25eccc416ed56e1aab819222c805a2a4bfe4cb19e7556bf2ffde80
+  vega.min.js        vega 6.4.0, build/vega.min.js, unchanged
+                     8f6a3587cf8d4f42c7e08120e3eb05d067e746d554e39d2dcf52acc0bd5ba28f
+  LICENSE.vega       vega 6.4.0, LICENSE (BSD-3-Clause)
+                     63727832aaf62004a2b249c933e327f3c90caf49e41a72f4bf436edf632cbda8
+  vega-lite.min.js   vega-lite 6.5.0, build/vega-lite.min.js, unchanged (it ends with a
+                     sourceMappingURL comment; the map is not kept)
+                     83e215e84e308ee8688fa6503ba0f1cf8a3c05c0d61df2841a0b92bf86809e00
+  LICENSE.vega-lite  vega-lite 6.5.0, LICENSE (BSD-3-Clause)
+                     f618900fd0d64046963b29f40590cdd1e341a2f41449f99110d82fd81fea808c
+  vega-interpreter.js  vega-interpreter 2.3.2, build/vega-interpreter.js, WRAPPED: the package
+                     ships this one build only, as a module that imports from vega-util. The
+                     committed file is it with its first line (the import) replaced by a read
+                     of the same three names from the global `vega` (vega.min.js exports all of
+                     vega-util), its export line replaced by setting the global
+                     `vegaInterpreter`, a three-line comment on top, and the whole in a
+                     function so that its names stay out of the page's globals. The original:
+                     c0bdb735a63f9276f136e8d90d7fdf5d8e9df8031eb069048fc9975c876fd7f9
+                     the committed file:
+                     4d19048194a80018df1339aebdb85629698bfa23926714a4f770f800a520bd35
+  LICENSE.vega-interpreter  vega-interpreter 2.3.2, LICENSE (BSD-3-Clause)
+                     63727832aaf62004a2b249c933e327f3c90caf49e41a72f4bf436edf632cbda8
+
+Vega compiles its expressions with `new Function` unless it is given the interpreter; the
+page always gives it (the page's policy has no 'unsafe-eval').
