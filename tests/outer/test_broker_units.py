@@ -297,7 +297,7 @@ def test_an_operation_is_accepted_logged_and_started_with_what_it_needs_and_no_m
     reply = world.call("create", {"name": "kafka", "cpus": 2}, token=token, op_id="op-1")
     assert reply == {"ok": True, "result": {"op_id": "op-1", "state": "running", "started": True}}
     (spec,) = world.spawned
-    assert sorted(spec) == ["agents", "claude_effort", "claude_model", "editor", "limits", "lock_fd", "log_fd", "marker_fd", "name", "op_id", "verb"]
+    assert sorted(spec) == ["agents", "claude_effort", "claude_model", "editor", "limits", "lock_fd", "log_fd", "marker_fd", "name", "op_id", "pi_model", "pi_thinking", "verb"]
     first = json.loads(read(broker.view_log("op-1")))
     assert {k: first[k] for k in ("op_id", "project", "action", "step", "status", "msg")} == {
         "op_id": "op-1", "project": "kafka", "action": "create", "step": "accepted", "status": "step", "msg": ""}

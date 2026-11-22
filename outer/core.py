@@ -9,7 +9,7 @@ creation was cut short is finished by its next start.
 
     /data/core/projects/<name>.json   the record: limits, whether it should be running, its
                                       agents, whether it has the editor, Claude's model and
-                                      effort
+                                      effort, pi's model and thinking level
     /data/projects/<name>             the workspace        -> /workspace in the sandbox
     /data/homes/<name>                the home folder      -> /home/learner
     /data/core/provision/<name>       the tutor's public key, the sandbox's SSH host key,
@@ -25,12 +25,15 @@ creation was cut short is finished by its next start.
     /data/core/tutor_secret           the secret the web server and the tutor service share
     cl-sb-<name>, cl-net-<name>       the container and its network
 
-The software projects get (Claude Code, the editor) is fetched once into a distribution:
+The software projects get (Claude Code, pi, the editor) is fetched once into a distribution:
 
     /data/dist/agents/claude          RS's tree: local/ (what Claude Code's installer left as
                                       ~/.local, its editor extension tucked inside) and
                                       claude/settings.json
     /data/dist/agents/claude.json     its versions and when it was pulled (also in .cl-dist inside)
+    /data/dist/agents/pi              RS's tree: local/ (RS's recipe's ~/.local: a private node,
+                                      pi, pi-subagents, RS's rules extension and launcher) and
+                                      pi/settings.json; pi.json beside it, with its extra pins
     /data/dist/editor                 RS's tree: .local/ (code-server's standalone install, RS's
                                       list of built-in extensions removed), tools/ (RS's deploy
                                       script and lazy-start stub), templates/ (RS's User and
@@ -64,8 +67,8 @@ A destroy marks the record first ("destroying") and removes it last. A destroy t
 short is therefore never taken for a creation that was: nothing starts such a project, and
 running destroy again finishes it.
 
-This module is also the `cl` command: `cl create <name> [--agent claude] [--editor]
-[--claude-model M] [--claude-effort E]`, `cl list`, `cl agents add|update|model <name>`,
+This module is also the `cl` command: `cl create <name> [--agent claude] [--agent pi] [--editor]
+[--claude-model M] [--claude-effort E] [--pi-model P/M] [--pi-thinking T]`, `cl list`, `cl agents add|update|model <name>`,
 `cl backup`, `cl backups`, `cl backup-rm <name>`, `cl restore <file or name>`, and so on.
 """
 import argparse
@@ -286,11 +289,13 @@ def limit_args(limits, for_update=False):
 
 # --- records -------------------------------------------------------------------------------
 
-def new_record(name, limits=None, agents=(), editor=False, claude_model="", claude_effort=""):
+def new_record(name, limits=None, agents=(), editor=False, claude_model="", claude_effort="", pi_model="", pi_thinking=""):
     model, effort = checked_claude_pair(claude_model, claude_effort)
+    agents = checked_agents(agents)
+    pi_model, pi_thinking = checked_pi_pair(pi_model, pi_thinking, agents)
     return {"name": valid_name(name), "created": datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds"),
-            "wanted": "running", "limits": checked_limits(limits), "agents": checked_agents(agents), "editor": checked_editor(editor),
-            "claude_model": model, "claude_effort": effort}
+            "wanted": "running", "limits": checked_limits(limits), "agents": agents, "editor": checked_editor(editor),
+            "claude_model": model, "claude_effort": effort, "pi_model": pi_model, "pi_thinking": pi_thinking}
 
 
 def model_catalog():
@@ -320,6 +325,27 @@ def checked_claude_pair(model, effort):
         if model in tiers and effort not in tiers[model]:
             raise CoreError(f"{model} takes no effort {effort}" + (f" (it takes {', '.join(tiers[model])})." if tiers[model] else "."))
     return model, effort
+
+
+def checked_pi_pair(model, thinking, agents=None):
+    """pi's starting model and thinking level, as RS's _validated_pi_pair checks them: each may
+    be empty (pi's own pick); a model is provider/model of RS's strict pattern (it is written
+    into pi's settings); a thinking level is one of pi's. With `agents` (a creation, a change
+    to a project), a value needs pi among them: with nothing to land on it is a dead field."""
+    for value, what in ((model, "pi model"), (thinking, "pi thinking level")):
+        if value is not None and not isinstance(value, str):
+            raise CoreError(f"The {what} is a word (or empty).")
+    model, thinking = (model or "").strip(), (thinking or "").strip()
+    if not (model or thinking):
+        return "", ""
+    if agents is not None and "pi" not in agents:
+        raise CoreError("A pi model or thinking level needs pi among the project's agents.")
+    if model and not PI_MODEL.match(model):
+        raise CoreError(f"pi model {model[:80]!r} must be written provider/model, e.g. openrouter/anthropic/claude-opus-latest "
+                        "(the provider takes letters, digits and . _ -; the model also : ~ @ + /).")
+    if thinking and thinking not in PI_THINKING_LEVELS:
+        raise CoreError(f"pi thinking level {thinking[:40]!r} is not one of {', '.join(PI_THINKING_LEVELS)}.")
+    return model, thinking
 
 
 def checked_agents(agents):
@@ -385,6 +411,7 @@ def read_record(name):
         record["agents"] = checked_agents(record.get("agents", []))
         record["editor"] = checked_editor(record.get("editor", True))
         record["claude_model"], record["claude_effort"] = checked_claude_pair(record.get("claude_model", ""), record.get("claude_effort", ""))
+        record["pi_model"], record["pi_thinking"] = checked_pi_pair(record.get("pi_model", ""), record.get("pi_thinking", ""))
         return record
     except FileNotFoundError as exc:
         raise CoreError(f"There is no project named {name}.") from exc
@@ -518,6 +545,75 @@ AGENT_SETTINGS_JSON = json.dumps(
      "remoteControlAtStartup": False,
      "feedbackDrafts": "off"},
     indent=2) + "\n"
+# pi's names, research-sandbox's (cli/rscore.py, _PI_NPM_PACKAGE and the five beside it): the
+# npm package and its registry's `latest` manifest; pi-subagents, installed into a VERSION
+# folder below a fixed wrapper package (a deploy overlays local/ onto ~/.local without
+# deleting anything, so a fixed install path would keep a newer version's dropped files
+# loading; a version folder leaves an older one inert); the settings repair the launcher runs
+# once (its marker is relative to pi's agent dir). Paths are relative to share/pi-agent.
+PI_NPM_PACKAGE = "@earendil-works/pi-coding-agent"
+PI_LATEST_URL = "https://registry.npmjs.org/@earendil-works%2Fpi-coding-agent/latest"
+PI_SUBAGENTS_NPM = "pi-subagents"
+PI_SUBAGENTS_DIR = "rs/pi-subagents"
+PI_SETTINGS_HEAL = "rs/settings-heal.mjs"
+PI_HEAL_MARKER = ".rs-heal/pi-subagents-package"
+PI_FILES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pi")   # outer/pi, /opt/cl/pi in the image: RS's files for pi
+PI_AGENT_DIR = ".local/share/pi-agent/agent"   # in a home: pi's agent dir (RS's PI_AGENT_DIR_REL)
+# nodejs.org's name for this machine (RS pins linux-x64).
+NODE_ARCH = {"aarch64": "arm64", "arm64": "arm64"}.get(os.uname().machine, "x64")
+# pi's settings, as RS ships them (cli/rscore.py, _pi_settings_json), verbatim: every project
+# trusted (the sandbox is the boundary, and a run without a terminal must never stall on a
+# trust question), install telemetry off, dark, the terminal's own scrollback (tuiMode), RS's
+# rules extension and the shipped pi-subagents named relative to the agent dir. Installed into
+# a project's agent dir once, never over the learner's own.
+PI_SETTINGS_JSON = json.dumps(
+    {"defaultProjectTrust": "always",
+     "enableInstallTelemetry": False,
+     "theme": "dark",
+     "tuiMode": "regular",
+     "extensions": ["../rs/rs-rules.ts"],
+     "packages": [f"../{PI_SUBAGENTS_DIR}"]},
+    indent=2) + "\n"
+RS_RULES_HEADER = re.compile(r"\A// rs-rules v(\S+)\s*$", re.MULTILINE)
+# pi's starting model, RS's PI_MODEL_RE: pi lists its models only once a provider is logged in
+# inside the project, so the model is a free provider/model id held to one strict pattern
+# (it admits every id pi 1.5 ships); and pi's thinking levels (RS's PI_THINKING_LEVELS).
+PI_MODEL = re.compile(r"\A[A-Za-z0-9._-]+/[A-Za-z0-9._:~@+/-]+\Z")
+PI_MODEL_JS = "^[A-Za-z0-9._-]+/[A-Za-z0-9._:~@+/-]+$"   # the same, for the page (RS's PI_MODEL_PATTERN)
+PI_THINKING_LEVELS = ("off", "minimal", "low", "medium", "high", "xhigh", "max")
+
+
+def rs_rules_source(pins):
+    """RS's rules extension for the distribution, checked against its pin as RS's
+    _rs_rules_source does: its first line carries its version, and a bump of one without the
+    other is a build error, not a silent drift."""
+    text = read_text(os.path.join(PI_FILES, "rs-rules.ts"))
+    found = RS_RULES_HEADER.match(text)
+    if not found:
+        raise CoreError("outer/pi/rs-rules.ts: the first line must be `// rs-rules v<version>`")
+    if found.group(1) != pins["rules_ver"]:
+        raise CoreError(f"outer/pi/rs-rules.ts is v{found.group(1)} but RS_PI_RULES_VERSION={pins['rules_ver']}; bump the pin and the header together")
+    return text
+
+
+def pi_subagents_wrapper(pins):
+    """RS's fixed wrapper package that pi loads pi-subagents through (cli/rscore.py,
+    _pi_subagents_wrapper), verbatim: its `pi` manifest mirrors pi-subagents' own with every
+    path inside the pinned version folder."""
+    ver = pins["subagents_ver"]
+    base = f"./{ver}/node_modules/{PI_SUBAGENTS_NPM}"
+    return json.dumps(
+        {"name": "rs-pi-subagents",
+         "version": ver,
+         "private": True,
+         "description": f"{PI_SUBAGENTS_NPM} {ver} as shipped in RS's pi download",
+         "pi": {"extensions": [f"{base}/bundle/index.js"],
+                "skills": [f"{base}/skills"],
+                "prompts": [f"{base}/prompts"],
+                "changelogPath": f"{base}/CHANGELOG.md"}},
+        indent=2) + "\n"
+
+
 # Open VSX's name for this machine (RS pins linux-x64; the extension is built for both).
 EXT_PLATFORM = {"aarch64": "linux-arm64", "arm64": "linux-arm64"}.get(os.uname().machine, "linux-x64")
 # The closed table of what can be pulled. `dist` is the place under /data/dist; `local` where
@@ -525,7 +621,8 @@ EXT_PLATFORM = {"aarch64": "linux-arm64", "arm64": "linux-arm64"}.get(os.uname()
 # program, relative to the distribution; `in_tree` where the launcher must lead, with the
 # version in it; `installer` the vendor's script and the shell and arguments it is run with.
 # An agent's tree is RS's fixed one: local/ (with the agent's editor extension tucked inside
-# it, at `ext.file`) and the agent's settings beside it (`files`). The editor's is RS's too:
+# it, at `ext.file`) and the agent's settings beside it (`files`; a text, or a function of the
+# extra pins). pi is built from RS's own recipe instead of a vendor's installer (see its row). The editor's is RS's too:
 # .local/, the repository's files of outer/editor/ (`copies`), and the extensions RS bundles
 # (`extensions`, each at its own pin, fetched from Open VSX in the build container), with RS's
 # list of built-in extensions removed from the install (`strip`).
@@ -566,6 +663,73 @@ SOFTWARE = {
                    "tools/code-server-stub.py": ("code-server-stub.py", 0o755),
                    "templates/User/settings.json": ("code-server-settings.json", 0o644),
                    "templates/Machine/settings.json": ("code-server-machine-settings.json", 0o644)},
+    },
+    # pi, research-sandbox's _AGENT_INSTALL["pi"] (cli/rscore.py; read the long comment above
+    # it there): a node program with no self-contained binary, so the distribution carries a
+    # PRIVATE node runtime under share/pi-agent/node, the npm-installed package under
+    # share/pi-agent/pi, pi's agent dir relocated to share/pi-agent/agent (laid empty; at run
+    # time it holds the settings the deploy installs no-clobber from pi/settings.json, the
+    # learner's login, sessions and own MCP servers), pi-subagents in a version folder behind
+    # RS's fixed wrapper package, RS's rules extension and settings repair, and RS's launcher
+    # script at bin/pi, which finds all of it from its own folder, so that a copy runs from any
+    # home with an empty environment. No editor extension. `recipe` is RS's install text,
+    # .format-ed with the version and the extra pins (its only braces are those keys and the
+    # launcher's doubled ones); `files` are written after the capture, some from the pins;
+    # `built_check` gates the tree; `version_file` says which version the tree holds.
+    "pi": {
+        "kind": "agent", "label": "pi", "key": "PI_CODING_AGENT_VERSION", "report": "agents",
+        "dist": "agents/pi", "local": "local", "launcher": "local/bin/pi",
+        "version_file": f"local/share/pi-agent/pi/lib/node_modules/{PI_NPM_PACKAGE}/package.json",
+        "upstream": PI_LATEST_URL,   # JSON, its "version"
+        "extra_pins": {"node_ver": "NODE_VERSION", "rules_ver": "RS_PI_RULES_VERSION",
+                       "layout_ver": "RS_PI_DIST_LAYOUT", "subagents_ver": "PI_SUBAGENTS_VERSION"},
+        "recipe": (
+            "mkdir -p ~/.local/bin ~/.local/share/pi-agent/node ~/.local/share/pi-agent/pi"
+            " ~/.local/share/pi-agent/agent/extensions"
+            " && curl -fsSL --max-time 300"
+            " https://nodejs.org/dist/v{node_ver}/node-v{node_ver}-linux-{node_arch}.tar.gz"
+            " | tar -xz --strip-components=1 -C ~/.local/share/pi-agent/node"
+            " --exclude=CHANGELOG.md --exclude=LICENSE --exclude=README.md"
+            " && export PATH=~/.local/share/pi-agent/node/bin:$PATH"
+            " && npm install -g --ignore-scripts --prefix ~/.local/share/pi-agent/pi"
+            " --no-fund --no-audit --loglevel=error"
+            f" {PI_NPM_PACKAGE}@{{ver}}"
+            f" && mkdir -p ~/.local/share/pi-agent/{PI_SUBAGENTS_DIR}/{{subagents_ver}}"
+            f" && npm install --prefix ~/.local/share/pi-agent/{PI_SUBAGENTS_DIR}/{{subagents_ver}}"
+            " --omit=peer --ignore-scripts --no-fund --no-audit --loglevel=error"
+            f" {PI_SUBAGENTS_NPM}@{{subagents_ver}}"
+            " && printf '%s\\n'"
+            " '#!/bin/sh'"
+            " '# RS launcher for pi: resolves the private node + the bundled cli.js'"
+            " '# from its own directory and supplies the env defaults when unset,'"
+            " '# so an absolute-path call from any home and any environment works.'"
+            " '# The private node is APPENDED to PATH: pi spawns npm by name.'"
+            " 'd=$(cd \"${{0%/*}}/..\" && pwd -P)'"
+            " '[ -n \"$PI_CODING_AGENT_DIR\" ] || export PI_CODING_AGENT_DIR=\"$d/share/pi-agent/agent\"'"
+            " '[ -n \"$PI_TELEMETRY\" ] || export PI_TELEMETRY=0'"
+            " 'PATH=\"${{PATH:-/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}}:$d/share/pi-agent/node/bin\"; export PATH'"
+            " '# One-time RS settings heal: adds the shipped pi-subagents to the'"
+            " '# settings of pi once; never stops pi from starting.'"
+            " 'rs_agd=$PI_CODING_AGENT_DIR; case $rs_agd in \"~\") rs_agd=$HOME ;; \"~/\"*) rs_agd=$HOME/${{rs_agd#??}} ;; esac'"
+            f" '[ -e \"$rs_agd/{PI_HEAL_MARKER}\" ] || \"$d/share/pi-agent/node/bin/node\""
+            f" \"$d/share/pi-agent/{PI_SETTINGS_HEAL}\" {PI_HEAL_MARKER}"
+            f" \"$d/share/pi-agent/{PI_SUBAGENTS_DIR}\" >&2 </dev/null'"
+            " 'exec \"$d/share/pi-agent/node/bin/node\" \"$d/share/pi-agent/pi/lib/node_modules/"
+            "@earendil-works/pi-coding-agent/dist/bundle/cli.js\" \"$@\"'"
+            " > ~/.local/bin/pi && chmod 755 ~/.local/bin/pi"
+            " && rm -rf ~/.local/share/pi-agent/node/include ~/.local/share/pi-agent/node/share/doc"
+            " ~/.local/share/pi-agent/node/share/man"
+            " ~/.local/share/pi-agent/node/lib/node_modules/corepack"
+            " ~/.local/share/pi-agent/node/bin/npx ~/.local/share/pi-agent/node/bin/corepack"
+        ),
+        "files": {"pi/settings.json": lambda pins: PI_SETTINGS_JSON,
+                  "local/share/pi-agent/rs/rs-rules.ts": lambda pins: rs_rules_source(pins),
+                  f"local/share/pi-agent/{PI_SUBAGENTS_DIR}/package.json": lambda pins: pi_subagents_wrapper(pins),
+                  f"local/share/pi-agent/{PI_SETTINGS_HEAL}": lambda pins: read_text(os.path.join(PI_FILES, "settings-heal.mjs"))},
+        "built_check": (f"share/pi-agent/pi/lib/node_modules/{PI_NPM_PACKAGE}/dist/bundle/cli.js",
+                        "share/pi-agent/node/bin/node",
+                        "share/pi-agent/node/bin/npm",
+                        f"share/pi-agent/{PI_SUBAGENTS_DIR}/{{subagents_ver}}/node_modules/{PI_SUBAGENTS_NPM}/bundle/index.js"),
     },
 }
 EDITOR_FILES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "editor")   # outer/editor, /opt/cl/editor in the image
@@ -668,9 +832,29 @@ def extension_pins(software):
     return out
 
 
+EXTRA_PIN = re.compile(r"[0-9]+(\.[0-9]+){0,3}")   # an extra pin may be a bare counter (RS_PI_DIST_LAYOUT)
+
+
+def extra_pins(software):
+    """{"node_ver": version, ...} of the build-time pins beside `software`'s own (pi's private
+    node, RS's rules extension, the tree's layout, pi-subagents), at the pins in effect,
+    checked; {} for software that has none. An unset one is refused, as RS's build dies on
+    it: a distribution with an unversioned part is never built."""
+    versions, out = load_versions(), {}
+    for name, key in known_software(software).get("extra_pins", {}).items():
+        value = versions.get(key)
+        if value is None:
+            raise CoreError(f"{known_software(software)['label']} needs the pin {key}, which is not set ({VERSIONS_FILE}).")
+        if not EXTRA_PIN.fullmatch(value):
+            raise CoreError(f"{key} (in {VERSIONS_FILE} or {versions_local()}) is not a version (digits and dots): {value[:40]!r}.")
+        out[name] = value
+    return out
+
+
 def pin_keys(software):
     spec = known_software(software)
-    return [spec["key"], *([spec["ext"]["key"]] if "ext" in spec else []), *(key for _, _, key in spec.get("extensions", ()))]
+    return [spec["key"], *([spec["ext"]["key"]] if "ext" in spec else []), *(key for _, _, key in spec.get("extensions", ())),
+            *spec.get("extra_pins", {}).values()]
 
 
 def write_pins(lines):
@@ -800,6 +984,8 @@ def pulled(software):
             out["ext_version"] = checked_version(mark["ext_version"], "The pulled extension's version")
         if "extensions" in spec:
             out["extensions"] = {str(one)[:80]: checked_version(version, "A bundled extension's version") for one, version in mark["extensions"].items()}
+        if "extra_pins" in spec:
+            out["extra_pins"] = {str(one)[:40]: str(version)[:40] for one, version in mark["extra_pins"].items()}
         return out
     except (OSError, ValueError, KeyError, TypeError, AttributeError, CoreError):
         return None
@@ -823,7 +1009,7 @@ def relativize_launcher(root, launcher, local=""):
         os.replace(tmp, path)
 
 
-def check_tree(software, root, version):
+def check_tree(software, root, version, extras=None):
     """A tree is taken only if its launcher is there, leads (through relative links only) to
     a program inside the tree, and that program is the version wanted. Raises with why not."""
     spec = known_software(software)
@@ -841,6 +1027,22 @@ def check_tree(software, root, version):
         raise CoreError(f"{spec['launcher']} leads nowhere ({type(exc).__name__})") from exc
     if not stat.S_ISREG(mode) or not mode & 0o111:
         raise CoreError(f"{spec['launcher']} does not lead to a program")
+    if "version_file" in spec:
+        # pi's launcher is RS's script, which names no version: the package's own manifest
+        # does, and RS's built_check names what must be there besides (formatted with the
+        # extra pins, as RS's build does).
+        for relative in spec.get("built_check", ()):
+            path = os.path.join(root, spec["local"], relative.format(**(extras or {})))
+            if (os.path.islink(path) and os.path.isabs(os.readlink(path))) or not os.path.isfile(path):
+                raise CoreError(f"the build left no {spec['local']}/{relative.format(**(extras or {}))}")
+        try:
+            with open(os.path.join(root, spec["version_file"])) as fh:
+                held = json.loads(fh.read(1024 * 1024)).get("version")
+        except (OSError, ValueError, AttributeError) as exc:
+            raise CoreError(f"{spec['version_file']} cannot be read ({type(exc).__name__})") from exc
+        if held != version:
+            raise CoreError(f"the distribution holds version {str(held)[:40]}, not {version}")
+        return
     found = spec["in_tree"].fullmatch(os.path.relpath(real, top))
     if not found:
         raise CoreError(f"{spec['launcher']} leads to {os.path.relpath(real, top)[:200]}, not to a version of {spec['label']}")
@@ -864,7 +1066,7 @@ def fresh_folder(path, owner=None):
         os.chown(path, owner, owner)
 
 
-def arrange_tree(software, captured):
+def arrange_tree(software, captured, extras=None):
     """RS's fixed tree around the ~/.local an installer left: for an agent local/ and the
     agent's settings beside it; for the editor .local/, the repository's tools and settings,
     and the extensions the build fetched into ext/ beside the ~/.local, as RS's
@@ -879,7 +1081,7 @@ def arrange_tree(software, captured):
     os.rename(captured, os.path.join(tree, spec["local"]))
     for relative, text in spec.get("files", {}).items():
         os.makedirs(os.path.dirname(os.path.join(tree, relative)), mode=0o755, exist_ok=True)
-        write_file(os.path.join(tree, relative), text, 0o644)
+        write_file(os.path.join(tree, relative), text(extras or {}) if callable(text) else text, 0o644)
     for relative, (source, mode) in spec.get("copies", {}).items():
         os.makedirs(os.path.dirname(os.path.join(tree, relative)), mode=0o755, exist_ok=True)
         shutil.copyfile(os.path.join(EDITOR_FILES, source), os.path.join(tree, relative))
@@ -895,7 +1097,7 @@ def arrange_tree(software, captured):
     return tree
 
 
-def install_dist(software, tree, version, say, ext_version=None, extensions=None):
+def install_dist(software, tree, version, say, ext_version=None, extensions=None, extras=None):
     """Mark a checked tree and put it in the distribution's place by renames: the old one is
     moved aside only once the new one is whole, and removed only after the new one is in. The
     folders above are never replaced: running sandboxes have /data/dist mounted."""
@@ -903,8 +1105,11 @@ def install_dist(software, tree, version, say, ext_version=None, extensions=None
     if os.path.islink(tree) or not os.path.isdir(tree):   # before anything is written into it: never through a link
         raise CoreError("the installer left no folder of its own (a link, or nothing)")
     relativize_launcher(tree, spec["launcher"], spec["local"])
-    check_tree(software, tree, version)
+    check_tree(software, tree, version, extras)
     mark = {"version": version, "pulled_at": now_utc()}
+    if "extra_pins" in spec:
+        # What this build bundled for each extra pin, so that a pin moved since reads stale.
+        mark["extra_pins"] = {str(one): str(v) for one, v in dict(extras or {}).items()}
     if "ext" in spec:
         # The extension rides inside local/ (RS's "tuck"): a tree without it is refused.
         ext_file = os.path.join(tree, spec["local"], spec["ext"]["file"])
@@ -950,14 +1155,26 @@ def build_dist(software, version, say=say_nothing, ext_version=None):
     checked_version(version, f"The version of {spec['label']}")
     ext_version = (ext_version or ext_pin(software)) if "ext" in spec else None
     extensions = extension_pins(software)
+    extras = extra_pins(software)
+    # The files written after the capture, made now, as RS does: one that is refused (the rules
+    # extension's header against its pin) is refused before anything is downloaded.
+    for text in spec.get("files", {}).values():
+        if callable(text):
+            text(extras)
     image = ensure_image(say, "sandbox")
     if not there_is("network", BUILD_NET):
         docker("network", "create", BUILD_NET)
     os.makedirs(f"{DATA}/dist-staging", mode=0o700, exist_ok=True)
-    args = [arg.format(version=version) for arg in spec["args"]]
-    mounts, script = [], f'set -euo pipefail; curl -fsSL "$0" | {spec["shell"]} -s -- "$@"'
-    if os.path.isfile(p["installer"]):   # the tests' way in: the build network reaches no test server
-        mounts, script = ["-v", f"{p['installer']}:/opt/cl-installer:ro"], f'set -euo pipefail; {spec["shell"]} /opt/cl-installer "$@"'
+    if "recipe" in spec:
+        # RS's install text, of the closed table and checked pins only, run by bash as RS's
+        # `set -e; set -o pipefail` does.
+        args, mounts = [], []
+        script = "set -euo pipefail; " + spec["recipe"].format(ver=version, node_arch=NODE_ARCH, **extras)
+    else:
+        args = [arg.format(version=version) for arg in spec["args"]]
+        mounts, script = [], f'set -euo pipefail; curl -fsSL "$0" | {spec["shell"]} -s -- "$@"'
+        if os.path.isfile(p["installer"]):   # the tests' way in: the build network reaches no test server
+            mounts, script = ["-v", f"{p['installer']}:/opt/cl-installer:ro"], f'set -euo pipefail; {spec["shell"]} /opt/cl-installer "$@"'
     if ext_version is not None:
         checked_version(ext_version, f"The version of the extension of {spec['label']}")
         place = f'"$HOME/.local/{spec["ext"]["file"]}"'
@@ -987,7 +1204,7 @@ def build_dist(software, version, say=say_nothing, ext_version=None):
             try:
                 done = docker("run", "--rm", "--name", p["container"], "--network", BUILD_NET, *DROPPED,
                               "-e", f"HOME={BUILD_HOME}", "-v", f"{p['staging']}:{BUILD_HOME}", *mounts,
-                              "--entrypoint", "timeout", image, str(DIST_BUILD_TIMEOUT_S), "bash", "-c", script, spec["installer"], *args,
+                              "--entrypoint", "timeout", image, str(DIST_BUILD_TIMEOUT_S), "bash", "-c", script, spec.get("installer", f"cl-{software}-build"), *args,
                               timeout=DIST_BUILD_TIMEOUT_S + 120, check=False)
             except CoreError as exc:
                 last = str(exc)
@@ -996,7 +1213,7 @@ def build_dist(software, version, say=say_nothing, ext_version=None):
                 last = f"the installer failed (exit {done.returncode}): " + (done.stderr.strip() or done.stdout.strip())[-500:]
                 continue
             try:
-                return install_dist(software, arrange_tree(software, os.path.join(p["staging"], ".local")), version, say, ext_version, extensions)
+                return install_dist(software, arrange_tree(software, os.path.join(p["staging"], ".local"), extras), version, say, ext_version, extensions, extras)
             except CoreError as exc:
                 last = str(exc)
     finally:
@@ -1018,6 +1235,7 @@ def take_preloaded(software, say=say_nothing):
         version = checked_version(given["version"], f"The version in {p['preload_json']}")
         ext_version = checked_version(given["ext_version"], f"The extension's version in {p['preload_json']}") if "ext" in spec else None
         extensions = given.get("extensions", extension_pins(software)) if "extensions" in spec else None
+        extras = given.get("extra_pins", extra_pins(software)) if "extra_pins" in spec else None
     except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
         raise CoreError(f"{p['preload_json']} cannot be read ({type(exc).__name__}).") from exc
     say(f"taking {spec['label']} {version} from {p['preload']}")
@@ -1026,7 +1244,7 @@ def take_preloaded(software, say=say_nothing):
     try:
         tree = os.path.join(p["staging"], "tree")
         shutil.copytree(p["preload"], tree, symlinks=True)
-        return install_dist(software, tree, version, say, ext_version, extensions)
+        return install_dist(software, tree, version, say, ext_version, extensions, extras)
     finally:
         shutil.rmtree(p["staging"], ignore_errors=True)
 
@@ -1064,7 +1282,8 @@ def upstream_version(software):
         image = ensure_image(kind="sandbox")
         if not there_is("network", BUILD_NET):
             docker("network", "create", BUILD_NET)
-        how = ["--max-filesize", "1024", spec["upstream"]] if software == "claude" else ["-o", "/dev/null", "-w", "%{url_effective}", spec["upstream"]]
+        how = {"claude": ["--max-filesize", "1024", spec["upstream"]],
+               "pi": ["--max-filesize", "4000000", spec["upstream"]]}.get(software, ["-o", "/dev/null", "-w", "%{url_effective}", spec["upstream"]])
         try:
             done = docker("run", "--rm", "--network", BUILD_NET, *DROPPED, "--entrypoint", "curl", image,
                           "-fsSL", "--max-time", str(UPSTREAM_TIMEOUT_S), *how, timeout=UPSTREAM_TIMEOUT_S + 60, check=False)
@@ -1079,6 +1298,13 @@ def upstream_version(software):
             if "/releases/tag/" not in answer:
                 raise CoreError(f"Upstream did not name a release of {spec['label']} (it answered {answer[:120]!r}).")
             answer = answer.rsplit("/", 1)[-1].removeprefix("v")
+    if software == "pi":
+        # The npm registry's `latest` manifest: a JSON object whose "version" is the tag, as
+        # RS's _agent_resolve_upstream reads it (latest_json_key).
+        try:
+            answer = json.loads(answer).get("version")
+        except (ValueError, AttributeError, RecursionError):
+            answer = None
     return checked_version(answer, f"Upstream's newest version of {spec['label']}")
 
 
@@ -1185,10 +1411,11 @@ def editor_refresh(say=say_nothing):
     return software_refresh("code-server", say)
 
 
-def dist_status_word(have, version, ext_version=None, extensions=None):
+def dist_status_word(have, version, ext_version=None, extensions=None, extras=None):
     if have is None:
         return "not pulled"
-    same = have["version"] == version and have.get("ext_version") == ext_version and have.get("extensions") == extensions
+    same = (have["version"] == version and have.get("ext_version") == ext_version and have.get("extensions") == extensions
+            and have.get("extra_pins") == extras)
     return "up to date" if same else STALE
 
 
@@ -1217,6 +1444,15 @@ def software_status():
             row["extensions"] = [{"id": f"{ns}.{name}", "key": key, "version": None, "repo_version": base.get(key),
                                   "pulled": had.get(f"{ns}.{name}")} for ns, name, key in spec["extensions"]]
             row["overridden"] = row["overridden"] or any(key in override for _, _, key in spec["extensions"])
+        if "extra_pins" in spec:
+            # RS's sub-rows for pi (software_status, extra_pins): each one's short name, pin
+            # key, the version in effect, the repository's and the one pulled, so that a
+            # "stale — re-pull" never shows without the row that explains it.
+            had = (row["pulled"] or {}).get("extra_pins", {})
+            row["extra_pins"] = [{"id": name, "label": name.removesuffix("_ver"), "key": key, "version": None,
+                                  "repo_version": base.get(key), "pulled": had.get(name)} for name, key in spec["extra_pins"].items()]
+            row["overridden"] = row["overridden"] or any(key in override for key in spec["extra_pins"].values())
+        extras = None
         try:
             row["version"] = pin(software)
             if "ext" in spec:
@@ -1225,19 +1461,30 @@ def software_status():
                 extensions = extension_pins(software)
                 for one in row["extensions"]:
                     one["version"] = extensions[one["id"]]
+            if "extra_pins" in spec:
+                extras = extra_pins(software)
+                for one in row["extra_pins"]:
+                    one["version"] = extras[one["id"]]
         except CoreError as exc:
             row["problem"] = problem or str(exc)
         # A version that cannot be read is never "up to date"; an agent is stale when either
         # its pin or its extension's moved since the pull, the editor when any bundled pin did.
-        row["status"] = dist_status_word(row["pulled"], row["version"], ext_version, extensions)
+        row["status"] = dist_status_word(row["pulled"], row["version"], ext_version, extensions, extras)
         rows.append(row)
     return rows
 
 
+# What the keeper pulls by itself at a first start: Claude Code and the editor, as RS's first
+# start does (research.py, cmd_start: its default agent and the editor, each only if absent).
+# pi is not among them there either: it is pulled when the learner asks (Settings -> Software).
+FIRST_PULLS = ("claude", "code-server")
+
+
 def keep_software(report, image_ready):
-    """The keeper's first pulls, once the sandbox image is had: for the agent and then the
+    """The keeper's first pulls, once the sandbox image is had: for Claude Code and then the
     editor, a distribution that is there is said ready; one that is not is pulled, once."""
-    for software, spec in SOFTWARE.items():
+    for software in FIRST_PULLS:
+        spec = SOFTWARE[software]
         key = spec["report"]
         try:
             there = pulled(software)
@@ -1362,10 +1609,12 @@ def write_provisioning(record):
         "ssh_host_ed25519_key": (read_text(host_key), 0o600),
         "ssh_host_ed25519_key.pub": (host_public, 0o644),
         "shell_password_hash": (crypt_hash(password) + "\n", 0o600),
-        # What the sandbox's init deploys at start (the agents, and the editor if true), and the model
-        # and effort the deploy script writes into Claude Code's settings.
+        # What the sandbox's init deploys at start (the agents, and the editor if true), the model
+        # and effort the deploy script writes into Claude Code's settings, and pi's model and
+        # thinking level, into pi's.
         SOFTWARE_FILE: (json.dumps({"agents": record["agents"], "editor": record["editor"],
-                                    "claude": {"model": record["claude_model"], "effort": record["claude_effort"]}}) + "\n", 0o644),
+                                    "claude": {"model": record["claude_model"], "effort": record["claude_effort"]},
+                                    "pi": {"model": record["pi_model"], "thinking": record["pi_thinking"]}}) + "\n", 0o644),
     }
     for filename, (text, mode) in wanted.items():
         write_file(os.path.join(p["provision"], filename), text, mode)
@@ -1479,7 +1728,7 @@ def status(name):
     container = inspect_container(p["container"])
     out = {"name": name, "created": record["created"], "wanted": record["wanted"], "limits": record["limits"],
            "agents": record["agents"], "editor": record["editor"], "claude_model": record["claude_model"], "claude_effort": record["claude_effort"],
-           "state": "missing", "address": "", "image": "", "container": "", "setup": ""}
+           "pi_model": record["pi_model"], "pi_thinking": record["pi_thinking"], "state": "missing", "address": "", "image": "", "container": "", "setup": ""}
     if container:
         out["state"] = "running" if container["State"].get("Running") else "stopped"
         out["address"] = container["NetworkSettings"]["Networks"].get(p["network"], {}).get("IPAddress", "")
@@ -1502,7 +1751,7 @@ def list_projects():
         except CoreError as exc:  # the record is fine; the daemon could not say how the sandbox is
             out.append({"name": name, "created": record["created"], "wanted": record["wanted"], "limits": record["limits"],
                         "agents": record["agents"], "editor": record["editor"], "claude_model": record["claude_model"],
-                        "claude_effort": record["claude_effort"], "state": "unknown", "address": "", "image": "", "container": "", "setup": "", "problem": str(exc)})
+                        "claude_effort": record["claude_effort"], "pi_model": record["pi_model"], "pi_thinking": record["pi_thinking"], "state": "unknown", "address": "", "image": "", "container": "", "setup": "", "problem": str(exc)})
     return out
 
 
@@ -1717,13 +1966,15 @@ def port_list(name):
     return {"project": name, "ports": read_ports(name)}
 
 
-def create(name, limits=None, say=say_nothing, agents=(), editor=False, claude_model="", claude_effort=""):
+def create(name, limits=None, say=say_nothing, agents=(), editor=False, claude_model="", claude_effort="", pi_model="", pi_thinking=""):
     """A new project with the agents and the editor asked for (none by default), each of which
-    must be pulled, and Claude's model and effort (Claude's own default when empty): what is
-    asked for is checked before anything is made, as RS does."""
+    must be pulled, Claude's model and effort (Claude's own default when empty), and pi's
+    starting model and thinking level (pi's own pick when empty): what is asked for is checked
+    before anything is made, as RS does."""
     valid_name(name)
     agents, editor = checked_agents(agents), checked_editor(editor)
     checked_claude_pair(claude_model, claude_effort)
+    checked_pi_pair(pi_model, pi_thinking, agents)
     refuse_unpulled(agents, editor)
     with locked(name):
         if os.path.exists(paths(name)["record"]):
@@ -1731,7 +1982,7 @@ def create(name, limits=None, say=say_nothing, agents=(), editor=False, claude_m
         left = leftovers(name)
         if left:
             raise CoreError(f"Something of an earlier project named {name} is left ({', '.join(left)}). `destroy {name}` clears it.")
-        record = new_record(name, limits, agents, editor, claude_model, claude_effort)
+        record = new_record(name, limits, agents, editor, claude_model, claude_effort, pi_model, pi_thinking)
         try:
             write_record(record)
             ensure(record, say)
@@ -1914,24 +2165,39 @@ def agents_update(name):
         return {"project": name, "agents": record["agents"], "deployed": deploy_agents(name, record["agents"])}
 
 
-def agents_model(name, model=None, effort=None):
-    """Set or clear Claude's model and effort of a running project (RS's Config box, Agents):
-    None keeps what the project has, "" clears it (Claude's own default). Written into the
-    record and the provisioning folder, then into ~/.claude/settings.json in the sandbox by
-    the deploy script, as RS's _write_agent_settings does. "applied" says whether there was a
-    settings file to write into: one that is installed later gets the pair then."""
+def agents_model(name, model=None, effort=None, pi_model=None, pi_thinking=None):
+    """Set or clear Claude's model and effort, or pi's model and thinking level, of a running
+    project (RS's Config box, Agents): None keeps what the project has, "" clears it (the
+    agent's own default). Written into the record and the provisioning folder, then into the
+    agent's settings in the sandbox by the deploy script, as RS's _write_agent_settings does:
+    Claude's when its pair was given (or nothing at all was), pi's when its pair was. "applied"
+    (Claude) and "pi_applied" say whether there was a settings file to write into: one that is
+    installed later gets the pair then."""
     valid_name(name)
     with locked(name):
         record = not_being_destroyed(read_record(name))
+        for_pi = pi_model is not None or pi_thinking is not None
+        for_claude = model is not None or effort is not None or not for_pi
         model = record["claude_model"] if model is None else model
         effort = record["claude_effort"] if effort is None else effort
         model, effort = checked_claude_pair(model, effort)
+        pi_model = record["pi_model"] if pi_model is None else pi_model
+        pi_thinking = record["pi_thinking"] if pi_thinking is None else pi_thinking
+        pi_model, pi_thinking = checked_pi_pair(pi_model, pi_thinking, record["agents"] if for_pi else None)
         deployable_sandbox(name)
         record["claude_model"], record["claude_effort"] = model, effort
+        record["pi_model"], record["pi_thinking"] = pi_model, pi_thinking
         write_record(record)
         write_provisioning(record)
-        said = run_deploy(paths(name)["container"], "settings", "claude", f"The model and effort could not be written into the settings of {name}")
-        return {"project": name, "claude_model": model, "claude_effort": effort, "applied": not said.endswith("settings absent")}
+        out = {"project": name, "claude_model": model, "claude_effort": effort, "pi_model": pi_model, "pi_thinking": pi_thinking}
+        container = paths(name)["container"]
+        if for_claude:
+            said = run_deploy(container, "settings", "claude", f"The model and effort could not be written into the settings of {name}")
+            out["applied"] = not said.endswith("settings absent")
+        if for_pi:
+            said = run_deploy(container, "settings", "pi", f"pi's model and thinking level could not be written into the settings of {name}")
+            out["pi_applied"] = not said.endswith("settings absent")
+        return out
 
 
 def remove_everything(name):
@@ -2981,7 +3247,7 @@ def main(argv=None):
     keeper = verbs.add_parser("web-keep", help="(run by the init) bring the web server up and keep it up")
     keeper.add_argument("status_port", type=int)
     verbs.add_parser("passwd", help="set the interface's password: read from standard input, or asked for at a terminal")
-    verbs.add_parser("software", help="what is pulled of the agent and the editor, and at which version")
+    verbs.add_parser("software", help="what is pulled of the agents and the editor, and at which version")
     for verb in ("agent", "editor"):
         actions = verbs.add_parser(verb, help=f"pull or refresh the {verb}'s distribution").add_subparsers(dest="action", required=True)
         for action in ("pull", "refresh"):
@@ -2996,10 +3262,12 @@ def main(argv=None):
     one.add_argument("name")
     one.add_argument("agent", nargs="?", default="claude")
     deploys.add_parser("update", help="deploy the pulled version of every agent of a running project").add_argument("name")
-    one = deploys.add_parser("model", help="set Claude's model and effort of a running project (an empty value clears it)")
+    one = deploys.add_parser("model", help="set Claude's model and effort, or pi's model and thinking level, of a running project (an empty value clears it)")
     one.add_argument("name")
-    one.add_argument("--model", help="a tier (opus, sonnet, haiku, fable) or a model id")
-    one.add_argument("--effort", help="low, medium, high, xhigh or max")
+    one.add_argument("--model", help="Claude's: a tier (opus, sonnet, haiku, fable) or a model id")
+    one.add_argument("--effort", help="Claude's: low, medium, high, xhigh or max")
+    one.add_argument("--pi-model", help="pi's: provider/model")
+    one.add_argument("--pi-thinking", help=f"pi's: {', '.join(PI_THINKING_LEVELS)}")
     verbs.add_parser("backup", help="one archive of everything clanker-learn keeps but the fetched software, under /data/backups")
     verbs.add_parser("backups", help="the backups there are")
     verbs.add_parser("backup-rm", help="remove a backup").add_argument("backup")
@@ -3012,10 +3280,12 @@ def main(argv=None):
             for option in ("pids", "memory", "cpus"):
                 one.add_argument(f"--{option}", help="a number (memory: 512m, 2g), or none")
         if verb == "create":
-            one.add_argument("--agent", action="append", default=[], dest="agents", help="an agent to add (claude); again for another")
+            one.add_argument("--agent", action="append", default=[], dest="agents", help=f"an agent to add ({', '.join(AGENTS)}); again for another")
             one.add_argument("--editor", action="store_true", help="give the project the editor")
             one.add_argument("--claude-model", default="", help="Claude's model: a tier (opus, sonnet, haiku, fable) or a model id")
             one.add_argument("--claude-effort", default="", help="Claude's effort: low, medium, high, xhigh or max")
+            one.add_argument("--pi-model", default="", help="pi's starting model: provider/model")
+            one.add_argument("--pi-thinking", default="", help=f"pi's starting thinking level: {', '.join(PI_THINKING_LEVELS)}")
     args = parser.parse_args(argv)
 
     def say(message):
@@ -3044,7 +3314,7 @@ def main(argv=None):
             elif args.action == "update":
                 out = agents_update(args.name)
             else:
-                out = agents_model(args.name, args.model, args.effort)
+                out = agents_model(args.name, args.model, args.effort, args.pi_model, args.pi_thinking)
         elif args.verb == "start-wanted":
             out = start_wanted(say)
         elif args.verb == "backup":
@@ -3061,7 +3331,7 @@ def main(argv=None):
             given = {k: limit_option(getattr(args, k), k) for k in ("pids", "memory", "cpus")}
             if args.verb == "create":
                 out = create(args.name, {k: v for k, v in given.items() if v is not UNCHANGED}, say, args.agents, args.editor,
-                             args.claude_model, args.claude_effort)
+                             args.claude_model, args.claude_effort, args.pi_model, args.pi_thinking)
             else:
                 out = set_limits(args.name, **given)
         elif args.verb == "start":

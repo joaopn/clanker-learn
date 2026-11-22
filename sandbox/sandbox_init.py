@@ -71,7 +71,7 @@ MAX_SERVICES = 64
 SERVICES_BYTES = 64 * 1024
 CRYPT_HASH = re.compile(r"\$6\$[./A-Za-z0-9]{1,16}\$[./A-Za-z0-9]{86}")   # as the core writes it
 SOFTWARE_FILE = os.path.join(PROVISION, "software.json")
-AGENTS = ("claude",)            # the core's closed set (outer/core.py, AGENTS)
+AGENTS = ("claude", "pi")       # the core's closed set (outer/core.py, AGENTS)
 DEPLOY = "/opt/cl/deploy"
 DEPLOY_TIMEOUT_S = 900
 

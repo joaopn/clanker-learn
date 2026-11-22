@@ -146,7 +146,7 @@ AUDITED_VERBS = OP_VERBS | LANE_VERBS | {"limits", "attach", "port_add", "port_r
 # Answered by this process at once, under the project's lock taken without waiting.
 LOCKED_VERBS = frozenset({"limits", "port_add", "port_remove", "agents_model"})
 LIMITS = ("pids", "memory", "cpus")
-CREATE_SOFTWARE = ("agents", "editor", "claude_model", "claude_effort")
+CREATE_SOFTWARE = ("agents", "editor", "claude_model", "claude_effort", "pi_model", "pi_thinking")
 FIELDS = {
     "list": frozenset(),
     "status": frozenset({"name"}),
@@ -165,7 +165,7 @@ FIELDS = {
     "pin_reset": frozenset({"software"}),
     "agents_add": frozenset({"name", "agent"}),
     "agents_update": frozenset({"name"}),
-    "agents_model": frozenset({"name", "model", "effort"}),
+    "agents_model": frozenset({"name", "model", "effort", "pi_model", "pi_thinking"}),
     "create": frozenset({"name", *LIMITS, *CREATE_SOFTWARE}),
     "start": frozenset({"name"}),
     "stop": frozenset({"name"}),
@@ -505,8 +505,9 @@ def operation_extra(verb, args):
         editor = checked(core.checked_editor, args.get("editor", False))
         model, effort = (("" if args.get(key) is None else args[key]) for key in ("claude_model", "claude_effort"))
         model, effort = checked(lambda pair: core.checked_claude_pair(*pair), (model, effort))
+        pi_model, pi_thinking = checked(lambda pair: core.checked_pi_pair(*pair, agents), (args.get("pi_model"), args.get("pi_thinking")))
         checked(lambda chosen: core.refuse_unpulled(*chosen), (agents, editor))
-        return {"agents": agents, "editor": editor, "claude_model": model, "claude_effort": effort}
+        return {"agents": agents, "editor": editor, "claude_model": model, "claude_effort": effort, "pi_model": pi_model, "pi_thinking": pi_thinking}
     if verb == "agents_add":
         agent = checked(core.known_agent, args.get("agent", "claude"))
         checked(lambda one: core.refuse_unpulled([one], False), agent)
@@ -532,12 +533,17 @@ def refresh_check_answer(check):
 
 def models_payload():
     """RS's `models` answer, of what clanker-learn has: the efforts and the tiers (alias,
-    label, blurb, the efforts each takes), from the core's catalog file."""
+    label, blurb, the efforts each takes), from the core's catalog file; and pi's half, which
+    RS's page carries as constants (RS has no catalog for pi: pi lists its models only once a
+    provider is logged in inside the project, so its model is a free provider/model id): the
+    thinking levels and the model's pattern, the core's own."""
     core.model_catalog()  # the core's check of the file: a refusal in its words
     with open(core.MODELS_FILE) as fh:
         catalog = json.load(fh)
     return {"efforts": list(catalog["efforts"]),
-            "models": [{key: m.get(key) for key in ("alias", "label", "blurb", "efforts")} for m in catalog["models"]]}
+            "models": [{key: m.get(key) for key in ("alias", "label", "blurb", "efforts")} for m in catalog["models"]],
+            "pi": {"thinking_levels": list(core.PI_THINKING_LEVELS), "model_pattern": core.PI_MODEL_JS,
+                   "model_example": "openrouter/anthropic/claude-opus-latest"}}
 
 
 def proof_is_right(proof):
@@ -802,7 +808,7 @@ def dispatch(verb, args, token=None, tokens=None, *, op_id=None, audit=None, spa
                 if verb == "limits":
                     return answered("ok", ok(core.set_limits(name, **changed)))
                 if verb == "agents_model":
-                    return answered("ok", ok(core.agents_model(name, args.get("model"), args.get("effort"))))
+                    return answered("ok", ok(core.agents_model(name, args.get("model"), args.get("effort"), args.get("pi_model"), args.get("pi_thinking"))))
                 if verb == "port_add":
                     return answered("ok", ok(core.port_add(name, args.get("port"), args.get("label"), args.get("passthrough", False), args.get("host_port"))))
                 return answered("ok", ok(core.port_remove(name, args.get("port"), args.get("passthrough", False))))

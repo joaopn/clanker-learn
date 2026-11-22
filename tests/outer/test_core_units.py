@@ -1767,7 +1767,9 @@ def local_pins(tmp_path):
 
 def test_the_repository_ships_both_pins_and_the_image_has_them():
     repo = pathlib.Path(__file__).resolve().parents[2]
-    assert core.parse_pins(str(repo / "versions.env")) == {"CLAUDE_CODE_VERSION": CLAUDE, "CODE_SERVER_VERSION": EDITOR, "CLAUDE_CODE_EXT_VERSION": CLAUDE, **EXT_PINS}
+    assert core.parse_pins(str(repo / "versions.env")) == {"CLAUDE_CODE_VERSION": CLAUDE, "CODE_SERVER_VERSION": EDITOR, "CLAUDE_CODE_EXT_VERSION": CLAUDE, **EXT_PINS,
+                                                          "PI_CODING_AGENT_VERSION": "1.5.0", "NODE_VERSION": "24.18.0", "PI_SUBAGENTS_VERSION": "0.84.0",
+                                                          "RS_PI_RULES_VERSION": "0.8.0", "RS_PI_DIST_LAYOUT": "2"}
     assert "COPY versions.env /opt/cl/versions.env" in (repo / "outer" / "Dockerfile").read_text()
 
 
@@ -1960,11 +1962,11 @@ def test_the_lane_is_dropped_when_its_holder_dies(dists, tmp_path):
 
 def test_the_status_words(dists, tmp_path):
     rows = core.software_status()
-    assert [(r["id"], r["row"], r["status"], r["pulled"], r["version"], r["repo_version"], r["overridden"]) for r in rows] == [
+    assert [(r["id"], r["row"], r["status"], r["pulled"], r["version"], r["repo_version"], r["overridden"]) for r in rows[:2]] == [
         ("claude", "agent: claude", "not pulled", None, CLAUDE, CLAUDE, False),
         ("code-server", "editor: code-server", "not pulled", None, EDITOR, EDITOR, False)]
     core.software_pull("claude")
-    assert [r["status"] for r in core.software_status()] == ["up to date", "not pulled"]
+    assert [r["status"] for r in core.software_status()][:2] == ["up to date", "not pulled"]
     core.set_version_pin("CLAUDE_CODE_VERSION", "2.1.400")
     claude = core.software_status()[0]
     assert (claude["status"], claude["pulled"]["version"], claude["version"], claude["repo_version"], claude["overridden"]) == (
@@ -2023,7 +2025,7 @@ def test_refresh_raises_the_pin_and_pulls_only_when_upstream_is_newer(dists, tmp
 
 
 def test_unknown_software_is_refused_by_name():
-    for call in (lambda: core.software_pull("pi"), lambda: core.agent_pull("code-server"), lambda: core.pin_reset("../x")):
+    for call in (lambda: core.software_pull("nope"), lambda: core.agent_pull("code-server"), lambda: core.pin_reset("../x")):
         with pytest.raises(core.CoreError, match="There is no"):
             call()
 
@@ -2055,7 +2057,7 @@ def test_the_keeper_takes_a_preloaded_distribution_and_builds_nothing(dists, tmp
                        ("editor", "pulling"), ("editor", f"pulling: taking the editor (code-server) 4.125.0 from {tmp_path}/preload/dist/editor"),
                        ("editor", "pulling: the editor (code-server) 4.125.0 is pulled"), ("editor", "ready: 4.125.0")]
     assert dists.runs() == [] and (tmp_path / "data" / "dist" / "editor" / ".cl-dist").is_file()
-    assert [r["status"] for r in core.software_status()] == ["up to date", "stale — re-pull"]
+    assert [r["status"] for r in core.software_status()][:2] == ["up to date", "stale — re-pull"]
     reports.clear()
     core.keep_software(lambda key, value: reports.append((key, value)), True)                # the next start: nothing pulled
     assert reports == [("agents", f"ready: {CLAUDE}"), ("editor", "ready: 4.125.0")] and dists.runs() == []
@@ -2086,7 +2088,7 @@ def test_the_keeper_builds_what_is_missing_and_says_what_failed(dists, tmp_path)
 
 def test_the_software_verbs_print_json(dists, tmp_path, capsys):
     assert core.main(["software"]) == 0
-    assert [row["status"] for row in json.loads(capsys.readouterr().out)] == ["not pulled", "not pulled"]
+    assert [row["status"] for row in json.loads(capsys.readouterr().out)] == ["not pulled", "not pulled", "not pulled"]
     assert core.main(["agent", "pull"]) == 0 and json.loads(capsys.readouterr().out)["version"] == CLAUDE
     assert core.main(["editor", "pull"]) == 0 and json.loads(capsys.readouterr().out)["version"] == EDITOR
     (tmp_path / "preload" / "upstream").mkdir(parents=True)

@@ -112,12 +112,12 @@ _OP_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 # What each write verb of the broker takes. The broker refuses any other field, so only
 # these are forwarded: a field the page sends by mistake is dropped here, in one place.
 BROKER_FIELDS = {
-    "create": ("name", "pids", "memory", "cpus", "agents", "editor", "claude_model", "claude_effort"),
+    "create": ("name", "pids", "memory", "cpus", "agents", "editor", "claude_model", "claude_effort", "pi_model", "pi_thinking"),
     "limits": ("pids", "memory", "cpus"),
     "port_add": ("port", "label", "passthrough", "host_port"),
     "port_remove": ("port", "passthrough"),
     "agents_add": ("agent",),
-    "agents_model": ("model", "effort"),
+    "agents_model": ("model", "effort", "pi_model", "pi_thinking"),
 }
 # agents_update is RS's action name: an operation, like start (RS runs it on its lifecycle lane).
 PROJECT_ACTIONS = ("start", "stop", "recreate", "destroy", "agents_update")
@@ -549,9 +549,10 @@ async def broker_project_agents_handler(request: web.Request) -> web.Response:
 
 
 async def broker_project_model_handler(request: web.Request) -> web.Response:
-    """POST /broker/project/{name}/model {model?, effort?} — Claude's model and effort of a
-    running project (gated, origin-checked; RS's Config box, Agents). A field left out keeps
-    what the project has, "" clears it. The broker answers directly."""
+    """POST /broker/project/{name}/model {model?, effort?, pi_model?, pi_thinking?} — Claude's
+    model and effort, or pi's model and thinking level, of a running project (gated,
+    origin-checked; RS's Config box, Agents). A field left out keeps what the project has, ""
+    clears it. The broker answers directly."""
     if not origin_ok(request):
         return web.Response(status=403, text="origin rejected")
     body = await _json_body(request)
@@ -573,8 +574,9 @@ async def broker_software_handler(request: web.Request) -> web.Response:
 
 
 async def broker_models_handler(request: web.Request) -> web.Response:
-    """GET /broker/models — the catalog of Claude's tiers and the efforts each takes, for the
-    model pickers (the New project box, the project's Config box). Gated read."""
+    """GET /broker/models — the catalog of Claude's tiers and the efforts each takes, and pi's
+    thinking levels and model pattern, for the model pickers (the New project box, the
+    project's Config box). Gated read."""
     status, body = await _relay(request, "models")
     return web.json_response(body, status=status)
 

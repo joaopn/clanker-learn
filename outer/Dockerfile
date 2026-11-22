@@ -41,11 +41,14 @@ RUN mkdir -p /opt/cl/selftest/bin && cp /bin/busybox /opt/cl/selftest/bin/busybo
 
 COPY outer/guard.py outer/init.py outer/core.py outer/broker.py outer/broker_auth.py /opt/cl/
 
-# The versions of Claude Code and the editor that projects get, as the repository has them
+# The versions of Claude Code, pi and the editor that projects get, as the repository has them
 # (/data/versions.local.env overrides them; see that file's header).
 COPY versions.env /opt/cl/versions.env
 # Claude's model tiers and the efforts each takes (research-sandbox's models/catalog.json).
 COPY outer/models.json /opt/cl/models.json
+# pi's files from research-sandbox (its rules extension and settings repair), which the core puts
+# into pi's distribution when it builds one.
+COPY outer/pi/ /opt/cl/pi/
 # The editor's files from research-sandbox (its deploy script, lazy-start stub and settings),
 # which the core puts into the editor's distribution when it builds one.
 COPY outer/editor/ /opt/cl/editor/

@@ -11,7 +11,7 @@ FROM debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f0
 # What a learning environment starts from: a shell user's tools, Python and Node with their
 # package managers, a compiler, sshd for the tutor's way in and the Shell's, tmux, which
 # keeps the Shell's session when its page is closed, and jq, with which the deploy script writes
-# Claude Code's model and effort into its settings. Recommended packages are left
+# the agents' models into their settings. Recommended packages are left
 # out. The host keys the package makes at install are removed: every sandbox gets its own from
 # its provisioning folder.
 RUN set -eux; \
@@ -34,13 +34,14 @@ RUN set -eux; \
 
 COPY sandbox_init.py files_server.py loopback_fwd.py /opt/cl/
 
-# The deploy script (copies a distribution into the sandbox user's home), and `claude`, which
-# runs the home's copy, so that a command over SSH that reads no login files finds it too.
+# The deploy script (copies a distribution into the sandbox user's home), and `claude` and `pi`,
+# which run the home's copy, so that a command over SSH that reads no login files finds it too.
 # The distributions are mounted at /opt/cl/dist; the two links give RS's scripts their paths
 # (the editor's deploy script and stub run from /opt/editor-dist/tools, and need python3).
 COPY deploy.sh /opt/cl/deploy
 COPY claude.sh /usr/local/bin/claude
-RUN chmod 0755 /opt/cl/deploy /usr/local/bin/claude; \
+COPY pi.sh /usr/local/bin/pi
+RUN chmod 0755 /opt/cl/deploy /usr/local/bin/claude /usr/local/bin/pi; \
     ln -s /opt/cl/dist/agents /opt/agent-dist; \
     ln -s /opt/cl/dist/editor /opt/editor-dist
 
