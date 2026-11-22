@@ -7,7 +7,9 @@ the broker's socket folder, read-only, and a folder for its certificate.
 It carries: the login (the proof the browser derives from the password is relayed to the
 broker, which authenticates; the broker's session token stays here, server-side, under a
 cookie scoped to /broker), the first password (a set-up code from the container's log), the
-project list and status, the project actions, the progress of an operation, a project's
+project list and status, the project actions (its agents among them), Settings -> Software
+(the builds of the agents and the editor, followed as operations) and the model catalog, the
+progress of an operation, a project's
 terminal (a WebSocket relayed to the sandbox's sshd, where it runs tmux), a project's session
 cookie (which its web-app tabs are opened with), a project's tabs (the files server, the web
 apps named by hand or detected, the raw TCP ports named by hand), opening a web app on an
@@ -108,12 +110,15 @@ _OP_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 # What each write verb of the broker takes. The broker refuses any other field, so only
 # these are forwarded: a field the page sends by mistake is dropped here, in one place.
 BROKER_FIELDS = {
-    "create": ("name", "pids", "memory", "cpus"),
+    "create": ("name", "pids", "memory", "cpus", "agents", "editor", "claude_model", "claude_effort"),
     "limits": ("pids", "memory", "cpus"),
     "port_add": ("port", "label", "passthrough", "host_port"),
     "port_remove": ("port", "passthrough"),
+    "agents_add": ("agent",),
+    "agents_model": ("model", "effort"),
 }
-PROJECT_ACTIONS = ("start", "stop", "recreate", "destroy")
+# agents_update is RS's action name: an operation, like start (RS runs it on its lifecycle lane).
+PROJECT_ACTIONS = ("start", "stop", "recreate", "destroy", "agents_update")
 
 LOGIN_MAX_FAILURES = 10
 LOGIN_WINDOW_SECONDS = 60
@@ -511,6 +516,113 @@ async def broker_project_action_handler(request: web.Request) -> web.Response:
         if isinstance(proof, str):
             args["proof"] = proof
     return await _lane_relay(request, action, args, name)
+
+
+async def broker_project_agents_handler(request: web.Request) -> web.Response:
+    """POST /broker/project/{name}/agents {agent} — add an agent to a running project (gated,
+    origin-checked). An operation, as RS's `update` with agents: {ok, op_id} at once, or the
+    broker's refusal (an agent that is not pulled, busy) in this response."""
+    if not origin_ok(request):
+        return web.Response(status=403, text="origin rejected")
+    body = await _json_body(request)
+    if body is None:
+        return _bad_request() if _broker_session(request) else _unauthorized()
+    name = request.match_info.get("name", "")
+    return await _lane_relay(request, "agents_add", dict(_forward(body, "agents_add"), name=name), name)
+
+
+async def broker_project_model_handler(request: web.Request) -> web.Response:
+    """POST /broker/project/{name}/model {model?, effort?} — Claude's model and effort of a
+    running project (gated, origin-checked; RS's Config box, Agents). A field left out keeps
+    what the project has, "" clears it. The broker answers directly."""
+    if not origin_ok(request):
+        return web.Response(status=403, text="origin rejected")
+    body = await _json_body(request)
+    if body is None:
+        return _bad_request() if _broker_session(request) else _unauthorized()
+    args = dict(_forward(body, "agents_model"), name=request.match_info.get("name", ""))
+    status, reply = await _relay(request, "agents_model", args)
+    return web.json_response(reply, status=status)
+
+
+# ---- Settings -> Software, and the model catalog (RS's handlers) ------------------
+
+async def broker_software_handler(request: web.Request) -> web.Response:
+    """GET /broker/software — what is pulled of the agents and the editor, the version in
+    effect and the repository's, and whether one is being built (gated). The SameSite=Strict
+    cookie is the CSRF defense for this read."""
+    status, body = await _relay(request, "software_status")
+    return web.json_response(body, status=status)
+
+
+async def broker_models_handler(request: web.Request) -> web.Response:
+    """GET /broker/models — the catalog of Claude's tiers and the efforts each takes, for the
+    model pickers (the New project box, the project's Config box). Gated read."""
+    status, body = await _relay(request, "models")
+    return web.json_response(body, status=status)
+
+
+async def broker_pin_reset_handler(request: web.Request) -> web.Response:
+    """POST /broker/software/pin-reset {software} — "Use repo version": the software's pins
+    out of the local override (gated, origin-checked). RS sends the pin's key; the core here
+    takes the software's id ("claude", "code-server")."""
+    if not origin_ok(request):
+        return web.Response(status=403, text="origin rejected")
+    body = await _json_body(request) or {}
+    status, reply = await _relay(request, "pin_reset", {"software": body.get("software")})
+    return web.json_response(reply, status=status)
+
+
+# The fixed set of build verbs the browser may request (the input boundary — the broker
+# re-validates the agent pre-spawn). agent_pull/agent_refresh carry the agent; the refreshes
+# re-resolve upstream child-side (no client-supplied version crosses).
+_BUILD_VERBS = frozenset({"agent_pull", "editor_pull", "agent_refresh", "editor_refresh"})
+
+
+async def broker_build_handler(request: web.Request) -> web.Response:
+    """POST /broker/software/build {verb, agent?} — start a build (gated, origin-checked).
+    Returns {ok, op_id} at once; the browser follows it as any operation (/broker/op/<id>/log,
+    /alive, /broker/op/<id>) and finds it again after a reload at /broker/software/active. A
+    refusal (another build runs: busy; an unknown agent) comes back in this response."""
+    if not origin_ok(request):
+        return web.Response(status=403, text="origin rejected")
+    if _broker_session(request) is None:
+        return _unauthorized()
+    body = await _json_body(request) or {}
+    verb = body.get("verb")
+    if verb not in _BUILD_VERBS:
+        return web.json_response(
+            {"ok": False, "error": {"kind": "validation", "message": "unknown build verb"}}, status=200)
+    args = {"agent": body.get("agent", "claude")} if verb in ("agent_pull", "agent_refresh") else {}
+    return await _lane_relay(request, verb, args, "software")
+
+
+_REFRESH_CHECK_VERBS = frozenset({"agent_refresh_check", "editor_refresh_check"})
+
+
+async def broker_refresh_check_handler(request: web.Request) -> web.Response:
+    """POST /broker/software/refresh-check {verb, agent?} — upstream's newest beside the
+    version in effect, so the page can show current→latest before Refresh (gated,
+    origin-checked; the broker asks upstream, bounded by the core)."""
+    if not origin_ok(request):
+        return web.Response(status=403, text="origin rejected")
+    if _broker_session(request) is None:
+        return _unauthorized()
+    body = await _json_body(request) or {}
+    verb = body.get("verb")
+    if verb not in _REFRESH_CHECK_VERBS:
+        return web.json_response(
+            {"ok": False, "error": {"kind": "validation", "message": "unknown refresh-check verb"}}, status=200)
+    args = {"agent": body.get("agent", "claude")} if verb == "agent_refresh_check" else {}
+    status, reply = await _relay(request, verb, args)
+    return web.json_response(reply, status=status)
+
+
+async def broker_software_active_handler(request: web.Request) -> web.Response:
+    """GET /broker/software/active — every build in flight, {ops:[{op_id, verb, target,
+    agent?, state}]} (gated). The page seeds its "pulling…" labels from this after a reload."""
+    status, body = await _relay(request, "build_active")
+    return web.json_response(body, status=status)
 
 
 async def broker_lifecycle_handler(request: web.Request) -> web.Response:
@@ -1034,7 +1146,7 @@ def _detected_rows(reply: dict) -> list[dict] | None:
     return [r for r in (rows if isinstance(rows, list) else []) if isinstance(r, dict) and _is_port(r.get("port"))]
 
 
-def _assemble_services(project: str, entries: list[dict], detected: list[dict] | None) -> dict:
+def _assemble_services(project: str, entries: list[dict], detected: list[dict] | None, editor: bool = True) -> dict:
     """The project's tabs, in RS's shape (id -> row, in tab order). Of RS's rows only the
     kinds clanker-learn has: the editor, the files server, web apps named by hand, detected apps, raw TCP
     ports. A web row carries its origin port once the app was opened (never allocated here)."""
@@ -1048,7 +1160,8 @@ def _assemble_services(project: str, entries: list[dict], detected: list[dict] |
 
     out: dict[str, dict] = {}
     if detected is not None:
-        out["editor"] = web_row(EDITOR_PORT, "Editor", always_on=True)
+        if editor:   # only a project given the editor has the Editor tab
+            out["editor"] = web_row(EDITOR_PORT, "Editor", always_on=True)
         out["files"] = web_row(FILES_SERVER_PORT, "Files", always_on=True)
     named = {e["port"] for e in entries}
     for e in entries:
@@ -1081,8 +1194,16 @@ async def project_services_handler(request: web.Request) -> web.Response:
     status, detected = await _relay(request, "port_detect", {"name": project})
     if status != 200:
         return web.json_response(detected, status=status)
+    rows = _detected_rows(detected)
+    editor = rows is not None and await _has_editor(request, project)
     return web.json_response(
-        {"ok": True, "services": _assemble_services(project, entries, _detected_rows(detected))})
+        {"ok": True, "services": _assemble_services(project, entries, rows, editor)})
+
+
+async def _has_editor(request: web.Request, project: str) -> bool:
+    """Whether the project was given the editor, as the broker's `status` says."""
+    status, reply = await _relay(request, "status", {"name": project})
+    return status == 200 and bool(reply.get("ok")) and (reply.get("result") or {}).get("editor") is True
 
 
 async def project_origin_handler(request: web.Request) -> web.Response:
@@ -1106,7 +1227,8 @@ async def project_origin_handler(request: web.Request) -> web.Response:
     _claims_take(project, entries)
     if not _is_port(port):
         return _refusal("validation", "port must be a port number from 1 to 65535")
-    allowed = port in (EDITOR_PORT, FILES_SERVER_PORT) or port in {e["port"] for e in entries if not e.get("passthrough")}
+    allowed = (port == FILES_SERVER_PORT or (port == EDITOR_PORT and await _has_editor(request, project))
+               or port in {e["port"] for e in entries if not e.get("passthrough")})
     if not allowed:
         status, detected = await _relay(request, "port_detect", {"name": project})
         if status != 200:
@@ -1615,6 +1737,12 @@ def build_app() -> web.Application:
     app.router.add_post("/broker/setup", broker_setup_handler)
     app.router.add_get("/broker/projects", broker_projects_handler)
     app.router.add_get("/broker/lifecycle", broker_lifecycle_handler)
+    app.router.add_get("/broker/models", broker_models_handler)
+    app.router.add_get("/broker/software", broker_software_handler)
+    app.router.add_get("/broker/software/active", broker_software_active_handler)
+    app.router.add_post("/broker/software/build", broker_build_handler)
+    app.router.add_post("/broker/software/refresh-check", broker_refresh_check_handler)
+    app.router.add_post("/broker/software/pin-reset", broker_pin_reset_handler)
     app.router.add_post("/broker/project", broker_create_handler)
     app.router.add_get("/broker/project/{name}", broker_project_status_handler)
     app.router.add_get("/broker/project/{name}/terminal", ws_handler)
@@ -1626,6 +1754,8 @@ def build_app() -> web.Application:
     app.router.add_post("/broker/project/{name}/session", session_handler)
     app.router.add_post("/broker/project/{name}/origin", project_origin_handler)
     app.router.add_post("/broker/project/{name}/ports", broker_port_add_handler)
+    app.router.add_post("/broker/project/{name}/agents", broker_project_agents_handler)
+    app.router.add_post("/broker/project/{name}/model", broker_project_model_handler)
     app.router.add_post("/broker/project/{name}/{action}", broker_project_action_handler)
     app.router.add_get("/broker/op/{op_id}/log", broker_op_log_handler)
     app.router.add_get("/broker/op/{op_id}/alive", broker_op_alive_handler)

@@ -211,9 +211,9 @@ def test_a_minted_op_id_is_one_the_broker_takes_for_the_longest_name(action):
 
 
 def test_the_fields_forwarded_are_the_brokers():
-    for verb in ("create", "limits", "port_add", "port_remove"):
+    for verb in server.BROKER_FIELDS:
         assert set(server.BROKER_FIELDS[verb]) | {"name"} == broker.FIELDS[verb]
-    assert set(server.BROKER_FIELDS) == {"create", "limits", "port_add", "port_remove"}
+    assert set(server.BROKER_FIELDS) == {"create", "limits", "port_add", "port_remove", "agents_add", "agents_model"}
     assert set(server.PROJECT_ACTIONS) <= broker.OP_VERBS and set(server.PROJECT_ACTIONS) <= set(broker.FIELDS)
     body = {"name": "p1", "pids": 100, "memory": "1g", "cpus": "2", "proof": "x", "token": "t", "op_id": "o"}
     assert server._forward(body, "create") == {"name": "p1", "pids": 100, "memory": "1g", "cpus": "2"}
@@ -1567,6 +1567,7 @@ DETECTED = [{"port": 3000, "inodes": [201], "label": "3000"}, {"port": 8000, "in
 def ports_known(fake, named=NAMED, detected=DETECTED):
     fake.replies["port_list"] = lambda args: broker.ok({"project": args["name"], "ports": named})
     fake.replies["port_detect"] = lambda args: broker.ok({"project": args["name"], "running": True, "ports": detected})
+    fake.replies["status"] = broker.ok({"editor": True})
 
 
 def test_the_service_list_holds_the_editor_the_files_server_the_named_and_detected_apps_and_raw_tcp(fake):
@@ -1627,7 +1628,7 @@ def test_the_editors_port_opens_like_the_files_servers_without_detection(fake):
         answer = await client.post("/broker/project/p1/origin", json={"port": 8443}, headers=with_session(client))
         return await answer.json()
     assert served(test) == {"ok": True, "origin_port": 11100}
-    assert fake.verbs() == ["port_list"] and server.ORIGIN_PORTS == {11100: {"project": "p1", "port": 8443}}
+    assert fake.verbs() == ["port_list", "status"] and server.ORIGIN_PORTS == {11100: {"project": "p1", "port": 8443}}
 
 
 def test_the_port_routes_relay_their_verbs_with_their_fields_only_and_the_claims_follow(fake):

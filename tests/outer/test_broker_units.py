@@ -75,8 +75,10 @@ def read(path):
 def test_a_verb_that_is_not_in_the_table_is_unknown_and_nothing_passes_through(world):
     for verb in ("docker", "exec", "update", "passwd", "", None, 7, "__run-op"):
         assert kind(world.call(verb)) == "unknown_verb"
-    assert sorted(broker.FIELDS) == ["attach", "build_alive", "create", "destroy", "first_password", "lifecycle_active", "limits", "list", "op",
-                                     "port_add", "port_detect", "port_list", "port_remove", "recreate", "setup_needed", "start", "status", "stop"]
+    assert sorted(broker.FIELDS) == ["agent_pull", "agent_refresh", "agent_refresh_check", "agents_add", "agents_model", "agents_update", "attach",
+                                     "build_active", "build_alive", "create", "destroy", "editor_pull", "editor_refresh", "editor_refresh_check",
+                                     "first_password", "lifecycle_active", "limits", "list", "models", "op", "pin_reset", "port_add", "port_detect",
+                                     "port_list", "port_remove", "recreate", "setup_needed", "software_status", "start", "status", "stop"]
 
 
 def test_arguments_that_are_not_an_object_are_a_bad_request(world):
@@ -295,7 +297,7 @@ def test_an_operation_is_accepted_logged_and_started_with_what_it_needs_and_no_m
     reply = world.call("create", {"name": "kafka", "cpus": 2}, token=token, op_id="op-1")
     assert reply == {"ok": True, "result": {"op_id": "op-1", "state": "running", "started": True}}
     (spec,) = world.spawned
-    assert sorted(spec) == ["limits", "lock_fd", "log_fd", "marker_fd", "name", "op_id", "verb"]
+    assert sorted(spec) == ["agents", "claude_effort", "claude_model", "editor", "limits", "lock_fd", "log_fd", "marker_fd", "name", "op_id", "verb"]
     first = json.loads(read(broker.view_log("op-1")))
     assert {k: first[k] for k in ("op_id", "project", "action", "step", "status", "msg")} == {
         "op_id": "op-1", "project": "kafka", "action": "create", "step": "accepted", "status": "step", "msg": ""}

@@ -50,9 +50,15 @@ One request per connection, handled one at a time. Containment, by construction:
   * A request larger than MAX_REQUEST_BYTES is refused before its body is read, and a
     request that has not arrived whole within READ_TIMEOUT_S is dropped.
 
-The five verbs that can take long (create, start, stop, recreate, destroy) run as operations:
-a child of this process, a fresh interpreter given only the verb, the checked name and limits
-and the caller's op_id, which calls the core and writes RS's progress log,
+Settings -> Software (RS's verbs): `software_status` and `models` are reads,
+`agent_refresh_check` and `editor_refresh_check` ask upstream in the request (bounded by the
+core), `pin_reset` is answered at once. A project's agents: `agents_model` is answered at
+once under the project's lock, like `limits`.
+
+The verbs that can take long (create, start, stop, recreate, destroy, agents_add,
+agents_update) run as operations: a child of this process, a fresh interpreter given only the
+verb, the checked name, limits and choices and the caller's op_id, which calls the core and
+writes RS's progress log,
 <the socket's folder>/oplogs/<op_id>.view.log: JSON lines {op_id, project, action, step,
 status, msg, ts}, the last one with status "done" or "failed". The reply returns at once.
 
@@ -63,6 +69,12 @@ keeps it for as long as the child holds it, across a restart of this broker, wit
 written anywhere; the child lets go when the work is done, just before its last word, or by
 ending. A second lock, on a marker file per operation, held to the child's end, says in the
 same way whether the operation still runs.
+
+The builds (agent_pull, agent_refresh, editor_pull, editor_refresh) are operations that
+belong to no project, RS's build lane: what is taken without waiting and handed to the child
+is the core's build lane instead of a project's lock, one build at a time ("busy" with the
+core's sentence while another runs; RS queues builds of other targets). Their records carry
+`project: null`, as RS's; `build_active` lists them, `lifecycle_active` the project ones.
 """
 import base64
 import contextlib
@@ -108,19 +120,38 @@ AUTH_VERBS = ("login", "logout")
 SETUP_VERBS = frozenset({"setup_needed", "first_password"})
 OPEN_VERBS = frozenset({"list", "status", "op"})
 STEP_UP_VERBS = frozenset({"destroy"})
-OP_VERBS = frozenset({"create", "start", "stop", "recreate", "destroy"})
+# Operations on a project: a child holds the project's lock (agents_add and agents_update run
+# here as RS runs its `update` and `agents_update`: on its lifecycle lane, with a log).
+OP_VERBS = frozenset({"create", "start", "stop", "recreate", "destroy", "agents_add", "agents_update"})
+# Operations that belong to no project (RS's build lane): a child holds the core's build lane
+# instead. Their log records carry `project: null`, as RS's do (its build ops have no name).
+BUILD_VERBS = frozenset({"agent_pull", "agent_refresh", "editor_pull", "editor_refresh"})
 # Audited like the operations: `attach` hands out a credential, the others change something.
-AUDITED_VERBS = OP_VERBS | {"limits", "attach", "port_add", "port_remove"}
+AUDITED_VERBS = OP_VERBS | BUILD_VERBS | {"limits", "attach", "port_add", "port_remove", "agents_model", "pin_reset"}
 # Answered by this process at once, under the project's lock taken without waiting.
-LOCKED_VERBS = frozenset({"limits", "port_add", "port_remove"})
+LOCKED_VERBS = frozenset({"limits", "port_add", "port_remove", "agents_model"})
 LIMITS = ("pids", "memory", "cpus")
+CREATE_SOFTWARE = ("agents", "editor", "claude_model", "claude_effort")
 FIELDS = {
     "list": frozenset(),
     "status": frozenset({"name"}),
     "op": frozenset({"op_id"}),
     "build_alive": frozenset({"op_id"}),
     "lifecycle_active": frozenset(),
-    "create": frozenset({"name", *LIMITS}),
+    "build_active": frozenset(),
+    "software_status": frozenset(),
+    "models": frozenset(),
+    "agent_refresh_check": frozenset({"agent"}),
+    "editor_refresh_check": frozenset(),
+    "agent_pull": frozenset({"agent"}),
+    "agent_refresh": frozenset({"agent"}),
+    "editor_pull": frozenset(),
+    "editor_refresh": frozenset(),
+    "pin_reset": frozenset({"software"}),
+    "agents_add": frozenset({"name", "agent"}),
+    "agents_update": frozenset({"name"}),
+    "agents_model": frozenset({"name", "model", "effort"}),
+    "create": frozenset({"name", *LIMITS, *CREATE_SOFTWARE}),
     "start": frozenset({"name"}),
     "stop": frozenset({"name"}),
     "recreate": frozenset({"name"}),
@@ -226,9 +257,10 @@ def op_state(op_id):
     return dict(out, state="failed", msg="The operation ended without a result.")
 
 
-def ops_in_flight():
-    """Every operation whose child lives: {op_id, project, verb, state}, oldest first. A marker
-    whose child is gone is cleared on the way."""
+def ops_in_flight(builds=False):
+    """Every operation on a project whose child lives: {op_id, project, verb, state}, oldest
+    first; with `builds`, every build instead, in RS's build_active shape: {op_id, verb,
+    target, agent?, state}. A marker whose child is gone is cleared on the way."""
     try:
         found = os.listdir(MARKERS)
     except OSError:
@@ -249,18 +281,41 @@ def ops_in_flight():
         try:
             with open(marker(op_id)) as fh:
                 told = json.load(fh)
-            out.append({"op_id": op_id, "project": told["project"], "verb": told["verb"], "state": "running"})
+            if not builds and told["project"] is not None:
+                out.append({"op_id": op_id, "project": told["project"], "verb": told["verb"], "state": "running"})
+            elif builds and told["project"] is None:
+                op = {"op_id": op_id, "verb": told["verb"], "target": told["target"], "state": "running"}
+                if isinstance(told.get("agent"), str):
+                    op["agent"] = told["agent"]
+                out.append(op)
         except (OSError, ValueError, KeyError, TypeError):
             continue
     return out
 
 
-def start_operation(op_id, verb, name, limits, spawn):
-    """Take the project, make the log and the marker, start the child. Raises Refuse("busy")
-    when the project is not free, and Refuse("bad_request") for an op_id already used."""
-    held = core.try_lock(name)
-    if held is None:
-        raise Refuse("busy", f"Something else is being done with {name}; try again when it is over.")
+def build_target(verb, agent):
+    """What a build makes, in RS's words: "agent:<agent>" or "editor"."""
+    return f"agent:{agent}" if verb.startswith("agent_") else "editor"
+
+
+def start_operation(op_id, verb, name, limits, spawn, extra=None):
+    """Take the project (or, for a build, the build lane), make the log and the marker, start
+    the child. Raises Refuse("busy") when the project or the lane is not free, and
+    Refuse("bad_request") for an op_id already used. `extra` is more of the spec, checked
+    values only."""
+    extra = dict(extra or {})
+    if verb in BUILD_VERBS:
+        try:
+            lane = core.take_build_lane(extra["software"])
+        except core.CoreError as exc:
+            raise Refuse("busy", str(exc)) from exc
+        handed = {"lane_fds": [fh.fileno() for fh in lane]}
+        told = {"target": build_target(verb, extra.get("agent")), **({"agent": extra["agent"]} if "agent" in extra else {})}
+    else:
+        held = core.try_lock(name)
+        if held is None:
+            raise Refuse("busy", f"Something else is being done with {name}; try again when it is over.")
+        lane, handed, told = [held], {"lock_fd": held.fileno()}, {}
     try:
         os.makedirs(OPLOGS, mode=0o755, exist_ok=True)
         os.makedirs(MARKERS, mode=0o700, exist_ok=True)
@@ -271,31 +326,55 @@ def start_operation(op_id, verb, name, limits, spawn):
         try:
             os.write(log_fd, record(op_id, name, verb, "step", "accepted", "").encode())
             with open(marker(op_id), "w") as mark:
-                json.dump({"op_id": op_id, "project": name, "verb": verb}, mark)
+                json.dump({"op_id": op_id, "project": name, "verb": verb, **told}, mark)
                 mark.flush()
                 fcntl.flock(mark, fcntl.LOCK_EX)
-                spawn({"op_id": op_id, "verb": verb, "name": name, "limits": limits,
-                       "lock_fd": held.fileno(), "marker_fd": mark.fileno(), "log_fd": log_fd})
+                spawn({"op_id": op_id, "verb": verb, "name": name, "limits": limits, **extra, **handed,
+                       "marker_fd": mark.fileno(), "log_fd": log_fd})
         finally:
             os.close(log_fd)
     finally:
-        held.close()  # the child has its own copy by now; this one is let go
+        for fh in lane:
+            fh.close()  # the child has its own copy by now; this one is let go
 
 
 def spawn_child(spec, children):
     """A fresh interpreter for one operation. It gets the three descriptors and the spec, and
     nothing of this process's memory: no token, no proof. It stays in this process's group,
     so that the init can end the broker and its operations together."""
+    held = [spec["lock_fd"]] if "lock_fd" in spec else list(spec["lane_fds"])
     child = subprocess.Popen([sys.executable, os.path.abspath(__file__), "__run-op", json.dumps(spec)],
                              stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                             pass_fds=(spec["lock_fd"], spec["marker_fd"], spec["log_fd"]))
+                             pass_fds=(*held, spec["marker_fd"], spec["log_fd"]))
     children.append(child)
 
 
+def what_was_done(verb, name, out):
+    """The last word of an operation that went well."""
+    if verb in BUILD_VERBS:
+        label = core.SOFTWARE[out.get("software", "")]["label"] if out.get("software") in core.SOFTWARE else "The software"
+        label = label[0].upper() + label[1:]
+        if verb.endswith("_refresh") and not out.get("bumped"):
+            return f"{label} {out.get('version')} is in effect and upstream's newest is {out.get('upstream')}: nothing to do."
+        return f"{label} {out.get('version')} is pulled."
+    if verb in ("agents_add", "agents_update"):
+        deployed = ", ".join(f"{agent} {version}" for agent, version in (out.get("deployed") or {}).items())
+        return f"Deployed into {name}: {deployed or 'nothing'}."
+    notes = " ".join(out.get("notes", []))
+    return f"{name} is {out.get('state', 'done')}." + (f" {notes}" if notes else "")
+
+
 def run_operation(spec):
-    """The child: do the work with the project's lock already in hand, and say how it went."""
+    """The child: do the work with the project's lock (or the build lane) already in hand, and
+    say how it went."""
     op_id, verb, name = spec["op_id"], spec["verb"], spec["name"]
-    core.HELD.add(name)  # handed over by the broker, held through spec["lock_fd"] until let_go(), or this process's end
+    build = verb in BUILD_VERBS
+    if build:
+        core.LANE_HELD = spec["software"]  # handed over by the broker, held through spec["lane_fds"]
+        handed = list(spec.get("lane_fds", []))
+    else:
+        core.HELD.add(name)  # handed over by the broker, held through spec["lock_fd"] until let_go(), or this process's end
+        handed = [spec["lock_fd"]]
 
     def emit(status, step, msg=""):
         os.write(spec["log_fd"], record(op_id, name, verb, status, step, msg).encode())
@@ -306,12 +385,29 @@ def run_operation(spec):
     def let_go():
         """The project is free before the last word is written: whoever reads "done" and asks
         for the next thing at once must not be told "busy"."""
-        core.HELD.discard(name)
-        with contextlib.suppress(OSError):
-            os.close(spec["lock_fd"])
+        if build:
+            core.LANE_HELD = None
+        else:
+            core.HELD.discard(name)
+        for fd in handed:
+            with contextlib.suppress(OSError):
+                os.close(fd)
     try:
         if verb == "create":
-            out = core.create(name, spec["limits"], say)
+            chosen = {key: spec[key] for key in CREATE_SOFTWARE if key in spec}
+            out = core.create(name, spec["limits"], say, **chosen)
+        elif verb == "agent_pull":
+            out = core.agent_pull(spec["agent"], say)
+        elif verb == "agent_refresh":
+            out = core.agent_refresh(spec["agent"], say)
+        elif verb == "editor_pull":
+            out = core.editor_pull(say)
+        elif verb == "editor_refresh":
+            out = core.editor_refresh(say)
+        elif verb == "agents_add":
+            out = core.agents_add(name, spec["agent"])
+        elif verb == "agents_update":
+            out = core.agents_update(name)
         elif verb == "start":
             out = core.start(name, say)
         elif verb == "stop":
@@ -320,9 +416,8 @@ def run_operation(spec):
             out = core.recreate(name, say)
         else:
             out = core.destroy(name)
-        notes = " ".join(out.get("notes", []))
         let_go()
-        emit("done", "done", f"{name} is {out.get('state', 'done')}." + (f" {notes}" if notes else ""))
+        emit("done", "done", what_was_done(verb, name, out))
         code = 0
     except core.CoreError as exc:
         let_go()
@@ -356,6 +451,58 @@ def limits_named(args):
         except core.CoreError as exc:
             raise Refuse("validation", str(exc)) from exc
     return given
+
+
+def checked(check, value):
+    """A field checked by the core: its refusal is the request's answer."""
+    try:
+        return check(value)
+    except core.CoreError as exc:
+        raise Refuse("validation", str(exc)) from exc
+
+
+def operation_extra(verb, args):
+    """What an operation's child is handed besides the name and the limits: checked values
+    only, refused before the operation is accepted where the core can say so (an agent that
+    is not pulled is the request's answer, not a failed operation)."""
+    if verb == "create":
+        agents = checked(core.checked_agents, args.get("agents", []))
+        editor = checked(core.checked_editor, args.get("editor", False))
+        model, effort = (("" if args.get(key) is None else args[key]) for key in ("claude_model", "claude_effort"))
+        model, effort = checked(lambda pair: core.checked_claude_pair(*pair), (model, effort))
+        checked(lambda chosen: core.refuse_unpulled(*chosen), (agents, editor))
+        return {"agents": agents, "editor": editor, "claude_model": model, "claude_effort": effort}
+    if verb == "agents_add":
+        agent = checked(core.known_agent, args.get("agent", "claude"))
+        checked(lambda one: core.refuse_unpulled([one], False), agent)
+        return {"agent": agent}
+    if verb in ("agent_pull", "agent_refresh"):
+        agent = checked(core.known_agent, args.get("agent", "claude"))
+        return {"agent": agent, "software": agent}
+    if verb in ("editor_pull", "editor_refresh"):
+        return {"software": "code-server"}
+    return {}
+
+
+def refresh_check_answer(check):
+    """The core's refresh check, in RS's shape ({current, latest, downgrade}, and for an
+    agent ext_current, ext_latest, ext_downgrade), with the core's own keys kept beside."""
+    out = dict(check, current=check["version"], latest=check["upstream"],
+               downgrade=core.is_newer(check["version"], check["upstream"]))
+    if "ext_version" in check:
+        out.update(ext_current=check["ext_version"], ext_latest=check["ext_upstream"],
+                   ext_downgrade=core.is_newer(check["ext_version"], check["ext_upstream"]))
+    return out
+
+
+def models_payload():
+    """RS's `models` answer, of what clanker-learn has: the efforts and the tiers (alias,
+    label, blurb, the efforts each takes), from the core's catalog file."""
+    core.model_catalog()  # the core's check of the file: a refusal in its words
+    with open(core.MODELS_FILE) as fh:
+        catalog = json.load(fh)
+    return {"efforts": list(catalog["efforts"]),
+            "models": [{key: m.get(key) for key in ("alias", "label", "blurb", "efforts")} for m in catalog["models"]]}
 
 
 def proof_is_right(proof):
@@ -572,6 +719,22 @@ def dispatch(verb, args, token=None, tokens=None, *, op_id=None, audit=None, spa
             return ok({"alive": is_running(checked_op_id(args.get("op_id")))})
         if verb == "lifecycle_active":
             return ok({"ops": ops_in_flight()})
+        if verb == "build_active":
+            return ok({"ops": ops_in_flight(builds=True)})
+
+        # Settings -> Software: reads, the two that ask upstream answered in the request
+        # (bounded by the core), and "Use repo version".
+        if verb == "software_status":
+            return ok(core.software_status())
+        if verb == "models":
+            return ok(models_payload())
+        if verb == "agent_refresh_check":
+            return ok(refresh_check_answer(core.agent_refresh_check(checked(core.known_agent, args.get("agent", "claude")))))
+        if verb == "editor_refresh_check":
+            return ok(refresh_check_answer(core.editor_refresh_check()))
+        if verb == "pin_reset":
+            checked(core.known_software, args.get("software"))
+            return answered("ok", ok(core.pin_reset(args["software"])))
 
         if verb == "attach":
             return answered("ok", ok(core.attach(name)))
@@ -589,6 +752,8 @@ def dispatch(verb, args, token=None, tokens=None, *, op_id=None, audit=None, spa
             try:
                 if verb == "limits":
                     return answered("ok", ok(core.set_limits(name, **changed)))
+                if verb == "agents_model":
+                    return answered("ok", ok(core.agents_model(name, args.get("model"), args.get("effort"))))
                 if verb == "port_add":
                     return answered("ok", ok(core.port_add(name, args.get("port"), args.get("label"), args.get("passthrough", False), args.get("host_port"))))
                 return answered("ok", ok(core.port_remove(name, args.get("port"), args.get("passthrough", False))))
@@ -597,9 +762,10 @@ def dispatch(verb, args, token=None, tokens=None, *, op_id=None, audit=None, spa
                 held.close()
 
         limits = limits_named(args) if verb == "create" else None
+        extra = operation_extra(verb, args)
         checked_op_id(op_id)
         if spawn is not None:
-            start_operation(op_id, verb, name, limits, spawn)
+            start_operation(op_id, verb, name, limits, spawn, extra)
         return answered("ok", ok({"op_id": op_id, "state": "running", "started": True}))
     except Refuse as refused:
         return answered(refused.kind, err(refused.kind, refused.message))
