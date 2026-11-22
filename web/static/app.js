@@ -7,7 +7,9 @@
 // follow the mock's lesson view; three pieces are ported from gaggiclanker's web client (said at
 // their place: the stream client, the context line's wording, the Markdown rules). The tabs side
 // by side (columns, splitters, tabs dragged between them) are RS's column layout, lifted (see
-// "tabs side by side" below). Plain script, no framework, no build step.
+// "tabs side by side" below). The interface settings (Settings -> Interface: themes, editor zoom,
+// CLI width and font size) and the sidebar's drag to resize are RS's too (see "the interface
+// settings" below). Plain script, no framework, no build step.
 //
 // Every string that comes from the server or a sandbox goes into the page as text: the
 // page is built with h() below, which makes text nodes, and never with innerHTML. The tutor's
@@ -207,6 +209,14 @@ const S = {
     backupsError: null,
     backupOp: null,        // the op_id of the backup being made, or null
     ctxWindow: {},         // project -> the context window its tutor last reported (the context line)
+    // The interface settings (Settings -> Interface), per browser, set by applyInterfaceSettings
+    // before the first render; teardownApp keeps them.
+    theme: null,           // THEMES id
+    termTheme: null,       // TERM_THEMES id, or null = follow the interface theme
+    railWidth: null,       // px
+    iframeZoom: null,      // the scale of the Editor and web-app frames
+    cliMaxWidth: null,     // px, 0 = full width
+    termFontSize: null,    // px
 };
 
 const tabOf = (project) => S.tabs[project] || "shell";
@@ -356,8 +366,11 @@ function enterApp(projects) {
     const settings = makeSettingsPane();
     const knowledge = makeKnowledgePane();
     panes.append(empty, settings.el, knowledge.el);
+    const railSplitter = h("div", { class: "rail-splitter", title: "Drag to resize" });
+    installRailSplitterDrag(railSplitter);
     document.getElementById("app").replaceChildren(h("div", { class: "shell" },
         h("nav", { class: "rail" },
+            railSplitter,
             h("div", { class: "rail-head" }, h("span", {}, "PROJECTS")),
             rail,
             h("div", { class: "rail-foot" },
@@ -709,18 +722,593 @@ function dropPane(key) {
     delete S.panes[key];
 }
 
-// ---- the Shell: RS's terminal -------------------------------------------------------------
+// ---- the interface settings: RS's ---------------------------------------------------------
+//
+// RS's (webui/static/app.js at RS commit 9c995b6): THEMES, DEFAULT_THEME, TERM_THEMES,
+// applyTheme, applyTermTheme, currentXtermTheme, repaintTerminals, the iframe zoom, the CLI
+// width and the CLI font size (their load/apply/set functions and selectors, syncTermFontSize),
+// lifted. Kept per browser in its storage as RS keeps them, under this page's own keys, and
+// every read and write of it may fail (a private window, blocked site data): the page then
+// works with the defaults. Adapted: each theme also carries the colours this page has and RS's
+// does not (--bg-rail, --warn-fg, the tab colours); the defaults are the maintainer's RS
+// settings (Editor 100%, CLI width 1000 px, CLI font size 16 px; RS's own: 90%, full width,
+// 13 px); RS's `state` is S; RS's Layout selector is left out (this page has no phone layout).
+// Shown in Settings -> Interface (RS: its floating Settings box, renderSettingsInto).
 
-// RS's dark terminal palette.
-const XTERM_THEME = {
-    background: "#000000", foreground: "#e0e0e0",
-    cursor: "#e0e0e0", cursorAccent: "#000000",
-    selectionBackground: "rgba(255,255,255,0.25)",
-    black: "#000000", red: "#cc0403", green: "#19cb00", yellow: "#cecb00",
-    blue: "#0d73cc", magenta: "#cb1ed1", cyan: "#0dcdcd", white: "#dddddd",
-    brightBlack: "#767676", brightRed: "#f2201f", brightGreen: "#23fd00", brightYellow: "#fffd00",
-    brightBlue: "#1a8fff", brightMagenta: "#fd28ff", brightCyan: "#14ffff", brightWhite: "#ffffff",
+const THEME_KEY = "cl-theme";
+// Terminal palette, chosen apart from the interface theme. Absent = follow the interface theme's own.
+const TERM_THEME_KEY = "cl-term-theme";
+const IFRAME_ZOOM_KEY = "cl-iframe-zoom";
+const IFRAME_ZOOMS = [0.7, 0.8, 0.9, 1.0, 1.1, 1.2];
+const IFRAME_ZOOM_DEFAULT = 1.0;
+// A px cap on the Shell's terminal, for line length on wide windows; applied window-side (a
+// max-width on .term-pad, which the fit add-on measures). 0 = full width.
+const CLI_WIDTH_KEY = "cl-cli-max-width";
+const CLI_MAX_WIDTHS = [0, 800, 1000, 1200];
+const CLI_MAX_WIDTH_DEFAULT = 1000;
+const TERM_FONT_SIZE_KEY = "cl-term-font-size";
+const TERM_FONT_SIZES = [11, 12, 13, 14, 16, 18];
+const TERM_FONT_SIZE_DEFAULT = 16;
+// The sidebar's width (RS's rail): dragged at its right edge, kept, clamped as RS's.
+const RAIL_WIDTH_KEY = "cl-rail-width";
+const RAIL_WIDTH_DEFAULT = 250;
+const RAIL_WIDTH_MIN = 80;
+const RAIL_WIDTH_MAX = 480;
+
+// The browser's storage, which may refuse.
+function storeGet(key) { try { return localStorage.getItem(key); } catch (_) { return null; } }
+function storeSet(key, v) { try { localStorage.setItem(key, v); } catch (_) { /* the page works without it */ } }
+function storeDel(key) { try { localStorage.removeItem(key); } catch (_) { /* the page works without it */ } }
+
+const THEMES = {
+    dark: {
+        label: "Dark",
+        xterm: {
+            background: "#000000", foreground: "#e0e0e0",
+            cursor: "#e0e0e0", cursorAccent: "#000000",
+            selectionBackground: "rgba(255,255,255,0.25)",
+            black: "#000000", red: "#cc0403", green: "#19cb00", yellow: "#cecb00",
+            blue: "#0d73cc", magenta: "#cb1ed1", cyan: "#0dcdcd", white: "#dddddd",
+            brightBlack: "#767676", brightRed: "#f2201f", brightGreen: "#23fd00",
+            brightYellow: "#fffd00", brightBlue: "#1a8fff", brightMagenta: "#fd28ff",
+            brightCyan: "#14ffff", brightWhite: "#ffffff",
+        },
+        css: {
+            "--bg-base": "#1e1e1e", "--bg-card": "#2a2a2a", "--bg-active": "#1e1e1e",
+            "--bg-input": "#1a1a1a", "--bg-input-focus-border": "#6c9",
+            "--fg-base": "#e0e0e0", "--fg-muted": "#aaa", "--fg-faint": "#777",
+            "--fg-accent": "#6c9",
+            "--border": "#444", "--border-strong": "#555",
+            "--btn-bg": "#4a7c4e", "--btn-bg-hover": "#5a8c5e",
+            "--btn-secondary-bg": "#444", "--btn-secondary-bg-hover": "#555",
+            "--btn-danger-bg": "#7c3a3a", "--btn-danger-bg-hover": "#8c4a4a",
+            "--error-fg": "#e88",
+            "--status-up": "#6c6", "--status-down": "#555", "--status-error": "#e66",
+            "--pane-bg": "#000",
+            "--bg-rail": "#252525", "--warn-fg": "#d29922",
+            "--tab-type-cli": "#2e7d32", "--tab-type-editor": "#17a2b8", "--tab-type-other": "#8a8a8a",
+            "--tab-type-lesson": "#a371f7", "--tab-type-kb": "#d29922",
+        },
+    },
+    light: {
+        label: "Light",
+        xterm: {
+            background: "#ffffff", foreground: "#2a2a2a",
+            cursor: "#2a2a2a", cursorAccent: "#ffffff",
+            selectionBackground: "rgba(0,0,0,0.18)",
+            black: "#2a2a2a", red: "#c91b00", green: "#00c200", yellow: "#c7c400",
+            blue: "#0225c7", magenta: "#ca30c7", cyan: "#00c5c7", white: "#c7c7c7",
+            brightBlack: "#676767", brightRed: "#ff6e67", brightGreen: "#5ffa68",
+            brightYellow: "#fffc67", brightBlue: "#6871ff", brightMagenta: "#ff77ff",
+            brightCyan: "#60fdff", brightWhite: "#ffffff",
+        },
+        css: {
+            "--bg-base": "#fafafa", "--bg-card": "#ececec", "--bg-active": "#ffffff",
+            "--bg-input": "#ffffff", "--bg-input-focus-border": "#3a8a3a",
+            "--fg-base": "#1f1f1f", "--fg-muted": "#555", "--fg-faint": "#888",
+            "--fg-accent": "#3a8a3a",
+            "--border": "#d0d0d0", "--border-strong": "#bbb",
+            "--btn-bg": "#3a8a3a", "--btn-bg-hover": "#4a9a4a",
+            "--btn-secondary-bg": "#d0d0d0", "--btn-secondary-bg-hover": "#bbb",
+            "--btn-danger-bg": "#b03a3a", "--btn-danger-bg-hover": "#c04a4a",
+            "--error-fg": "#a33",
+            "--status-up": "#3a8a3a", "--status-down": "#aaa", "--status-error": "#c04040",
+            "--pane-bg": "#ffffff",
+            "--bg-rail": "#f0f0f0", "--warn-fg": "#9a6700",
+            "--tab-type-cli": "#2e7d32", "--tab-type-editor": "#138496", "--tab-type-other": "#8a8a8a",
+            "--tab-type-lesson": "#8250df", "--tab-type-kb": "#b7791f",
+        },
+    },
+    "solarized-dark": {
+        label: "Solarized Dark",
+        xterm: {
+            background: "#002b36", foreground: "#839496",
+            cursor: "#93a1a1", cursorAccent: "#002b36",
+            selectionBackground: "rgba(147,161,161,0.25)",
+            black: "#073642", red: "#dc322f", green: "#859900", yellow: "#b58900",
+            blue: "#268bd2", magenta: "#d33682", cyan: "#2aa198", white: "#eee8d5",
+            brightBlack: "#002b36", brightRed: "#cb4b16", brightGreen: "#586e75",
+            brightYellow: "#657b83", brightBlue: "#839496", brightMagenta: "#6c71c4",
+            brightCyan: "#93a1a1", brightWhite: "#fdf6e3",
+        },
+        css: {
+            "--bg-base": "#002b36", "--bg-card": "#073642", "--bg-active": "#002b36",
+            "--bg-input": "#001f27", "--bg-input-focus-border": "#268bd2",
+            "--fg-base": "#93a1a1", "--fg-muted": "#839496", "--fg-faint": "#657b83",
+            "--fg-accent": "#2aa198",
+            "--border": "#0a4452", "--border-strong": "#0e5a6f",
+            "--btn-bg": "#268bd2", "--btn-bg-hover": "#3a9be0",
+            "--btn-secondary-bg": "#0a4452", "--btn-secondary-bg-hover": "#0e5a6f",
+            "--btn-danger-bg": "#dc322f", "--btn-danger-bg-hover": "#ec4240",
+            "--error-fg": "#dc322f",
+            "--status-up": "#859900", "--status-down": "#586e75", "--status-error": "#dc322f",
+            "--pane-bg": "#002b36",
+            "--bg-rail": "#04313d", "--warn-fg": "#b58900",
+            "--tab-type-cli": "#859900", "--tab-type-editor": "#2aa198", "--tab-type-other": "#586e75",
+            "--tab-type-lesson": "#6c71c4", "--tab-type-kb": "#b58900",
+        },
+    },
+    dracula: {
+        label: "Dracula",
+        xterm: {
+            background: "#282a36", foreground: "#f8f8f2",
+            cursor: "#f8f8f2", cursorAccent: "#282a36",
+            selectionBackground: "rgba(68,71,90,0.7)",
+            black: "#21222c", red: "#ff5555", green: "#50fa7b", yellow: "#f1fa8c",
+            blue: "#bd93f9", magenta: "#ff79c6", cyan: "#8be9fd", white: "#f8f8f2",
+            brightBlack: "#6272a4", brightRed: "#ff6e6e", brightGreen: "#69ff94",
+            brightYellow: "#ffffa5", brightBlue: "#d6acff", brightMagenta: "#ff92df",
+            brightCyan: "#a4ffff", brightWhite: "#ffffff",
+        },
+        css: {
+            "--bg-base": "#282a36", "--bg-card": "#343746", "--bg-active": "#282a36",
+            "--bg-input": "#21222c", "--bg-input-focus-border": "#bd93f9",
+            "--fg-base": "#f8f8f2", "--fg-muted": "#bdbdc8", "--fg-faint": "#6272a4",
+            "--fg-accent": "#bd93f9",
+            "--border": "#44475a", "--border-strong": "#5c5f74",
+            "--btn-bg": "#50fa7b", "--btn-bg-hover": "#69ff94",
+            "--btn-secondary-bg": "#44475a", "--btn-secondary-bg-hover": "#5c5f74",
+            "--btn-danger-bg": "#ff5555", "--btn-danger-bg-hover": "#ff6e6e",
+            "--error-fg": "#ff5555",
+            "--status-up": "#50fa7b", "--status-down": "#6272a4", "--status-error": "#ff5555",
+            "--pane-bg": "#282a36",
+            "--bg-rail": "#2e303e", "--warn-fg": "#ffb86c",
+            "--tab-type-cli": "#50fa7b", "--tab-type-editor": "#8be9fd", "--tab-type-other": "#6272a4",
+            "--tab-type-lesson": "#bd93f9", "--tab-type-kb": "#ffb86c",
+        },
+    },
+    nord: {
+        label: "Nord",
+        xterm: {
+            background: "#2e3440", foreground: "#d8dee9",
+            cursor: "#d8dee9", cursorAccent: "#2e3440",
+            selectionBackground: "rgba(76,86,106,0.7)",
+            black: "#3b4252", red: "#bf616a", green: "#a3be8c", yellow: "#ebcb8b",
+            blue: "#81a1c1", magenta: "#b48ead", cyan: "#88c0d0", white: "#e5e9f0",
+            brightBlack: "#4c566a", brightRed: "#bf616a", brightGreen: "#a3be8c",
+            brightYellow: "#ebcb8b", brightBlue: "#81a1c1", brightMagenta: "#b48ead",
+            brightCyan: "#8fbcbb", brightWhite: "#eceff4",
+        },
+        css: {
+            "--bg-base": "#2e3440", "--bg-card": "#3b4252", "--bg-active": "#2e3440",
+            "--bg-input": "#272c36", "--bg-input-focus-border": "#88c0d0",
+            "--fg-base": "#d8dee9", "--fg-muted": "#a8b2c1", "--fg-faint": "#7884a0",
+            "--fg-accent": "#88c0d0",
+            "--border": "#434c5e", "--border-strong": "#4c566a",
+            "--btn-bg": "#5e81ac", "--btn-bg-hover": "#7592b8",
+            "--btn-secondary-bg": "#434c5e", "--btn-secondary-bg-hover": "#4c566a",
+            "--btn-danger-bg": "#bf616a", "--btn-danger-bg-hover": "#cf717a",
+            "--error-fg": "#bf616a",
+            "--status-up": "#a3be8c", "--status-down": "#4c566a", "--status-error": "#bf616a",
+            "--pane-bg": "#2e3440",
+            "--bg-rail": "#353b49", "--warn-fg": "#ebcb8b",
+            "--tab-type-cli": "#a3be8c", "--tab-type-editor": "#88c0d0", "--tab-type-other": "#7884a0",
+            "--tab-type-lesson": "#b48ead", "--tab-type-kb": "#ebcb8b",
+        },
+    },
 };
+
+const DEFAULT_THEME = "nord";
+
+// Terminal-only palettes (Settings → Terminal theme). The interface themes'
+// own palettes are REFERENCED, never copied, so "Same as interface theme"
+// and naming that same theme explicitly can never drift apart. `tone` only
+// groups the dropdown. The added palettes follow each project's published
+// terminal colors; Monokai Dimmed is the terminal panel of the default editor
+// theme (code-server-settings.json) — the bundled theme gives its ANSI
+// colors but no terminal foreground, cursor or selection, so those are
+// code-server's own fallbacks (foreground/cursor #cccccc, selection = the
+// editor selection #676b7180), and its ANSI black equals its background
+// exactly as it does in the editor.
+const TERM_THEMES = {
+    dark: { label: "Dark", tone: "dark", xterm: THEMES.dark.xterm },
+    "solarized-dark": { label: "Solarized Dark", tone: "dark", xterm: THEMES["solarized-dark"].xterm },
+    dracula: { label: "Dracula", tone: "dark", xterm: THEMES.dracula.xterm },
+    nord: { label: "Nord", tone: "dark", xterm: THEMES.nord.xterm },
+    "gruvbox-dark": {
+        label: "Gruvbox Dark", tone: "dark",
+        xterm: {
+            background: "#282828", foreground: "#ebdbb2",
+            cursor: "#ebdbb2", cursorAccent: "#282828",
+            selectionBackground: "rgba(146,131,116,0.4)",
+            black: "#282828", red: "#cc241d", green: "#98971a", yellow: "#d79921",
+            blue: "#458588", magenta: "#b16286", cyan: "#689d6a", white: "#a89984",
+            brightBlack: "#928374", brightRed: "#fb4934", brightGreen: "#b8bb26",
+            brightYellow: "#fabd2f", brightBlue: "#83a598", brightMagenta: "#d3869b",
+            brightCyan: "#8ec07c", brightWhite: "#ebdbb2",
+        },
+    },
+    "one-dark": {
+        label: "One Dark", tone: "dark",
+        xterm: {
+            background: "#282c34", foreground: "#abb2bf",
+            cursor: "#528bff", cursorAccent: "#282c34",
+            selectionBackground: "rgba(103,118,150,0.4)",
+            black: "#3f4451", red: "#e05561", green: "#8cc265", yellow: "#d18f52",
+            blue: "#4aa5f0", magenta: "#c162de", cyan: "#42b3c2", white: "#e6e6e6",
+            brightBlack: "#4f5666", brightRed: "#ff616e", brightGreen: "#a5e075",
+            brightYellow: "#f0a45d", brightBlue: "#4dc4ff", brightMagenta: "#de73ff",
+            brightCyan: "#4cd1e0", brightWhite: "#ffffff",
+        },
+    },
+    "tokyo-night": {
+        label: "Tokyo Night", tone: "dark",
+        xterm: {
+            background: "#1a1b26", foreground: "#c0caf5",
+            cursor: "#c0caf5", cursorAccent: "#1a1b26",
+            selectionBackground: "#283457",
+            black: "#15161e", red: "#f7768e", green: "#9ece6a", yellow: "#e0af68",
+            blue: "#7aa2f7", magenta: "#bb9af7", cyan: "#7dcfff", white: "#a9b1d6",
+            brightBlack: "#414868", brightRed: "#f7768e", brightGreen: "#9ece6a",
+            brightYellow: "#e0af68", brightBlue: "#7aa2f7", brightMagenta: "#bb9af7",
+            brightCyan: "#7dcfff", brightWhite: "#c0caf5",
+        },
+    },
+    "catppuccin-mocha": {
+        label: "Catppuccin Mocha", tone: "dark",
+        xterm: {
+            background: "#1e1e2e", foreground: "#cdd6f4",
+            cursor: "#f5e0dc", cursorAccent: "#1e1e2e",
+            selectionBackground: "rgba(88,91,112,0.6)",
+            black: "#45475a", red: "#f38ba8", green: "#a6e3a1", yellow: "#f9e2af",
+            blue: "#89b4fa", magenta: "#f5c2e7", cyan: "#94e2d5", white: "#bac2de",
+            brightBlack: "#585b70", brightRed: "#f38ba8", brightGreen: "#a6e3a1",
+            brightYellow: "#f9e2af", brightBlue: "#89b4fa", brightMagenta: "#f5c2e7",
+            brightCyan: "#94e2d5", brightWhite: "#a6adc8",
+        },
+    },
+    "monokai-dimmed": {
+        label: "Monokai Dimmed", tone: "dark",
+        xterm: {
+            background: "#1e1e1e", foreground: "#cccccc",
+            cursor: "#cccccc", cursorAccent: "#1e1e1e",
+            selectionBackground: "#676b7180",
+            black: "#1e1e1e", red: "#c4265e", green: "#86b42b", yellow: "#b3b42b",
+            blue: "#6a7ec8", magenta: "#8c6bc8", cyan: "#56adbc", white: "#e3e3dd",
+            brightBlack: "#666666", brightRed: "#f92672", brightGreen: "#a6e22e",
+            brightYellow: "#e2e22e", brightBlue: "#819aff", brightMagenta: "#ae81ff",
+            brightCyan: "#66d9ef", brightWhite: "#f8f8f2",
+        },
+    },
+    light: { label: "Light", tone: "light", xterm: THEMES.light.xterm },
+    "solarized-light": {
+        label: "Solarized Light", tone: "light",
+        xterm: {
+            background: "#fdf6e3", foreground: "#657b83",
+            cursor: "#586e75", cursorAccent: "#fdf6e3",
+            selectionBackground: "rgba(7,54,66,0.15)",
+            black: "#073642", red: "#dc322f", green: "#859900", yellow: "#b58900",
+            blue: "#268bd2", magenta: "#d33682", cyan: "#2aa198", white: "#eee8d5",
+            brightBlack: "#002b36", brightRed: "#cb4b16", brightGreen: "#586e75",
+            brightYellow: "#657b83", brightBlue: "#839496", brightMagenta: "#6c71c4",
+            brightCyan: "#93a1a1", brightWhite: "#fdf6e3",
+        },
+    },
+    "catppuccin-latte": {
+        label: "Catppuccin Latte", tone: "light",
+        xterm: {
+            background: "#eff1f5", foreground: "#4c4f69",
+            cursor: "#dc8a78", cursorAccent: "#eff1f5",
+            selectionBackground: "rgba(172,176,190,0.6)",
+            black: "#5c5f77", red: "#d20f39", green: "#40a02b", yellow: "#df8e1d",
+            blue: "#1e66f5", magenta: "#ea76cb", cyan: "#179299", white: "#acb0be",
+            brightBlack: "#6c6f85", brightRed: "#d20f39", brightGreen: "#40a02b",
+            brightYellow: "#df8e1d", brightBlue: "#1e66f5", brightMagenta: "#ea76cb",
+            brightCyan: "#179299", brightWhite: "#bcc0cc",
+        },
+    },
+    "github-light": {
+        label: "GitHub Light", tone: "light",
+        xterm: {
+            background: "#ffffff", foreground: "#1f2328",
+            cursor: "#0969da", cursorAccent: "#ffffff",
+            selectionBackground: "rgba(9,105,218,0.2)",
+            black: "#24292f", red: "#cf222e", green: "#116329", yellow: "#4d2d00",
+            blue: "#0969da", magenta: "#8250df", cyan: "#1b7c83", white: "#6e7781",
+            brightBlack: "#57606a", brightRed: "#a40e26", brightGreen: "#1a7f37",
+            brightYellow: "#633c01", brightBlue: "#218bff", brightMagenta: "#a475f9",
+            brightCyan: "#3192aa", brightWhite: "#8c959f",
+        },
+    },
+};
+
+function loadStoredTheme() {
+    const id = storeGet(THEME_KEY);
+    return THEMES[id] ? id : DEFAULT_THEME;
+}
+
+// null = follow the interface theme (the stored key is absent).
+function loadStoredTermTheme() {
+    const id = storeGet(TERM_THEME_KEY);
+    return TERM_THEMES[id] ? id : null;
+}
+
+function applyTheme(id) {
+    const valid = THEMES[id] ? id : DEFAULT_THEME;
+    for (const [k, v] of Object.entries(THEMES[valid].css)) {
+        document.documentElement.style.setProperty(k, v);
+    }
+    S.theme = valid;
+    storeSet(THEME_KEY, valid);
+    repaintTerminals();
+}
+
+function applyTermTheme(id) {
+    S.termTheme = TERM_THEMES[id] ? id : null;
+    if (S.termTheme) storeSet(TERM_THEME_KEY, S.termTheme);
+    else storeDel(TERM_THEME_KEY);
+    repaintTerminals();
+}
+
+function currentXtermTheme() {
+    const pinned = S.termTheme && TERM_THEMES[S.termTheme];
+    return pinned ? pinned.xterm : THEMES[S.theme || DEFAULT_THEME].xterm;
+}
+
+// Live recolor of every open terminal, plus --xterm-bg, which paints the Shell's own frame
+// (style.css .shell-pane .term-area) in the terminal palette rather than the interface's.
+function repaintTerminals() {
+    const x = currentXtermTheme();
+    document.documentElement.style.setProperty("--xterm-bg", x.background);
+    for (const pane of Object.values(S.panes)) {
+        if (pane.term) pane.term.options.theme = x;
+    }
+}
+
+function loadIframeZoom() {
+    const v = parseFloat(storeGet(IFRAME_ZOOM_KEY) || "");
+    return IFRAME_ZOOMS.includes(v) ? v : IFRAME_ZOOM_DEFAULT;
+}
+
+function applyIframeZoomVar(z) {
+    document.documentElement.style.setProperty("--iframe-zoom", String(z));
+}
+
+function setIframeZoom(z) {
+    S.iframeZoom = z;
+    applyIframeZoomVar(z);
+    storeSet(IFRAME_ZOOM_KEY, String(z));
+}
+
+function loadCliMaxWidth() {
+    const v = parseInt(storeGet(CLI_WIDTH_KEY) || "", 10);
+    return CLI_MAX_WIDTHS.includes(v) ? v : CLI_MAX_WIDTH_DEFAULT;
+}
+
+// The cap rides a root variable read by .term-pad; off removes it (max-width: none).
+function applyCliMaxWidthVar(v) {
+    if (v > 0) document.documentElement.style.setProperty("--cli-max-width", `${v}px`);
+    else document.documentElement.style.removeProperty("--cli-max-width");
+}
+
+function setCliMaxWidth(v) {
+    S.cliMaxWidth = v;
+    applyCliMaxWidthVar(v);
+    storeSet(CLI_WIDTH_KEY, String(v));
+    refitVisible();
+}
+
+function loadTermFontSize() {
+    const v = parseInt(storeGet(TERM_FONT_SIZE_KEY) || "", 10);
+    return TERM_FONT_SIZES.includes(v) ? v : TERM_FONT_SIZE_DEFAULT;
+}
+
+// RS's DEFER-APPLY: the setter stores only; the size reaches a terminal through
+// syncTermFontSize at its next refit while it is visible (Settings hides every Shell, and
+// xterm keeps stale cell metrics when its font changes while hidden).
+function setTermFontSize(v) {
+    S.termFontSize = v;
+    if (v !== TERM_FONT_SIZE_DEFAULT) storeSet(TERM_FONT_SIZE_KEY, String(v));
+    else storeDel(TERM_FONT_SIZE_KEY);
+    refitVisible();
+}
+
+// The stored font size onto one Shell's terminal, only while its pane is visible.
+function syncTermFontSize(pane) {
+    if (!pane || !pane.term || pane.el.hidden || pane.el.offsetParent === null) return;
+    if (pane.term.options.fontSize !== S.termFontSize) pane.term.options.fontSize = S.termFontSize;
+}
+
+function makeIframeZoomSelector() {
+    const sel = document.createElement("select");
+    sel.className = "theme-select";
+    sel.title = "Editor zoom (the Editor and every web-app tab)";
+    for (const z of IFRAME_ZOOMS) {
+        const opt = document.createElement("option");
+        opt.value = String(z);
+        opt.textContent = `Editor ${Math.round(z * 100)}%`;
+        if (Math.abs(z - S.iframeZoom) < 1e-6) opt.selected = true;
+        sel.appendChild(opt);
+    }
+    sel.onchange = () => setIframeZoom(parseFloat(sel.value));
+    return sel;
+}
+
+function makeCliWidthSelector() {
+    const sel = document.createElement("select");
+    sel.className = "theme-select";
+    sel.title = "Max width of the Shell's terminal (readability on wide windows)";
+    // RS's labels: the column counts are approximations at RS's 13 px terminal font.
+    const labels = {
+        0: "Full width",
+        800: "800 px (~100 cols)",
+        1000: "1000 px (~125 cols)",
+        1200: "1200 px (~150 cols)",
+    };
+    for (const w of CLI_MAX_WIDTHS) {
+        const opt = document.createElement("option");
+        opt.value = String(w);
+        opt.textContent = labels[w] || `${w} px`;
+        if (w === S.cliMaxWidth) opt.selected = true;
+        sel.appendChild(opt);
+    }
+    sel.onchange = () => setCliMaxWidth(parseInt(sel.value, 10));
+    return sel;
+}
+
+function makeTermFontSizeSelector() {
+    const sel = document.createElement("select");
+    sel.className = "theme-select";
+    sel.title = "Font size of the Shell's terminal (applies to open tabs at once)";
+    for (const n of TERM_FONT_SIZES) {
+        const opt = document.createElement("option");
+        opt.value = String(n);
+        opt.textContent = n === TERM_FONT_SIZE_DEFAULT ? `${n} px (default)` : `${n} px`;
+        if (n === S.termFontSize) opt.selected = true;
+        sel.appendChild(opt);
+    }
+    sel.onchange = () => setTermFontSize(parseInt(sel.value, 10));
+    return sel;
+}
+
+function makeThemeSelector() {
+    const sel = document.createElement("select");
+    sel.className = "theme-select";
+    sel.title = "Interface theme";
+    for (const [id, t] of Object.entries(THEMES)) {
+        const opt = document.createElement("option");
+        opt.value = id;
+        opt.textContent = t.label;
+        if (id === S.theme) opt.selected = true;
+        sel.appendChild(opt);
+    }
+    sel.onchange = () => applyTheme(sel.value);
+    return sel;
+}
+
+// Terminal theme: "" = follow the interface theme; the named palettes sit in dark/light groups.
+function makeTermThemeSelector() {
+    const sel = document.createElement("select");
+    sel.className = "theme-select";
+    sel.title = "Terminal theme (the Shell only)";
+    const follow = document.createElement("option");
+    follow.value = "";
+    follow.textContent = "Same as interface theme";
+    if (!S.termTheme) follow.selected = true;
+    sel.appendChild(follow);
+    for (const [tone, label] of [["dark", "Dark palettes"], ["light", "Light palettes"]]) {
+        const group = document.createElement("optgroup");
+        group.label = label;
+        for (const [id, t] of Object.entries(TERM_THEMES)) {
+            if (t.tone !== tone) continue;
+            const opt = document.createElement("option");
+            opt.value = id;
+            opt.textContent = t.label;
+            if (id === S.termTheme) opt.selected = true;
+            group.appendChild(opt);
+        }
+        sel.appendChild(group);
+    }
+    sel.onchange = () => applyTermTheme(sel.value || null);
+    return sel;
+}
+
+// Settings -> Interface: RS's renderSettingsInto, without Layout. Changes apply at once.
+function makeInterfaceSettings() {
+    const row = (label, sel) => h("label", { class: "field if-row" }, h("span", {}, label), sel);
+    return h("div", { class: "card-body if-set" },
+        row("Interface theme", makeThemeSelector()),
+        row("Terminal theme", makeTermThemeSelector()),
+        row("Editor zoom", makeIframeZoomSelector()),
+        row("CLI width", makeCliWidthSelector()),
+        row("CLI font size", makeTermFontSizeSelector()));
+}
+
+// ---- the sidebar's width: RS's rail splitter ------------------------------------------------
+
+function loadRailWidth() {
+    const v = parseInt(storeGet(RAIL_WIDTH_KEY) || "", 10);
+    if (!isFinite(v)) return RAIL_WIDTH_DEFAULT;
+    return Math.max(RAIL_WIDTH_MIN, Math.min(RAIL_WIDTH_MAX, v));
+}
+
+function applyRailWidth(px) {
+    document.documentElement.style.setProperty("--rail-width", `${px}px`);
+}
+
+// RS's installRailSplitterDrag: a pointer-captured drag on the rail's right edge (so moving
+// over a frame or a terminal does not freeze it); lostpointercapture is the cancel path.
+// Adapted: the terminals are refitted through refitVisible.
+function installRailSplitterDrag(splitter) {
+    let dragging = false;
+    let pointerId = null;
+    const onMove = (ev) => {
+        if (!dragging) return;
+        const rail = splitter.parentElement;
+        if (!rail) return;
+        const rect = rail.getBoundingClientRect();
+        let w = ev.clientX - rect.left;
+        w = Math.max(RAIL_WIDTH_MIN, Math.min(RAIL_WIDTH_MAX, w));
+        applyRailWidth(w);
+        S.railWidth = w;
+    };
+    const onLost = (ev) => { if (ev.pointerId === pointerId) onUp(); };
+    const onUp = () => {
+        if (!dragging) return;
+        dragging = false;
+        splitter.removeEventListener("lostpointercapture", onLost);
+        document.removeEventListener("lostpointercapture", onLost);
+        splitter.classList.remove("dragging");
+        try { if (pointerId != null) splitter.releasePointerCapture(pointerId); } catch (_) {}
+        pointerId = null;
+        splitter.removeEventListener("pointermove", onMove);
+        splitter.removeEventListener("pointerup", onUp);
+        splitter.removeEventListener("pointercancel", onUp);
+        document.body.style.userSelect = "";
+        storeSet(RAIL_WIDTH_KEY, String(Math.round(S.railWidth)));
+        refitVisible();
+    };
+    splitter.onpointerdown = (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        dragging = true;
+        pointerId = ev.pointerId;
+        splitter.classList.add("dragging");
+        try { splitter.setPointerCapture(ev.pointerId); } catch (_) {}
+        splitter.addEventListener("pointermove", onMove);
+        splitter.addEventListener("pointerup", onUp);
+        splitter.addEventListener("pointercancel", onUp);
+        splitter.addEventListener("lostpointercapture", onLost);
+        document.addEventListener("lostpointercapture", onLost);
+        document.body.style.userSelect = "none";
+    };
+}
+
+// RS's bootstrap of these settings, before the first render. Terminal choice first: applyTheme's
+// repaint reads it.
+function applyInterfaceSettings() {
+    S.termTheme = loadStoredTermTheme();
+    applyTheme(loadStoredTheme());
+    S.railWidth = loadRailWidth();
+    applyRailWidth(S.railWidth);
+    S.iframeZoom = loadIframeZoom();
+    applyIframeZoomVar(S.iframeZoom);
+    S.cliMaxWidth = loadCliMaxWidth();
+    applyCliMaxWidthVar(S.cliMaxWidth);
+    S.termFontSize = loadTermFontSize();
+}
+
+// ---- the Shell: RS's terminal -------------------------------------------------------------
 
 function makeShellPane(name) {
     const said = h("span", { class: "grow" });
@@ -766,7 +1354,8 @@ function makeShellPane(name) {
                        : p && p.state === "missing" ? "This project has no sandbox. Start it to make one."
                        : "The sandbox is not running.");
     };
-    pane.refit = () => { if (pane.fit) { try { pane.fit.fit(); } catch (_) {} } };
+    // RS's scheduleColumnRefit: the stored font size first (it changes the cell metrics), then the fit.
+    pane.refit = () => { syncTermFontSize(pane); if (pane.fit) { try { pane.fit.fit(); } catch (_) {} } };
     pane.close = () => {
         if (pane.ws) { pane.ws.onclose = null; try { pane.ws.close(); } catch (_) {} }
         if (pane.term) pane.term.dispose();
@@ -780,8 +1369,8 @@ function openTerminal(pane, pad) {
     const term = new Terminal({
         cursorBlink: true,
         fontFamily: getComputedStyle(document.documentElement).getPropertyValue("--mono").trim() || "monospace",
-        fontSize: 14,
-        theme: XTERM_THEME,
+        fontSize: S.termFontSize,
+        theme: currentXtermTheme(),
         scrollback: 5000,
     });
     const fit = new FitAddon.FitAddon();
@@ -3817,6 +4406,8 @@ function makeSettingsPane() {
     const mode = h("div", { class: "card mode-set" }, h("div", { class: "card-head" }, "How it runs"), h("div", { class: "none" }, "Asking…"));
     const el = h("div", { class: "pane page", hidden: true }, h("div", { class: "page-inner" },
         h("h1", {}, "Settings"),
+        h("div", { class: "card" }, h("div", { class: "card-head" }, "Interface"), makeInterfaceSettings(),
+            h("p", { class: "note if-hint" }, "Kept by this browser only; they apply at once.")),
         h("p", { class: "sub" }, "The software clanker-learn deploys into the projects' sandboxes. Each is fetched in a throwaway container and copied into a project from there."),
         h("div", { class: "card" }, h("div", { class: "card-head" }, "Software"), table,
             h("p", { class: "note sw-hint" }, "Running projects keep the agent versions they have until Update is pressed in their Config box (Agents); new projects get these. " +
@@ -4671,4 +5262,4 @@ async function followOp(opId, title, opts) {
 
 // ---- go ------------------------------------------------------------------------------------
 
-window.addEventListener("DOMContentLoaded", start);
+window.addEventListener("DOMContentLoaded", () => { applyInterfaceSettings(); start(); });
