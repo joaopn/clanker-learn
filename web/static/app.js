@@ -5,8 +5,9 @@
 // Config box's Agents are RS's (renderSoftwareScreen, mgmtRefreshDialog, agentsBoxContent,
 // mgmtAgentsUpdateDialog) adapted to this page's helpers. The lessons and their conversation
 // follow the mock's lesson view; three pieces are ported from gaggiclanker's web client (said at
-// their place: the stream client, the context line's wording, the Markdown rules). Plain script,
-// no framework, no build step.
+// their place: the stream client, the context line's wording, the Markdown rules). The tabs side
+// by side (columns, splitters, tabs dragged between them) are RS's column layout, lifted (see
+// "tabs side by side" below). Plain script, no framework, no build step.
 //
 // Every string that comes from the server or a sandbox goes into the page as text: the
 // page is built with h() below, which makes text nodes, and never with innerHTML. The tutor's
@@ -26,7 +27,7 @@ const MIN_PASSWORD_LENGTH = 8;
 const PROJECTS_EVERY_MS = 4000;
 const SERVICES_EVERY_MS = 5000;
 const OP_EVERY_MS = 1000;
-const LAYOUT_KEY = "cl-layout";   // browser storage: which project, tab and lessons were shown, nothing else
+const LAYOUT_KEY = "cl-layout";   // browser storage: which project, tabs, columns and lessons were shown, nothing else
 const LESSON_ID_RE = /^[A-Za-z0-9][A-Za-z0-9-]{0,63}$/;   // what the tutor service makes ids of
 
 const b64 = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf)));
@@ -82,17 +83,30 @@ function toast(text, bad) {
 }
 
 function loadLayout() {
-    const none = { project: null, tab: null, page: null, lessons: {}, expanded: [] };
+    const none = { project: null, tab: null, page: null, lessons: {}, columns: {}, expanded: [] };
     try {
         const v = JSON.parse(localStorage.getItem(LAYOUT_KEY) || "{}");
         const lessons = {};
         if (v.lessons && typeof v.lessons === "object") {
             for (const [k, id] of Object.entries(v.lessons)) if (typeof id === "string" && LESSON_ID_RE.test(id)) lessons[k] = id;
         }
+        // Per project: its columns of tab ids, their widths, the tabs last shown in them and the
+        // focused one. Only ids the project has are ever used (reconcileTabLayout).
+        const columns = {};
+        const strs = (a) => (Array.isArray(a) ? a.filter((x) => typeof x === "string" && x.length <= 200) : []);
+        if (v.columns && typeof v.columns === "object" && !Array.isArray(v.columns)) {
+            for (const [p, c] of Object.entries(v.columns)) {
+                if (!c || typeof c !== "object") continue;
+                columns[p] = { columns: (Array.isArray(c.columns) ? c.columns : []).filter(Array.isArray).map(strs),
+                               ratios: Array.isArray(c.ratios) ? c.ratios.filter((r) => typeof r === "number" && Number.isFinite(r) && r > 0) : undefined,
+                               active: strs(c.active).slice(-32),
+                               focus: typeof c.focus === "string" ? c.focus : undefined };
+            }
+        }
         return { project: typeof v.project === "string" ? v.project : null,
                  tab: typeof v.tab === "string" ? v.tab : null,
                  page: v.page === "settings" ? "settings" : null,
-                 lessons,
+                 lessons, columns,
                  expanded: Array.isArray(v.expanded) ? v.expanded.filter((x) => typeof x === "string") : [] };
     } catch (_) {
         return none;
@@ -102,7 +116,7 @@ function loadLayout() {
 function saveLayout() {
     try {
         localStorage.setItem(LAYOUT_KEY, JSON.stringify({ project: S.current, tab: S.current ? tabOf(S.current) : null, page: S.page,
-                                                         lessons: S.lessonOf, expanded: [...S.expanded] }));
+                                                         lessons: S.lessonOf, expanded: [...S.expanded], columns: S.cols }));
     } catch (_) { /* no storage: the page works without it */ }
 }
 
@@ -179,6 +193,11 @@ const S = {
     tutorSettingsError: null,
     filesOrigins: new Map(), // project -> the promise of its files server's address (what a lesson shows)
     editorFile: {},        // project -> {path, line}: the file its Editor is to open next
+    cols: {},              // project -> {columns, ratios, active, focus}: its tabs side by side, as kept
+    tabLayout: null,       // the shown project's reconciled {project, columns, ratios} (RS's state.tabLayout)
+    dragging: false,       // a tab or a splitter is being dragged: the strip and the panes are not rebuilt
+    renderPending: false,  // a render was asked for during the drag
+    wasNarrow: false,      // the window was at phone width at the last render
 };
 
 const tabOf = (project) => S.tabs[project] || "shell";
@@ -340,6 +359,9 @@ function enterApp(projects) {
     const layout = loadLayout();
     S.page = layout.page;
     S.lessonOf = layout.lessons;
+    S.cols = layout.columns;
+    for (const [p, c] of Object.entries(S.cols)) if (c.focus && p !== layout.project) S.tabs[p] = c.focus;
+    S.wasNarrow = narrowScreen();
     S.expanded = new Set(layout.expanded.filter((n) => projectRow(n)));
     if (layout.project && projectRow(layout.project)) {
         S.current = layout.project;
@@ -353,7 +375,7 @@ function enterApp(projects) {
     S.timers.push(setInterval(refreshProjects, PROJECTS_EVERY_MS));
     S.timers.push(setInterval(() => { if (S.current) refreshServices(S.current); }, SERVICES_EVERY_MS));
     S.timers.push(setInterval(() => { if (S.page === "settings") refreshSoftware(); }, SERVICES_EVERY_MS));
-    window.addEventListener("resize", refitVisible);
+    window.addEventListener("resize", onWindowResize);
     refreshProjects();
     if (S.current) refreshServices(S.current);
     if (S.page === "settings") { refreshSoftware(); refreshTutorSettings(); }
@@ -367,11 +389,12 @@ function teardownApp() {
     S.timers = [];
     for (const key of Object.keys(S.panes)) dropPane(key);
     closeModal();
-    window.removeEventListener("resize", refitVisible);
+    window.removeEventListener("resize", onWindowResize);
     Object.assign(S, { loggedIn: false, projects: [], ops: [], current: null, creating: null, tabs: {}, services: {}, panes: {}, shell: null, listError: null,
                        page: null, software: null, softwareError: null, builds: {}, checking: new Set(), models: null,
                        expanded: new Set(), lessons: {}, lessonOf: {}, activity: new Set(), tutorError: null,
-                       tutorSettings: null, tutorSettingsError: null, filesOrigins: new Map(), editorFile: {} });
+                       tutorSettings: null, tutorSettingsError: null, filesOrigins: new Map(), editorFile: {},
+                       cols: {}, tabLayout: null, dragging: false, renderPending: false });
 }
 
 async function refreshProjects() {
@@ -394,6 +417,7 @@ async function refreshProjects() {
         if (list.body.ok) {
             for (const n of [...S.expanded]) if (!projectRow(n) && n !== S.creating) S.expanded.delete(n);
             for (const n of Object.keys(S.lessons)) if (!projectRow(n)) delete S.lessons[n];
+            for (const n of Object.keys(S.cols)) if (!projectRow(n) && n !== S.creating) delete S.cols[n];
         }
         refreshTutor();
         if (S.current && S.current !== S.creating && !projectRow(S.current) && list.body.ok) {
@@ -502,83 +526,144 @@ function tabsOf(name) {
     return { tabs, raw };
 }
 
+// The strip: the project's chip, then its tabs (the Ports page among them) in their columns'
+// order. Side by side (desktop, two or three columns), each column's tabs sit in a group above
+// its pane, as RS's renderServiceTabs; at phone width it is one flat strip, as before.
 function renderTabbar() {
+    if (S.dragging) { S.renderPending = true; return; }
     const bar = S.shell.tabbar;
     const name = S.current;
-    if (S.page === "settings") { bar.replaceChildren(h("div", { class: "tb projchip" }, "Settings")); return; }
-    if (!name) { bar.replaceChildren(h("div", { class: "tb projchip" }, "clanker-learn")); return; }
+    bar.classList.remove("cols");
+    if (S.page === "settings") { S.tabLayout = null; bar.replaceChildren(h("div", { class: "tb projchip" }, "Settings")); return; }
+    if (!name) { S.tabLayout = null; bar.replaceChildren(h("div", { class: "tb projchip" }, "clanker-learn")); return; }
     const { tabs, raw } = tabsOf(name);
-    const shown = tabOf(name);
-    // A tab that is not there any more falls back to the Shell, once the list is known.
-    if (S.services[name] && shown !== "ports" && !tabs.some((t) => t.id === shown)) S.tabs[name] = "shell";
+    tabs.push({ id: "ports", label: "Ports", type: "ports" });
+    // A tab that is not there any more (once the list is known) gives the focus to another tab
+    // of its column, else to the Shell.
+    if (S.services[name] && !tabs.some((t) => t.id === tabOf(name))) {
+        const gone = tabOf(name);
+        const before = S.tabLayout && S.tabLayout.project === name ? S.tabLayout.columns : (S.cols[name] && S.cols[name].columns) || [];
+        const col = before.find((c) => c.includes(gone)) || [];
+        S.tabs[name] = col.find((id) => id !== gone && tabs.some((t) => t.id === id)) || "shell";
+    }
+    const byId = new Map(tabs.map((t) => [t.id, t]));
+    const L = columnLayout(name, tabs.map((t) => t.id));
+    const narrow = narrowScreen();
+    const multi = L.columns.length > 1 && !narrow;
+    const on = new Set(narrow ? [tabOf(name)] : L.columns.map((_, i) => columnActive(name, i)));
+    const tabEl = (id, col) => makeTab(name, byId.get(id), col, on.has(id));
+    const rawEls = raw.map(({ row }) => h("div", { class: "tb raw", title: `Raw TCP to port ${row.sandbox_port} of the sandbox. It has no login in front of it.` },
+        h("span", { class: "rawlabel" }, String(row.label)), h("code", {}, `${location.hostname}:${row.passthrough_port}`)));
     const items = [h("div", { class: "tb projchip" }, name)];
-    for (const t of tabs) {
-        const pane = S.panes[paneKey(name, t.id)];
-        const url = pane && pane.url;
-        items.push(h("div", { class: `tb t-${t.type}` + (tabOf(name) === t.id ? " on" : "") + (t.gone ? " gone" : ""),
-                              title: t.gone ? "This app no longer listens in the sandbox" : t.type === "lesson" ? "the lesson's conversation with the tutor"
-                                  : (t.row ? `port ${t.row.default_port} of the sandbox` : "a terminal in the sandbox"),
-                              onclick: () => showTab(name, t.id) },
-            t.label,
-            t.type !== "cli" && url ? h("a", { class: "newtab", href: url, target: "_blank", rel: "noopener noreferrer",
-                                                title: "Open in a new browser tab", onclick: (ev) => ev.stopPropagation() }, "↗") : null));
+    if (multi) {
+        bar.classList.add("cols");
+        items.push(h("div", { class: "tab-group-divider" }));
+        L.columns.forEach((col, i) => items.push(h("div", { class: "col-group" + (i === 0 ? " first" : "") },
+            col.map((id) => tabEl(id, i)), i === L.columns.length - 1 ? rawEls : null)));
+    } else {
+        // The Ports tab keeps its place at the right while it is the last one.
+        const flat = L.columns.flatMap((col, i) => col.map((id) => [id, i]));
+        flat.forEach(([id, i], k) => {
+            if (k === flat.length - 1 && id === "ports") items.push(...rawEls, h("div", { class: "spacer" }));
+            items.push(tabEl(id, i));
+        });
+        if (!flat.length || flat[flat.length - 1][0] !== "ports") items.push(...rawEls, h("div", { class: "spacer" }));
     }
-    for (const { row } of raw) {
-        const host = location.hostname;
-        items.push(h("div", { class: "tb raw", title: `Raw TCP to port ${row.sandbox_port} of the sandbox. It has no login in front of it.` },
-            h("span", { class: "rawlabel" }, String(row.label)), h("code", {}, `${host}:${row.passthrough_port}`)));
-    }
-    items.push(h("div", { class: "spacer" }));
-    items.push(h("div", { class: "tb t-ports" + (tabOf(name) === "ports" ? " on" : ""), onclick: () => showTab(name, "ports") }, "Ports"));
     bar.replaceChildren(...items);
+    if (multi) positionStripGroups(L.ratios);
+}
+
+function makeTab(name, t, col, on) {
+    const pane = S.panes[paneKey(name, t.id)];
+    const url = pane && pane.url;
+    const tab = h("div", { class: `tb t-${t.type}` + (on ? " on" : "") + (t.gone ? " gone" : ""), "data-tab": t.id, "data-column": String(col),
+                           title: t.gone ? "This app no longer listens in the sandbox" : t.type === "lesson" ? "the lesson's conversation with the tutor"
+                               : t.type === "ports" ? null : (t.row ? `port ${t.row.default_port} of the sandbox` : "a terminal in the sandbox"),
+                           // consumeTabDragClick swallows the one click the browser makes on the tab after a drag.
+                           onclick: () => { if (!consumeTabDragClick()) showTab(name, t.id); } },
+        h("span", { class: "tl" }, t.label),
+        t.type !== "cli" && t.type !== "ports" && url ? h("a", { class: "newtab", href: url, target: "_blank", rel: "noopener noreferrer",
+                                                                  title: "Open in a new browser tab", onclick: (ev) => ev.stopPropagation() }, "↗") : null);
+    armTabDrag(tab, name, t.id);
+    return tab;
 }
 
 function showTab(name, id) {
     const had = !!S.panes[paneKey(name, id)];
+    // The tab shown before stays its column's tab; this one becomes its own column's.
+    noteActive(name, tabOf(name));
+    noteActive(name, id);
     S.tabs[name] = id;
+    (S.cols[name] || (S.cols[name] = { columns: [], active: [] })).focus = id;
     saveLayout();
     render();
     if (id === "ports" && had) refreshPorts(name);   // a new Ports pane asks by itself
 }
 
-// The visible pane: made on first sight, kept (hidden) when another is shown.
+// The pane of a tab, made on first sight and kept (hidden) while no column shows it.
+function ensurePane(name, id) {
+    const key = paneKey(name, id);
+    let pane = S.panes[key];
+    if (pane) return pane;
+    if (id === "shell") pane = makeShellPane(name);
+    else if (id === "ports") pane = makePortsPane(name);
+    else if (lessonTabId(id)) pane = makeLessonPane(name, lessonTabId(id));
+    else {
+        const row = (S.services[name] || {})[id];
+        if (row) pane = makeWebPane(name, id, row);
+    }
+    if (pane) {
+        S.panes[key] = pane;
+        S.shell.panes.append(pane.el);
+        if (pane.kind === "ports") refreshPorts(name);
+    }
+    return pane;
+}
+
+// The visible panes: one per column (one in all at phone width). Every one of them is live; a
+// pane that no column shows lets go of what it follows (a lesson closes its stream).
 function showPane() {
+    if (S.dragging) { S.renderPending = true; return; }
     const { panes, empty } = S.shell;
     const name = S.current;
-    let visible = empty;
+    sweepColumnChrome();
+    const shown = [];   // {el, col, pane}
+    const L = name && !S.page && S.tabLayout && S.tabLayout.project === name ? S.tabLayout : null;
+    const multi = !!L && L.columns.length > 1 && !narrowScreen();
     if (S.page === "settings") {
-        visible = S.shell.settings.el;
+        shown.push({ el: S.shell.settings.el, col: 0 });
     } else if (!name) {
         empty.replaceChildren(h("div", { class: "page-inner" }, h("h1", {}, "No project shown"),
             h("p", { class: "sub" }, S.projects.length ? "Pick a project on the left." : "Make one with “+ New project” on the left.")));
+        shown.push({ el: empty, col: 0 });
     } else {
-        const id = tabOf(name);
-        const key = paneKey(name, id);
-        let pane = S.panes[key];
-        if (!pane) {
-            if (id === "shell") pane = makeShellPane(name);
-            else if (id === "ports") pane = makePortsPane(name);
-            else if (lessonTabId(id)) pane = makeLessonPane(name, lessonTabId(id));
-            else {
-                const row = (S.services[name] || {})[id];
-                if (row) pane = makeWebPane(name, id, row);
-            }
-            if (pane) {
-                S.panes[key] = pane;
-                panes.append(pane.el);
-                if (pane.kind === "ports") refreshPorts(name);
-            }
-        }
-        if (pane) {
-            visible = pane.el;
-            if (pane.update) pane.update();
-        } else {
+        const ids = multi ? L.columns.map((_, i) => columnActive(name, i)) : [tabOf(name)];
+        ids.forEach((id, col) => {
+            const pane = ensurePane(name, id);
+            if (pane) { shown.push({ el: pane.el, col, pane }); return; }
+            if (shown.some((s) => s.el === empty)) return;
             empty.replaceChildren(h("div", { class: "none" }, "Asking the sandbox for its tabs…"));
-        }
+            shown.push({ el: empty, col });
+        });
     }
-    for (const child of panes.children) child.hidden = child !== visible;
-    // A pane that went out of sight lets go of what it follows (a lesson closes its stream).
-    for (const pane of Object.values(S.panes)) if (pane.el !== visible && pane.hide) pane.hide();
+    const where = new Map(shown.map((s) => [s.el, s.col]));
+    for (const child of panes.children) {
+        if (!child.classList.contains("pane")) continue;
+        child.hidden = !where.has(child);
+        if (multi && where.has(child)) { child.dataset.col = String(where.get(child)); continue; }
+        delete child.dataset.col;
+        child.style.left = child.style.width = "";
+    }
+    for (const s of shown) if (s.pane && s.pane.update) s.pane.update();
+    for (const pane of Object.values(S.panes)) if (!where.has(pane.el) && pane.hide) pane.hide();
+    if (multi) {
+        for (let i = 1; i < L.columns.length; i++) {
+            const sp = h("div", { class: "column-splitter", title: "Drag to change the widths" });
+            installColumnSplitterDrag(sp, i - 1);
+            panes.append(sp);
+        }
+        positionColumnChrome(L.ratios);
+    }
     refitVisible();
 }
 
@@ -762,10 +847,401 @@ function handleControl(pane, ctrl, set) {
     return false;
 }
 
+// ---- tabs side by side: RS's column layout ---------------------------------------------------
+//
+// RS's (webui/static/app.js at RS commit 62788a8): MAX_TAB_COLUMNS, COLUMN_MIN_FRAC,
+// COLUMN_EDGE_BAND_FRAC, reconcileTabLayout, reconcileColumnRatios, moveTabInLayout,
+// positionColumnChrome, positionStripGroups, installColumnSplitterDrag, armTabDrag and its drag
+// chrome, lifted. A tab dragged to the side of a pane splits a new column out of it (up to three),
+// onto a strip it moves there or reorders; a column whose last tab leaves closes; the splitters
+// change the widths. Adapted: the layout is kept per project in the browser's storage (RS: its
+// vault), with the tab each column last showed and the focused tab (RS keeps those for the
+// session only); a never-arranged project's order is tabsOf's (RS: editors first); a drag holds
+// the page's polls back instead of being cut by them (RS re-renders only when the tabs change);
+// the frames are also covered while a drag runs. Arrangement is geometry only: a pane is never
+// moved in the document (an iframe moved there reloads). Desktop only: at phone width it is one
+// strip and one pane, as before.
+
+const MAX_TAB_COLUMNS = 3;
+const COLUMN_MIN_FRAC = 0.15;
+const COLUMN_EDGE_BAND_FRAC = 0.2;
+const TAB_DRAG_SLOP_PX = 5;
+const narrowScreen = () => window.matchMedia("(max-width: 700px)").matches;
+const pctOf = (f) => `${(f * 100).toFixed(4)}%`;
+
+// The kept columns against the tabs the project has now: ids that went are dropped (kept in the
+// store until the next arrangement, so an app that comes back finds its column), duplicates
+// collapse, new ids join the first column's end, empty columns fold away. Never writes.
+function reconcileTabLayout(stored, visibleIds) {
+    const kept = stored && Array.isArray(stored.columns) ? stored.columns : [];
+    const seen = new Set();
+    const columns = [];
+    for (const col of kept) {
+        if (!Array.isArray(col)) continue;
+        const ids = [];
+        for (const id of col) {
+            if (typeof id === "string" && visibleIds.includes(id) && !seen.has(id)) { seen.add(id); ids.push(id); }
+        }
+        if (ids.length) columns.push(ids);
+    }
+    if (columns.length > MAX_TAB_COLUMNS) {
+        const extra = columns.splice(MAX_TAB_COLUMNS);
+        columns[MAX_TAB_COLUMNS - 1].push(...extra.flat());
+    }
+    if (columns.length === 0) columns.push([]);
+    for (const id of visibleIds) if (!seen.has(id)) columns[0].push(id);
+    return columns;
+}
+
+// The kept widths against the column count: junk dropped, missing ones refilled, floored at
+// COLUMN_MIN_FRAC, summing to one.
+function reconcileColumnRatios(stored, nColumns) {
+    const kept = stored && Array.isArray(stored.ratios) ? stored.ratios : [];
+    const ratios = kept.filter((r) => typeof r === "number" && r > 0).slice(0, nColumns);
+    while (ratios.length < nColumns) ratios.push(1 / nColumns);
+    const sum = ratios.reduce((a, b) => a + b, 0);
+    const floored = ratios.map((r) => Math.max(COLUMN_MIN_FRAC, r / sum));
+    const sum2 = floored.reduce((a, b) => a + b, 0);
+    return floored.map((r) => r / sum2);
+}
+
+// The shown project's layout, stashed as the working copy of a drag (RS's state.tabLayout).
+function columnLayout(name, ids) {
+    const stored = S.cols[name];
+    const columns = reconcileTabLayout(stored, ids);
+    S.tabLayout = { project: name, columns, ratios: reconcileColumnRatios(stored, columns.length) };
+    return S.tabLayout;
+}
+
+// The tab a column shows: the focused tab when it is in the column, else the one it showed
+// last, else its first.
+function columnActive(name, col) {
+    const ids = S.tabLayout.columns[col];
+    if (ids.includes(tabOf(name))) return tabOf(name);
+    const last = (S.cols[name] && S.cols[name].active) || [];
+    return ids.find((id) => last.includes(id)) || ids[0];
+}
+
+// A tab becomes the one its column shows (the others of its column leave the list).
+function noteActive(name, id) {
+    const L = S.tabLayout && S.tabLayout.project === name ? S.tabLayout : null;
+    const col = L ? L.columns.find((c) => c.includes(id)) : null;
+    const entry = S.cols[name] || (S.cols[name] = { columns: [], active: [] });
+    entry.active = (entry.active || []).filter((x) => x !== id && !(col && col.includes(x)));
+    entry.active.push(id);
+    if (entry.active.length > 32) entry.active = entry.active.slice(-32);
+}
+
+function persistTabLayout(name, columns, ratios) {
+    const entry = S.cols[name] || (S.cols[name] = { columns: [], active: [] });
+    entry.columns = columns.map((c) => [...c]);
+    if (columns.length > 1 && Array.isArray(ratios)) entry.ratios = [...ratios];
+    else delete entry.ratios;
+    saveLayout();
+}
+
+// A project has one lesson tab at a time: the lesson opened takes the place of the one before.
+function renameLessonTab(name, newId) {
+    const entry = S.cols[name];
+    if (!entry) return;
+    const swap = (id) => (lessonTabId(id) ? newId : id);
+    entry.columns = (entry.columns || []).map((c) => c.map(swap));
+    entry.active = (entry.active || []).map(swap);
+}
+
+// Apply a drop target to the working layout {columns, ratios}. Targets:
+//   {type:"strip", col, index}: insert at `index` in column `col`
+//   {type:"append", col}: to column `col`'s end (a drop on the middle of its pane)
+//   {type:"split", col, side}: a new column "before" or "after" column `col`, taking half its width
+// True when the layout changed. An emptied column closes, its width going to a neighbour. At
+// MAX_TAB_COLUMNS every split is refused.
+function moveTabInLayout(layout, id, target) {
+    const { columns, ratios } = layout;
+    const src = columns.findIndex((c) => c.includes(id));
+    if (src === -1) return false;
+    const srcIdx = columns[src].indexOf(id);
+    if (target.type === "strip" || target.type === "append") {
+        const dst = target.col;
+        if (dst < 0 || dst >= columns.length) return false;
+        let index = target.type === "append" ? columns[dst].length : target.index;
+        columns[src].splice(srcIdx, 1);
+        if (dst === src && srcIdx < index) index -= 1;
+        index = Math.max(0, Math.min(index, columns[dst].length));
+        if (dst === src && index === srcIdx) { columns[src].splice(srcIdx, 0, id); return false; }
+        columns[dst].splice(index, 0, id);
+    } else if (target.type === "split") {
+        if (columns.length >= MAX_TAB_COLUMNS) return false;
+        const at = target.col + (target.side === "after" ? 1 : 0);
+        // A column's only tab split beside itself makes the same shape.
+        if (columns[src].length === 1 && (at === src || at === src + 1)) return false;
+        columns[src].splice(srcIdx, 1);
+        const half = ratios[target.col] / 2;
+        ratios[target.col] = half;
+        columns.splice(at, 0, [id]);
+        ratios.splice(at, 0, half);
+    } else {
+        return false;
+    }
+    for (let i = columns.length - 1; i >= 0; i--) {
+        if (columns[i].length) continue;
+        const neighbor = i > 0 ? i - 1 : 1;
+        if (ratios[neighbor] !== undefined) ratios[neighbor] += ratios[i];
+        columns.splice(i, 1);
+        ratios.splice(i, 1);
+    }
+    return true;
+}
+
+function sweepColumnChrome() {
+    S.shell.panes.querySelectorAll(".column-splitter, .column-drop-overlay").forEach((n) => n.remove());
+}
+
+// Position only: the splitters, the strip's groups and the shown panes from a set of widths.
+// The splitter drag runs it per frame, with no rebuild (which would drop its pointer capture).
+function positionColumnChrome(ratios) {
+    const lefts = [];
+    let x = 0;
+    for (const r of ratios) { lefts.push(x); x += r; }
+    S.shell.panes.querySelectorAll(".column-splitter").forEach((s, i) => { s.style.left = `calc(${pctOf(lefts[i + 1])} - 3px)`; });
+    positionStripGroups(ratios);
+    for (const child of S.shell.panes.children) {
+        if (child.hidden || child.dataset.col === undefined) continue;
+        const col = Number(child.dataset.col);
+        child.style.left = pctOf(lefts[col]);
+        child.style.width = pctOf(ratios[col]);
+    }
+}
+
+// Each column's tabs above its pane: the first group from the end of the chip to the first
+// boundary, each further one exactly over its pane. Tabs in a narrow group shrink, their
+// labels cut short.
+function positionStripGroups(ratios) {
+    const strip = S.shell.tabbar;
+    const groups = strip.querySelectorAll(".col-group");
+    if (!groups.length) return;
+    const divider = strip.querySelector(".tab-group-divider");
+    const chromeEnd = divider ? divider.offsetLeft + divider.offsetWidth : 0;
+    let x = 0;
+    groups.forEach((g, i) => {
+        if (i === 0) { g.style.left = `${chromeEnd}px`; g.style.width = `calc(${pctOf(ratios[0])} - ${chromeEnd}px)`; }
+        else { g.style.left = pctOf(x); g.style.width = pctOf(ratios[i]); }
+        x += ratios[i];
+    });
+}
+
+// A terminal measures itself again after its pane's size changed (a frame reflows by itself).
 function refitVisible() {
-    if (!S.shell || !S.current) return;
-    const pane = S.panes[paneKey(S.current, tabOf(S.current))];
-    if (pane && pane.refit) requestAnimationFrame(() => pane.refit());
+    if (!S.shell) return;
+    requestAnimationFrame(() => {
+        for (const pane of Object.values(S.panes)) if (pane.refit && !pane.el.hidden) pane.refit();
+    });
+}
+
+function onWindowResize() {
+    const narrow = narrowScreen();
+    if (narrow !== S.wasNarrow) { S.wasNarrow = narrow; render(); } else refitVisible();
+}
+
+// A drag has ended: the polls' renders held back meanwhile run now.
+function endDrag() {
+    S.dragging = false;
+    document.body.classList.remove("col-dragging");
+    if (S.renderPending) { S.renderPending = false; render(); }
+}
+
+// The splitter between columns `boundary` and `boundary + 1`: a pointer-captured drag (without
+// the capture, a move over a frame goes to the frame and the drag freezes), the two widths kept
+// above COLUMN_MIN_FRAC; geometry only while it moves, kept and the terminals refitted on release.
+function installColumnSplitterDrag(splitter, boundary) {
+    splitter.onpointerdown = (ev) => {
+        const layout = S.tabLayout;
+        const area = S.shell.panes;
+        if (!layout || ev.button !== 0) return;
+        const name = layout.project;
+        ev.preventDefault();
+        const pair = layout.ratios[boundary] + layout.ratios[boundary + 1];
+        const onMove = (mv) => {
+            const rect = area.getBoundingClientRect();
+            if (rect.width <= 0) return;
+            let leftEdge = 0;
+            for (let i = 0; i < boundary; i++) leftEdge += layout.ratios[i];
+            let share = (mv.clientX - rect.left) / rect.width - leftEdge;
+            share = Math.max(COLUMN_MIN_FRAC, Math.min(pair - COLUMN_MIN_FRAC, share));
+            layout.ratios[boundary] = share;
+            layout.ratios[boundary + 1] = pair - share;
+            positionColumnChrome(layout.ratios);
+        };
+        const onUp = () => {
+            splitter.removeEventListener("lostpointercapture", onUp);
+            document.removeEventListener("lostpointercapture", onDocLost);
+            splitter.removeEventListener("pointermove", onMove);
+            splitter.removeEventListener("pointerup", onUp);
+            splitter.removeEventListener("pointercancel", onUp);
+            try { splitter.releasePointerCapture(ev.pointerId); } catch (_) {}
+            splitter.classList.remove("dragging");
+            persistTabLayout(name, layout.columns, layout.ratios);
+            endDrag();
+            refitVisible();
+        };
+        const onDocLost = (lv) => { if (lv.pointerId === ev.pointerId) onUp(); };
+        splitter.classList.add("dragging");
+        S.dragging = true;
+        document.body.classList.add("col-dragging");
+        try { splitter.setPointerCapture(ev.pointerId); } catch (_) {}
+        splitter.addEventListener("pointermove", onMove);
+        splitter.addEventListener("pointerup", onUp);
+        splitter.addEventListener("pointercancel", onUp);
+        splitter.addEventListener("lostpointercapture", onUp);
+        document.addEventListener("lostpointercapture", onDocLost);
+    };
+}
+
+// After a drag with pointer capture, the browser makes a click on the captured tab: the tab's
+// onclick swallows exactly that one.
+let tabDragClickPending = false;
+function consumeTabDragClick() {
+    const pending = tabDragClickPending;
+    tabDragClickPending = false;
+    return pending;
+}
+
+// A tab's drag (desktop only): pointer-captured, never HTML5 drag-and-drop, so it goes on over
+// frames. Below the slop a press is a click. The drop is worked out from the geometry: on the
+// strip, before the tab whose middle is right of the pointer; over a pane, its outer bands split
+// a new column out (below MAX_TAB_COLUMNS), its middle moves the tab to the column's end.
+function armTabDrag(tab, name, id) {
+    tab.onpointerdown = (ev) => {
+        if (narrowScreen() || ev.button !== 0) return;
+        if (ev.target.closest("a, button")) return;   // the ↗ keeps its click
+        const strip = S.shell.tabbar;
+        const area = S.shell.panes;
+        const startX = ev.clientX, startY = ev.clientY;
+        let dragging = false;
+        let ghost = null, indicator = null, overlay = null;
+        let target = null;
+
+        const resolveTarget = (mv) => {
+            const layout = S.tabLayout;
+            if (!layout || layout.project !== name) return null;
+            const r = strip.getBoundingClientRect();
+            if (mv.clientX >= r.left && mv.clientX <= r.right && mv.clientY >= r.top && mv.clientY <= r.bottom) {
+                const tabs = Array.from(strip.querySelectorAll(".tb[data-tab]"));
+                if (!tabs.length) return null;
+                let flatIndex = tabs.length;
+                for (let i = 0; i < tabs.length; i++) {
+                    const tr = tabs[i].getBoundingClientRect();
+                    if (mv.clientX < tr.left + tr.width / 2) { flatIndex = i; break; }
+                }
+                let col, index;
+                if (flatIndex < tabs.length) {
+                    col = parseInt(tabs[flatIndex].getAttribute("data-column") || "0", 10);
+                    index = tabs.slice(0, flatIndex).filter((t) => t.getAttribute("data-column") === String(col)).length;
+                } else {
+                    col = parseInt(tabs[tabs.length - 1].getAttribute("data-column") || "0", 10);
+                    index = (layout.columns[col] || []).length;
+                }
+                return { type: "strip", col, index, tabs, flatIndex };
+            }
+            const ar = area.getBoundingClientRect();
+            if (mv.clientX < ar.left || mv.clientX > ar.right || mv.clientY < ar.top || mv.clientY > ar.bottom) return null;
+            const frac = (mv.clientX - ar.left) / ar.width;
+            let x = 0, col = 0;
+            for (let i = 0; i < layout.ratios.length; i++) {
+                col = i;
+                if (frac < x + layout.ratios[i] || i === layout.ratios.length - 1) break;
+                x += layout.ratios[i];
+            }
+            const within = (frac - x) / layout.ratios[col];
+            if (layout.columns.length < MAX_TAB_COLUMNS) {
+                if (within < COLUMN_EDGE_BAND_FRAC) return { type: "split", col, side: "before" };
+                if (within > 1 - COLUMN_EDGE_BAND_FRAC) return { type: "split", col, side: "after" };
+            }
+            return { type: "append", col };
+        };
+
+        // An insertion mark in the strip, or a tint over the pane: the whole column to move into
+        // it, half of it for the new column a split makes.
+        const showFeedback = (t) => {
+            if (indicator) { indicator.remove(); indicator = null; }
+            if (overlay) { overlay.remove(); overlay = null; }
+            if (!t) return;
+            if (t.type === "strip") {
+                const anchor = t.tabs[Math.min(t.flatIndex, t.tabs.length - 1)];
+                if (!anchor) return;
+                const sr = strip.getBoundingClientRect();
+                const tr = anchor.getBoundingClientRect();
+                const edgeX = (t.flatIndex < t.tabs.length ? tr.left : tr.right) - sr.left + strip.scrollLeft;
+                indicator = h("div", { class: "tab-drop-indicator" });
+                indicator.style.left = `${edgeX}px`;
+                strip.append(indicator);
+            } else if (S.tabLayout) {
+                const { ratios } = S.tabLayout;
+                let left = 0;
+                for (let i = 0; i < t.col; i++) left += ratios[i];
+                let w = ratios[t.col];
+                if (t.type === "split") { w /= 2; if (t.side === "after") left += w; }
+                overlay = h("div", { class: "column-drop-overlay" });
+                overlay.style.left = pctOf(left);
+                overlay.style.width = pctOf(w);
+                area.append(overlay);
+            }
+        };
+
+        const onMove = (mv) => {
+            if (!dragging) {
+                if (Math.abs(mv.clientX - startX) < TAB_DRAG_SLOP_PX && Math.abs(mv.clientY - startY) < TAB_DRAG_SLOP_PX) return;
+                dragging = true;
+                S.dragging = true;
+                tab.classList.add("dragging");
+                document.body.classList.add("col-dragging");
+                ghost = tab.cloneNode(true);
+                ghost.className = "tab-drag-ghost";
+                document.body.append(ghost);
+            }
+            ghost.style.left = `${mv.clientX + 10}px`;
+            ghost.style.top = `${mv.clientY + 10}px`;
+            target = resolveTarget(mv);
+            showFeedback(target);
+        };
+        const cleanup = () => {
+            // lostpointercapture first: the release below fires it at once.
+            tab.removeEventListener("lostpointercapture", onCancel);
+            document.removeEventListener("lostpointercapture", onDocLost);
+            tab.removeEventListener("pointermove", onMove);
+            tab.removeEventListener("pointerup", onUp);
+            tab.removeEventListener("pointercancel", onCancel);
+            try { tab.releasePointerCapture(ev.pointerId); } catch (_) {}
+            if (ghost) ghost.remove();
+            if (indicator) indicator.remove();
+            if (overlay) overlay.remove();
+            tab.classList.remove("dragging");
+        };
+        const onCancel = () => { cleanup(); if (dragging) endDrag(); };
+        const onDocLost = (lv) => { if (lv.pointerId === ev.pointerId) onCancel(); };
+        const onUp = () => {
+            const t = target;
+            cleanup();
+            if (!dragging) return;                // a click: let it through
+            tabDragClickPending = true;
+            // The browser's click comes at once if it comes at all; never swallow a later one.
+            setTimeout(() => { tabDragClickPending = false; }, 0);
+            const layout = S.tabLayout;
+            const moved = !!t && !!layout && layout.project === name
+                && moveTabInLayout(layout, id, t.type === "strip" ? { type: "strip", col: t.col, index: t.index } : t);
+            if (moved) persistTabLayout(name, layout.columns, layout.ratios);
+            S.renderPending = false;
+            endDrag();
+            if (S.current !== name) return;
+            // The moved tab becomes its column's shown tab and takes the focus.
+            if (moved) showTab(name, id); else render();
+        };
+        try { tab.setPointerCapture(ev.pointerId); } catch (_) {}
+        tab.addEventListener("pointermove", onMove);
+        tab.addEventListener("pointerup", onUp);
+        tab.addEventListener("pointercancel", onCancel);
+        tab.addEventListener("lostpointercapture", onCancel);
+        document.addEventListener("lostpointercapture", onDocLost);
+    };
 }
 
 // ---- a web tab: the editor, an app -----------------------------------------------------------
@@ -786,7 +1262,7 @@ function makeWebPane(name, id, row) {
     const bar = h("div", { class: "appbar" }, h("span", { class: "applabel" }, label), said, fileNote, link, reload, retry);
     const goneNote = h("div", { class: "gone-note", hidden: true },
         h("span", {}, "This app no longer listens in the sandbox. Its frame is kept until you close it."),
-        h("button", { onclick: () => { dropPane(paneKey(name, id)); S.tabs[name] = "shell"; render(); } }, "Close the tab"));
+        h("button", { onclick: () => { dropPane(paneKey(name, id)); render(); } }, "Close the tab"));
     const body = h("div", { class: "frame-area" },
         h("div", { class: "frame-hint" }, "If the frame stays empty, the browser has not accepted this address's certificate yet: open it in a new tab once, accept it there, then reload the frame."));
     const el = h("div", { class: "pane web-pane" }, bar, goneNote, body);
@@ -1006,6 +1482,7 @@ function lessonRows(name) {
 function openLesson(name, id) {
     const prev = S.lessonOf[name];
     if (prev && prev !== id) dropPane(paneKey(name, lessonTab(prev)));
+    renameLessonTab(name, lessonTab(id));
     S.lessonOf[name] = id;
     S.tabs[name] = lessonTab(id);
     S.page = null;
@@ -1748,8 +2225,14 @@ function makeLessonPane(name, id) {
     const tools = new Map();   // tool id -> its line, so a result fills the line its call made
     let follow = true;         // the conversation follows the newest text unless scrolled up
 
-    conv.addEventListener("scroll", () => { follow = conv.scrollHeight - conv.scrollTop - conv.clientHeight < 40; });
-    const toBottom = () => { if (follow) conv.scrollTop = conv.scrollHeight; };
+    // Scrolled up is above where the page last put it: text that grew or reflowed under a
+    // following conversation (a narrower column, a plot drawn late) does not end the following.
+    let putAt = 0;
+    conv.addEventListener("scroll", () => { follow = conv.scrollTop >= putAt - 2 || conv.scrollHeight - conv.scrollTop - conv.clientHeight < 40; });
+    const toBottom = () => { if (follow) { conv.scrollTop = conv.scrollHeight; putAt = conv.scrollTop; } };
+    // The text grows or reflows without a scroll (its column made narrower, a plot drawn late):
+    // a conversation that followed the newest text goes on following it.
+    if (window.ResizeObserver) new ResizeObserver(() => { if (!el.hidden) toBottom(); }).observe(inner);
 
     // A refusal (busy, a failed Stop) stays until the answer ends or the next message; a note
     // about the connection goes as soon as the connection is back.
@@ -1966,6 +2449,8 @@ function makeLessonPane(name, id) {
         follow = true;
         if (run) { S.activity.add(id); join(run.id, 0); } else setComposer();
         renderRail();
+        // At once as well: the scroll the emptying above made would otherwise end the following.
+        toBottom();
         requestAnimationFrame(toBottom);
     }
 

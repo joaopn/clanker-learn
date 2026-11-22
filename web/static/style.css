@@ -1,6 +1,7 @@
 /* clanker-learn's page. The palette and the components are the accepted mock's (which took
    RS's web UI defaults); only what this page shows is kept. No inline style anywhere: the
-   script switches classes and the `hidden` attribute. */
+   script switches classes and the `hidden` attribute; the one exception is the geometry of
+   the tabs side by side (left and width of the panes, splitters and tab groups: RS's). */
 :root {
     --bg-base: #1e1e1e;
     --bg-card: #2a2a2a;
@@ -110,7 +111,7 @@ a { color: var(--fg-accent); }
 .main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
 .tabbar {
     height: 42px; flex: none; display: flex; align-items: stretch; background: var(--bg-rail);
-    border-bottom: 1px solid var(--border); overflow-x: auto; white-space: nowrap;
+    border-bottom: 1px solid var(--border); overflow-x: auto; white-space: nowrap; position: relative;
 }
 .tabbar .tb {
     display: flex; align-items: center; gap: 8px; padding: 0 14px; cursor: pointer; border-right: 1px solid #333;
@@ -130,6 +131,38 @@ a { color: var(--fg-accent); }
 .tabbar .newtab { text-decoration: none; color: var(--fg-faint); font-size: 13px; }
 .tabbar .newtab:hover { color: var(--fg-accent); }
 .tabbar .spacer { flex: 1; }
+.tabbar .tb .tl { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+
+/* ---- tabs side by side (RS's column layout: style.css .column-tab-group, .column-splitter,
+   .column-drop-overlay, .tab-drag-ghost, .tab-drop-indicator) ---- */
+.tabbar.cols { overflow: hidden; }
+.tabbar .tab-group-divider { flex: none; align-self: center; width: 1px; height: 18px; margin: 0 6px; background: var(--border); }
+/* Each column's tabs in a group above its pane; the script sets left and width. The group's
+   left border marks the boundary; the chip stays above the groups. */
+.tabbar .col-group {
+    position: absolute; top: 0; bottom: 0; display: flex; align-items: stretch; background: var(--bg-rail);
+    border-left: 2px solid var(--border-strong); z-index: 1; overflow: hidden;
+}
+.tabbar .col-group.first { border-left: none; }
+.tabbar > .projchip, .tabbar > .tab-group-divider { position: relative; z-index: 2; }
+.tabbar .col-group .tb { min-width: 0; flex-shrink: 1; }
+.tabbar .col-group .tb .newtab, .tabbar .col-group .tb.raw code { flex-shrink: 0; }
+.tabbar .tab-drop-indicator { position: absolute; top: 4px; bottom: 4px; width: 2px; background: var(--fg-accent); pointer-events: none; z-index: 3; }
+.tabbar .tb.dragging { opacity: .4; }
+.tab-drag-ghost {
+    position: fixed; z-index: 1000; pointer-events: none; opacity: .85; display: flex; align-items: center; gap: 8px;
+    height: 30px; padding: 0 14px; background: var(--bg-base); border: 1px solid var(--border-strong); border-radius: 4px;
+    color: var(--fg-base); white-space: nowrap;
+}
+.panes .column-splitter { position: absolute; top: 0; bottom: 0; width: 6px; background: var(--border); cursor: col-resize; z-index: 4; touch-action: none; }
+.panes .column-splitter:hover, .panes .column-splitter.dragging { background: var(--fg-accent); }
+.panes .column-drop-overlay {
+    position: absolute; top: 0; bottom: 0; background: rgba(102, 204, 153, .12); border: 1px dashed var(--fg-accent);
+    pointer-events: none; z-index: 5;
+}
+/* While a tab or a splitter is dragged, no frame takes the pointer and nothing is selected. */
+body.col-dragging { user-select: none; cursor: grabbing; }
+body.col-dragging iframe { pointer-events: none; }
 
 .panes { flex: 1; min-height: 0; position: relative; }
 .pane { position: absolute; inset: 0; display: flex; flex-direction: column; min-width: 0; min-height: 0; }
@@ -266,6 +299,8 @@ ul.plain { margin: 6px 0 6px 20px; line-height: 1.5; }
 .tabbar .tb.t-lesson { border-top-color: var(--tab-type-lesson); max-width: 260px; overflow: hidden; text-overflow: ellipsis; display: block; line-height: 40px; }
 
 /* ---- a lesson's conversation (the mock's lesson view) ---- */
+/* A conversation in a narrow column takes the narrow window's spacing (end of the file). */
+.lesson-pane { container-type: inline-size; }
 .lhead { flex: none; display: flex; align-items: center; gap: 12px; padding: 9px 18px; border-bottom: 1px solid #333; background: #222; }
 .lh-main { flex: 1; min-width: 0; display: flex; align-items: baseline; gap: 12px; }
 .lhead .lt { font-weight: 600; font-size: 15px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
@@ -373,6 +408,17 @@ ul.plain { margin: 6px 0 6px 20px; line-height: 1.5; }
 /* ---- Settings -> Tutor ---- */
 .tutor-set .form p { margin: 8px 0; line-height: 1.45; }
 .tutor-state { font-weight: 600; }
+
+/* ---- a conversation in a narrow column ---- */
+@container (max-width: 560px) {
+    .conv { padding: 14px 10px 6px; }
+    .msg { grid-template-columns: 26px minmax(0, 1fr); gap: 8px; }
+    .av { width: 24px; height: 24px; font-size: 11px; }
+    .composer { padding: 6px 10px 10px; }
+    .ctxline { padding: 2px 10px 0; }
+    .lhead { padding: 7px 10px; }
+    .md .md-page-area { height: 360px; }
+}
 
 /* ---- narrow windows: the rail above, no horizontal page scroll ---- */
 @media (max-width: 700px) {
