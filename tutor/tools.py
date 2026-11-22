@@ -18,6 +18,8 @@ import json
 import logging
 import time
 
+import cards
+import knowledge
 import plans
 import store
 
@@ -62,7 +64,7 @@ def listed(kind):
 
 def check(schema, value, where="input"):
     """The parts of JSON Schema these tools use: type, properties, required,
-    additionalProperties false, items, min/maxItems, min/maxLength. Returns a sentence, or None."""
+    additionalProperties false, items, min/maxItems, min/maxLength, enum. Returns a sentence, or None."""
     kind = schema.get("type")
     if kind == "object":
         if not isinstance(value, dict):
@@ -95,6 +97,10 @@ def check(schema, value, where="input"):
             return f"{where} must be {schema.get('minLength', 0)} to {schema.get('maxLength')} characters"
     elif kind == "integer" and (isinstance(value, bool) or not isinstance(value, int)):
         return f"{where} must be a whole number"
+    elif kind == "boolean" and not isinstance(value, bool):
+        return f"{where} must be true or false"
+    if "enum" in schema and value not in schema["enum"]:
+        return f"{where} must be one of: {', '.join(map(str, schema['enum']))}"
     return None
 
 
@@ -132,7 +138,7 @@ async def dispatch(ctx, name, arguments):
                 status, error, payload = "error", f"The result is larger than {RESULT_MAX} bytes; ask for less.", None
         except TimeoutError:
             status, error = "timeout", f"{name} did not finish within {spec['timeout_s']:g} s."
-        except (ToolError, plans.PlanError) as exc:
+        except (ToolError, plans.PlanError, knowledge.KnowledgeError, cards.CheckError) as exc:
             status, error = "error", str(exc)
         except Exception as exc:
             log.exception("tool %s failed", name)
@@ -203,9 +209,12 @@ async def lesson_history(ctx, _args):
                                         "one_line": {"type": "string", "minLength": 1, "maxLength": plans.ONE_LINE_MAX}},
        "required": ["summary", "one_line"], "additionalProperties": False}, kinds=("lesson",))
 async def lesson_close(ctx, args):
-    turn = ctx["turn"]
-    row = store.close_lesson(ctx["db"], turn.lesson_id, args["summary"].strip(), " ".join(args["one_line"].split()))
-    return {"closed": row["id"], "state": row["state"], "said": "The lesson is done. The learner may still write in it; answer them as before."}
+    turn, db = ctx["turn"], ctx["db"]
+    row = store.close_lesson(db, turn.lesson_id, args["summary"].strip(), " ".join(args["one_line"].split()))
+    evidence_id = knowledge.add_evidence(db, "completion", turn.project, turn.created, row["id"], turn.run_id,
+                                         {"title": row["title"], "one_line": row["one_line"]})
+    return {"closed": row["id"], "state": row["state"], "evidence": evidence_id,
+            "said": "The lesson is done; every tutor's brief lists it under Recently. The learner may still write in it; answer them as before."}
 
 
 PLAN_MODULES = {"type": "array", "minItems": 1, "maxItems": plans.MODULES_MAX, "items": {
@@ -252,3 +261,192 @@ async def plan_change_propose(ctx, args):
         raise ToolError("The project has no plan yet: propose one with plan_propose.")
     modules, dropped = plans.clean_change(db, turn.project, turn.created, args["modules"])
     return show_proposal(ctx, "change", {"modules": modules, "dropped": dropped, "reason": args["reason"].strip()})
+
+
+# --- the knowledge base (knowledge.py) ----------------------------------------------------------
+
+LINE = {"type": "string", "minLength": 1, "maxLength": knowledge.LINE_MAX}
+QUOTE = {"type": "string", "minLength": 1, "maxLength": 1000}
+EVIDENCE_IDS = {"type": "array", "maxItems": 20, "items": {"type": "integer"}}
+RESTS_ON = {"type": "object", "properties": {"evidence": EVIDENCE_IDS, "quote": QUOTE}, "additionalProperties": False}
+INSIGHT_KIND = {"type": "string", "enum": list(knowledge.INSIGHT_KINDS)}
+RESTS_SAID = ("`rests_on` is what the record rests on: `evidence`, ids that exercise_check, answer_grade, lesson_close or the "
+              "learner's answers gave you, and/or `quote`, a sentence of at least 12 characters that the learner typed in this project, "
+              "copied exactly.")
+
+
+def this_project_insights(ctx):
+    turn = ctx["turn"]
+    return [knowledge.record_brief(row) for row in knowledge.records(ctx["db"], "insight", turn.project, turn.created)]
+
+
+@tool("brief_get", "read", "The learner's brief as it is now (their goals, how they want to be taught, their background, the global "
+      "insights they approved, the lessons done recently in any project) and this project's insights in force, with their numbers. "
+      "The opening context of this conversation had the brief as it was then.", NO_ARGS)
+async def brief_get(ctx, _args):
+    text, cut, _parts = knowledge.brief(ctx["db"])
+    return {"brief": text, "cut": cut, "this_project_insights": this_project_insights(ctx)}
+
+
+@tool("records_search", "read", "Search what you may read of the learner's records for every word of `query`: the lesson summaries of "
+      "every project, the goals, preferences, background and global insights, and this project's insights (retired ones too).",
+      {"type": "object", "properties": {"query": {"type": "string", "minLength": 1, "maxLength": 200}}, "required": ["query"],
+       "additionalProperties": False})
+async def records_search(ctx, args):
+    return knowledge.search(ctx["db"], ctx["turn"], args["query"])
+
+
+@tool("insight_record", "write", "Record one line on how the learner learns in this project: a misconception, a strength, what worked, "
+      "what did not (`kind`). Only this project's tutors are told it. " + RESTS_SAID,
+      {"type": "object", "properties": {"text": LINE, "kind": INSIGHT_KIND, "rests_on": RESTS_ON}, "required": ["text", "kind", "rests_on"],
+       "additionalProperties": False})
+async def insight_record(ctx, args):
+    turn, db = ctx["turn"], ctx["db"]
+    rests_on = knowledge.rests_on_of(db, turn, args["rests_on"])
+    row = knowledge.add(db, "insight", knowledge.one_line(args["text"]), knowledge.by_tutor(turn), project=turn.project, created=turn.created,
+                        insight_kind=args["kind"], rests_on=rests_on)
+    return {"insight": row["id"], "rests_on": rests_on,
+            "said": "Recorded. This project's tutors are told it from their next lesson; the learner sees it and can edit or delete it."}
+
+
+@tool("insight_replace", "write", "Replace an insight of this project (by its number) with a new line: the old one is retired and the "
+      "new one names it. You never edit an insight in place. " + RESTS_SAID,
+      {"type": "object", "properties": {"id": {"type": "integer"}, "text": LINE, "kind": INSIGHT_KIND, "rests_on": RESTS_ON},
+       "required": ["id", "text", "rests_on"], "additionalProperties": False})
+async def insight_replace(ctx, args):
+    turn, db = ctx["turn"], ctx["db"]
+    knowledge.own_insight(db, turn, args["id"])
+    rests_on = knowledge.rests_on_of(db, turn, args["rests_on"])
+    row = knowledge.replace(db, args["id"], knowledge.one_line(args["text"]), knowledge.by_tutor(turn), rests_on, args.get("kind"))
+    return {"insight": row["id"], "replaces": args["id"], "rests_on": rests_on, "said": f"Insight {args['id']} is retired; {row['id']} takes its place."}
+
+
+@tool("insight_retire", "write", "Retire an insight of this project (by its number) that no longer holds, saying why in `reason`.",
+      {"type": "object", "properties": {"id": {"type": "integer"}, "reason": {"type": "string", "minLength": 1, "maxLength": knowledge.REASON_MAX}},
+       "required": ["id", "reason"], "additionalProperties": False})
+async def insight_retire(ctx, args):
+    turn, db = ctx["turn"], ctx["db"]
+    knowledge.own_insight(db, turn, args["id"])
+    knowledge.retire(db, args["id"], knowledge.by_tutor(turn), knowledge.one_line(args["reason"]))
+    return {"retired": args["id"], "said": "Retired: no tutor is told it any more."}
+
+
+def in_their_words(ctx, kind, args):
+    turn, db = ctx["turn"], ctx["db"]
+    text = knowledge.one_line(args["text"])
+    same = next((row for row in knowledge.records(db, kind) if knowledge.collapsed(row["text"]) == knowledge.collapsed(text)), None)
+    if same is not None:
+        raise ToolError(f"That {kind} is recorded already ({same['id']}).")
+    quote_id = knowledge.quote_evidence(db, turn, args["quote"])
+    row = knowledge.add(db, kind, text, knowledge.by_tutor(turn), project=turn.project, created=turn.created,
+                        rests_on={"evidence": [quote_id], "insights": []})
+    return {kind: row["id"], "quote_evidence": quote_id,
+            "said": f"Recorded: every tutor of every project is told this {kind} in the learner's brief; the learner can edit or delete it."}
+
+
+QUOTED = {"type": "object", "properties": {"text": LINE, "quote": QUOTE}, "required": ["text", "quote"], "additionalProperties": False}
+
+
+@tool("preference_record", "write", "Record how the learner wants to be taught, as one line (`text`), ONLY when they said it: `quote` is "
+      "the sentence they typed in this project that says it, copied exactly (at least 12 characters). It is refused otherwise.", QUOTED)
+async def preference_record(ctx, args):
+    return in_their_words(ctx, "preference", args)
+
+
+@tool("goal_record", "write", "Record what the learner wants to reach, as one line (`text`), ONLY when they said it: `quote` is the "
+      "sentence they typed in this project that says it, copied exactly (at least 12 characters). It is refused otherwise.", QUOTED)
+async def goal_record(ctx, args):
+    return in_their_words(ctx, "goal", args)
+
+
+@tool("global_insight_propose", "propose", "Propose a global insight, told to every tutor of every project once the learner approves "
+      "it on their Knowledge page (not in this conversation): `{text, rests_on}` for a new one, `{replaces, text, rests_on}` to replace "
+      "one in force, `{retires, reason}` to retire one. `rests_on` cites this project's insights (`insights`, their numbers) and/or a "
+      "`quote` of the learner's. Sparingly: only what holds beyond this project.",
+      {"type": "object", "properties": {"text": LINE, "rests_on": {"type": "object", "properties": {"insights": EVIDENCE_IDS, "quote": QUOTE},
+                                                                  "additionalProperties": False},
+                                        "replaces": {"type": "integer"}, "retires": {"type": "integer"},
+                                        "reason": {"type": "string", "maxLength": knowledge.REASON_MAX}},
+       "additionalProperties": False})
+async def global_insight_propose(ctx, args):
+    row = knowledge.propose_global(ctx["db"], ctx["turn"], args)
+    return {"global_proposal": row["id"], "said": "Listed on the learner's Knowledge page, where they may edit, approve or dismiss it. No tutor "
+            "is told it until they approve it; their decision reaches you at the start of their next message in this lesson."}
+
+
+# --- exercises and quick questions (cards.py) ----------------------------------------------------
+
+@tool("exercise_define", "write", "Set the learner an exercise, shown as a card: a `title`, its `steps`, and a `check`: a shell `command` "
+      "run in /workspace as the learner (no credentials, 30 s at most) that exits with `expect_exit` (default 0) once their work is "
+      "right. The learner can press Check; so can you, with exercise_check.",
+      {"type": "object", "properties": {
+          "title": {"type": "string", "minLength": 1, "maxLength": plans.TITLE_MAX},
+          "steps": {"type": "array", "minItems": 1, "maxItems": 20, "items": {"type": "string", "minLength": 1, "maxLength": 2000}},
+          "check": {"type": "object", "properties": {"command": {"type": "string", "minLength": 1, "maxLength": 4000}, "expect_exit": {"type": "integer"}},
+                    "required": ["command"], "additionalProperties": False}},
+       "required": ["title", "steps", "check"], "additionalProperties": False}, kinds=("lesson",))
+async def exercise_define(ctx, args):
+    turn, db = ctx["turn"], ctx["db"]
+    spec = {"title": knowledge.one_line(args["title"]), "steps": [step.strip() for step in args["steps"]],
+            "check": {"command": args["check"]["command"].strip(), "expect_exit": args["check"].get("expect_exit", 0)}}
+    row = store.add_card(db, turn.lesson_id, turn.run_id, "exercise", spec)
+    ctx["runner"].on_card(turn, store.card_out(row))
+    return {"exercise": row["id"], "said": "Shown to the learner as a card with a Check button. When they press it, the outcome reaches you "
+            "with their next message; run the check yourself with exercise_check."}
+
+
+def card_of_project(ctx, card_id, kind):
+    turn, db = ctx["turn"], ctx["db"]
+    row = store.card(db, card_id)
+    home = store.lesson(db, row["lesson_id"]) if row else None
+    if row is None or row["kind"] != kind or (home["project"], home["created"]) != (turn.project, turn.created):
+        raise ToolError(f"There is no {kind} {card_id} in this project.")
+    return row
+
+
+@tool("exercise_check", "write", "Run an exercise's check now, in this project's sandbox (as the learner, in /workspace, 30 s at most). "
+      "The command, its exit code and output are stored as evidence (its id is returned) and shown on the card.",
+      {"type": "object", "properties": {"exercise": {"type": "integer"}}, "required": ["exercise"], "additionalProperties": False},
+      kinds=("lesson",), timeout_s=60)
+async def exercise_check(ctx, args):
+    turn, db = ctx["turn"], ctx["db"]
+    row = card_of_project(ctx, args["exercise"], "exercise")
+    outcome = await ctx["runner"].run_check(turn.project, json.loads(row["spec_json"])["check"]["command"], turn.run_id)
+    row = cards.record_check(db, row, outcome, "tutor", turn.run_id, told=True)
+    ctx["runner"].on_card(turn, store.card_out(row))
+    result = json.loads(row["result_json"])
+    return {key: result[key] for key in ("evidence", "passed", "exit_code", "timed_out", "output", "output_cut")}
+
+
+@tool("quiz_ask", "write", "Ask the learner a quick question, shown as a card they answer in place: `options` (2 to 8), `answer` the index "
+      "of the right one (from 0), `explanation` shown once they have answered. The page does not show the right answer before; do not "
+      "give it away in your text. Their choice reaches you with their next message.",
+      {"type": "object", "properties": {
+          "question": {"type": "string", "minLength": 1, "maxLength": 2000},
+          "options": {"type": "array", "minItems": 2, "maxItems": 8, "items": {"type": "string", "minLength": 1, "maxLength": 500}},
+          "answer": {"type": "integer"}, "explanation": {"type": "string", "minLength": 1, "maxLength": 2000}},
+       "required": ["question", "options", "answer", "explanation"], "additionalProperties": False}, kinds=("lesson",))
+async def quiz_ask(ctx, args):
+    turn, db = ctx["turn"], ctx["db"]
+    if not 0 <= args["answer"] < len(args["options"]):
+        raise ToolError(f"`answer` is the index of the right option, 0 to {len(args['options']) - 1}.")
+    spec = {"question": args["question"].strip(), "options": [knowledge.one_line(o) for o in args["options"]], "answer": args["answer"],
+            "explanation": args["explanation"].strip()}
+    row = store.add_card(db, turn.lesson_id, turn.run_id, "question", spec)
+    ctx["runner"].on_card(turn, store.card_out(row))
+    return {"question": row["id"], "said": "Shown to the learner as a card. Their choice reaches you with their next message."}
+
+
+@tool("answer_grade", "write", "Grade an answer the learner TYPED (not one chosen on a card, which is graded by itself): `quote` is the "
+      "sentence of their answer, copied exactly as they typed it in this project; `right` your grade; `note` why, in a sentence; "
+      "`question` what was asked. Stored as evidence; its id is returned, for an insight to rest on.",
+      {"type": "object", "properties": {"quote": QUOTE, "right": {"type": "boolean"}, "note": {"type": "string", "minLength": 1, "maxLength": 1000},
+                                        "question": {"type": "string", "maxLength": 2000}},
+       "required": ["quote", "right", "note"], "additionalProperties": False}, kinds=("lesson",))
+async def answer_grade(ctx, args):
+    turn, db = ctx["turn"], ctx["db"]
+    message = knowledge.find_quote(db, turn.project, turn.created, args["quote"])
+    evidence_id = knowledge.add_evidence(db, "answer", turn.project, turn.created, message["lesson_id"], turn.run_id,
+                                         {"how": "typed", "quote": knowledge.one_line(args["quote"]), "message_id": message["id"],
+                                          "question": (args.get("question") or "").strip(), "right": args["right"], "note": args["note"].strip()})
+    return {"evidence": evidence_id}

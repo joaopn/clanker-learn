@@ -23,6 +23,10 @@ carries the lesson's opening context before the learner's text (plans.opening_co
 apart from it; a session that is gone, or was made with other instructions, is replaced by a
 fresh one told to take the lesson up from its files, transcript.md (written here after every
 answer) and notes.md (kept by the tutor).
+
+An exercise's check (run_check) is run by the service over its own SSH channel, not through
+Claude Code: as the sandbox user, in /workspace, with no credential sent, for at most CHECK_S,
+tagged CL_CHECK_ID (its time limit and Stop end it by that tag) and, during a turn, CL_RUN_ID.
 """
 import asyncio
 import contextlib
@@ -33,6 +37,8 @@ import secrets
 import shlex
 import uuid
 
+import cards
+import knowledge
 import mcp
 import plans
 import store
@@ -54,6 +60,8 @@ IDLE_S = 30 * 60           # no overall limit (installing software takes long), 
 STOP_GRACE_S = 5           # after the interrupt, before the run's processes are ended as root
 END_S = 15                 # after the result, for Claude Code to end once its input is closed
 CLEANUP_S = 30
+CHECK_S = 30               # an exercise's check command, before it is ended
+CHECK_KEEP = 4000          # of a check's output, the end of it, what is stored
 LINE_LIMIT = 16 * 1024 * 1024   # a whole file read by a tool comes back on one line
 STDERR_KEEP = 4096
 
@@ -73,12 +81,12 @@ LOGIN_SIGNS = ("/login", "not logged in", "invalid api key", "oauth token", "aut
 # CAP_SYS_PTRACE, so it cannot read the environment of the learner's processes, while the
 # learner can; and a plain user cannot signal what runs under `sudo` (which also drops the
 # tag), so those are found as descendants of a tagged process and ended by root. Printed: the
-# pids of every process whose environment holds exactly CL_RUN_ID=<the id>, with all of their
-# descendants. This script's own process does not carry the tag: the clean-up's SSH call does
-# not send it.
+# pids of every process whose environment holds exactly the tag (CL_RUN_ID=<the id>, or a
+# check's CL_CHECK_ID=<its id>), with all of their descendants. This script's own process does
+# not carry the tag: the clean-up's SSH call does not send it.
 FIND_TAGGED = """
 import os, sys
-tag = ("CL_RUN_ID=" + sys.argv[1]).encode()
+tag = sys.argv[1].encode()
 me, children, found = os.getpid(), {}, set()
 for pid in filter(str.isdigit, os.listdir("/proc")):
     try:
@@ -155,21 +163,22 @@ def claude_command(session_id, resume, text):
             "unset CL_CLAUDE_TOKEN; export ENABLE_TOOL_SEARCH=false; exec " + " ".join(shlex.quote(part) for part in flags))
 
 
-async def kill_tagged(project, run_id):
-    """End every process in the sandbox that carries this run's CL_RUN_ID, and its descendants. Best effort:
-    a sandbox that is gone has nothing left to end."""
+async def kill_tagged(project, run_id, tag=None):
+    """End every process in the sandbox that carries this run's CL_RUN_ID (or `tag`, a whole
+    NAME=value), and its descendants. Best effort: a sandbox that is gone has nothing left to end."""
     if not os.path.isfile(f"{KEYS}/{project}/id_ed25519"):
         return
-    remote = "sh -c " + " ".join(shlex.quote(part) for part in (KILL_TAGGED, "kill-tagged", FIND_TAGGED, str(run_id)))
+    tag = tag or f"CL_RUN_ID={run_id}"
+    remote = "sh -c " + " ".join(shlex.quote(part) for part in (KILL_TAGGED, "kill-tagged", FIND_TAGGED, tag))
     proc = None
     try:
         proc = await asyncio.create_subprocess_exec(*ssh_argv(project), remote, stdin=asyncio.subprocess.DEVNULL,
                                                     stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
         out, err = await asyncio.wait_for(proc.communicate(), CLEANUP_S)
-        log.info("run %s: ended %s process(es) in %s%s", run_id, out.decode(errors="replace").strip() or "no",
+        log.info("%s: ended %s process(es) in %s%s", tag, out.decode(errors="replace").strip() or "no",
                  project, f" ({err.decode(errors='replace').strip()[-200:]})" if proc.returncode else "")
     except (OSError, TimeoutError) as exc:
-        log.info("run %s: the clean-up in %s did not run (%s)", run_id, project, type(exc).__name__)
+        log.info("%s: the clean-up in %s did not run (%s)", tag, project, type(exc).__name__)
         if proc is not None and proc.returncode is None:
             with contextlib.suppress(ProcessLookupError):
                 proc.kill()
@@ -199,6 +208,50 @@ async def write_file_as_learner(project, path, text):
         return False
 
 
+async def run_check(project, command, run_id=None, check_id=None):
+    """An exercise's check command, run by the service itself over its own SSH channel (not
+    through the agent): as the sandbox user, in /workspace, with no credential in its
+    environment (nothing is sent but the tags), for at most CHECK_S. It carries CL_CHECK_ID, by
+    which it is ended at its time limit, and during a turn the turn's CL_RUN_ID, so that Stop
+    ends it with the rest of the turn. Returns {exit_code (None when it was ended), output (the
+    end of stdout and stderr together), cut (whether more came before), timed_out, seconds}."""
+    if not os.path.isfile(f"{KEYS}/{project}/id_ed25519"):
+        raise cards.CheckError(START_PROJECT)
+    check_id = check_id or secrets.token_hex(8)
+    env, send = dict(os.environ, CL_CHECK_ID=check_id), ["CL_CHECK_ID"]
+    if run_id is not None:
+        env["CL_RUN_ID"] = str(run_id)
+        send.append("CL_RUN_ID")
+    remote = ("unset CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_API_KEY CL_CLAUDE_TOKEN CL_RUN_TOKEN; cd /workspace && exec sh -c "
+              + shlex.quote(command) + " 2>&1")
+    started = asyncio.get_running_loop().time()
+    proc = await asyncio.create_subprocess_exec(*ssh_argv(project, send), remote, env=env, stdin=asyncio.subprocess.DEVNULL,
+                                                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    out, total, timed_out = bytearray(), 0, False
+
+    async def read():
+        nonlocal total
+        while chunk := await proc.stdout.read(65536):
+            total += len(chunk)
+            out.extend(chunk)
+            del out[:-CHECK_KEEP * 2]
+        return await proc.wait()
+    try:
+        await asyncio.wait_for(read(), CHECK_S)
+    except TimeoutError:
+        timed_out = True
+        await kill_tagged(project, None, f"CL_CHECK_ID={check_id}")
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
+        await proc.wait()
+    err = (await proc.stderr.read()).decode(errors="replace").strip()
+    if not timed_out and proc.returncode == 255 and not out and err:
+        raise cards.CheckError(START_PROJECT if any(sign in err for sign in UNREACHABLE) else f"The check could not reach the sandbox: {err.splitlines()[-1][:300]}")
+    text = out.decode(errors="replace")
+    return {"exit_code": None if timed_out else proc.returncode, "output": text[-CHECK_KEEP:], "cut": total > CHECK_KEEP or len(text) > CHECK_KEEP,
+            "timed_out": timed_out, "seconds": round(asyncio.get_running_loop().time() - started, 1)}
+
+
 class Turn:
     """What the service holds of a running turn."""
 
@@ -216,7 +269,7 @@ class Turn:
         self.proc = None
         self.cancel_requested = False
         self.done = asyncio.Event()
-        self.stretch = {"text": [], "tools": [], "proposals": []}   # the assistant's message being written
+        self.stretch = {"text": [], "tools": [], "proposals": [], "cards": []}   # the assistant's message being written
         self.tools = {}                            # call id: (its dict, the stored message's id or None)
 
 
@@ -228,6 +281,7 @@ class Runner:
         self.by_lesson = {}
         self.by_run = {}
         self.tokens = {}   # the hash of a running turn's token: the turn
+        self.checks = {}   # a run's id: {the CL_CHECK_ID of a check its tutor is running: the project}
 
     # --- what the routes ask ---
 
@@ -247,9 +301,10 @@ class Runner:
     def activity(self):
         return [{"project": t.project, "created": t.created, "lesson_id": t.lesson_id, "run_id": t.run_id} for t in self.by_lesson.values()]
 
-    def start(self, lesson, text):
+    def start(self, lesson, text, composed=False):
         """The learner's message stored and its turn started, or None when a turn of this
-        lesson is running. Nothing awaits between the check and the claim."""
+        lesson is running. Nothing awaits between the check and the claim. A `composed` message
+        is one the system wrote for the learner (a card's answer sent as a message)."""
         if lesson["id"] in self.by_lesson:
             return None
         db = self.db
@@ -265,10 +320,17 @@ class Runner:
         token = secrets.token_urlsafe(32)
         turn = Turn(lesson, run["id"], token, instructions)
         turn.fresh = fresh
+        # What the learner decided or did since the last message, outside the conversation: the
+        # proposals, the global insights proposed here, the cards they answered or checked.
         outcomes = store.untold_outcomes(db, lesson["id"])
-        turn.notes = [plans.outcome_note(row) for row in outcomes]
+        globals_ = knowledge.untold_global(db, lesson["id"])
+        acted = store.untold_cards(db, lesson["id"])
+        turn.notes = ([plans.outcome_note(row) for row in outcomes] + [knowledge.global_outcome_note(row) for row in globals_]
+                      + [cards.note(row) for row in acted])
         store.mark_told(db, [row["id"] for row in outcomes])
-        turn.message_id = store.add_message(db, lesson["id"], run["id"], "user", text, context=self.context(turn, lesson))
+        knowledge.mark_global_told(db, [row["id"] for row in globals_])
+        store.mark_cards_told(db, [row["id"] for row in acted])
+        turn.message_id = store.add_message(db, lesson["id"], run["id"], "user", text, context=self.context(turn, lesson), composed=composed)
         store.mark_started(db, lesson["id"])
         store.touch_lesson(db, lesson["id"])
         self.by_lesson[lesson["id"]] = self.by_run[run["id"]] = turn
@@ -299,6 +361,35 @@ class Runner:
         turn.stretch["proposals"].append(proposal["id"])
         self.emit(turn, "proposal", {"proposal": proposal})
 
+    def on_card(self, turn, card):
+        """A card a tool of this turn made, or checked: shown now, and part of the message it comes with."""
+        if card["id"] not in turn.stretch["cards"] and card["message_id"] is None:
+            turn.stretch["cards"].append(card["id"])
+        self.emit(turn, card["kind"], {"card": card})
+
+    def card_changed(self, card):
+        """A card the learner acted on: when its lesson has an answer being written, its stream
+        carries the card's new state too (another tab of the same conversation sees it)."""
+        turn = self.by_lesson.get(card["lesson_id"])
+        if turn is not None:
+            self.emit(turn, card["kind"], {"card": card})
+
+    def busy_in(self, project, created):
+        return any((t.project, t.created) == (project, created) for t in self.by_lesson.values())
+
+    async def run_check(self, project, command, run_id=None):
+        """A check, kept by its run while it runs, so that Stop ends it too (the interrupt ends the
+        turn, not a check the tool server is running for it)."""
+        check_id = secrets.token_hex(8)
+        if run_id is not None:
+            self.checks.setdefault(run_id, {})[check_id] = project
+        try:
+            return await run_check(project, command, run_id, check_id)
+        finally:
+            self.checks.get(run_id, {}).pop(check_id, None)
+            if not self.checks.get(run_id):
+                self.checks.pop(run_id, None)
+
     async def cancel(self, run_id):
         turn = self.by_run.get(run_id)
         if turn is not None and not turn.cancel_requested:
@@ -306,6 +397,8 @@ class Runner:
             # Claude Code's own interrupt first; it ends the turn with a result line.
             await self._write(turn, {"type": "control_request", "request_id": f"stop-{run_id}", "request": {"subtype": "interrupt"}})
             self.tasks.spawn(f"stop-{run_id}", self._force_stop(turn))
+            for check_id, project in list(self.checks.get(run_id, {}).items()):
+                self.tasks.spawn(f"stop-check-{check_id}", kill_tagged(project, run_id, f"CL_CHECK_ID={check_id}"))
         row = store.run(self.db, run_id)
         return store.run_out(row) if row else None
 
@@ -344,14 +437,15 @@ class Runner:
     def flush(self, turn):
         stretch = turn.stretch
         text = "".join(stretch["text"])
-        if text or stretch["tools"] or stretch["proposals"]:
+        if text or stretch["tools"] or stretch["proposals"] or stretch["cards"]:
             message_id = store.add_message(self.db, turn.lesson_id, turn.run_id, "assistant", text, stretch["tools"])
             store.link_proposals(self.db, stretch["proposals"], message_id)
+            store.link_cards(self.db, stretch["cards"], message_id)
             message = store.message(self.db, message_id)
             for tool in stretch["tools"]:
                 turn.tools[tool["id"]] = (tool, message["id"])
             self.emit(turn, "message", {"message": message})
-        turn.stretch = {"text": [], "tools": [], "proposals": []}
+        turn.stretch = {"text": [], "tools": [], "proposals": [], "cards": []}
 
     async def _write(self, turn, obj):
         proc = turn.proc

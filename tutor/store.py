@@ -1,5 +1,6 @@
 """The tutor service's store: one SQLite file, its lessons, plans, messages, runs, events,
-proposals, the audit of the "learn" tools, and the tutor's instructions.
+proposals, cards, the audit of the "learn" tools, and the tutor's instructions. The knowledge
+base lives in the same file; its functions are in knowledge.py.
 
 Lifted from gaggiclanker (the maintainer's project, AGPL like this one): the connection and its
 pragmas from gaggiclanker/db/connection.py, the runs and the persisted event stream from the
@@ -18,7 +19,7 @@ import sqlite3
 import unicodedata
 import uuid
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 SCHEMA_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "schema.sql")
 NOW = "strftime('%Y-%m-%dT%H:%M:%fZ','now')"
 LESSONS_DIR = "/workspace/.learn/lessons"
@@ -60,6 +61,90 @@ PRAGMA user_version = 2;
 COMMIT;
 """
 
+# Version 2 (step 3) to 3 (step 4, the knowledge base): the records, evidence, the change log,
+# the global proposals and the cards added; a lesson can be kept for its summary when its
+# project is destroyed; a learner's message can be one the system composed.
+MIGRATE_2_TO_3 = """
+BEGIN;
+ALTER TABLE lessons ADD COLUMN project_removed INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE messages ADD COLUMN composed INTEGER NOT NULL DEFAULT 0;
+CREATE TABLE records (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind            TEXT NOT NULL,
+    text            TEXT NOT NULL,
+    insight_kind    TEXT,
+    project         TEXT,
+    created         TEXT,
+    project_removed INTEGER NOT NULL DEFAULT 0,
+    rests_on_json   TEXT NOT NULL DEFAULT '{"evidence": [], "insights": []}',
+    state           TEXT NOT NULL DEFAULT 'active',
+    replaces        INTEGER,
+    replaced_by     INTEGER,
+    reason          TEXT NOT NULL DEFAULT '',
+    by_json         TEXT NOT NULL,
+    created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+CREATE INDEX records_of_kind ON records (kind, state);
+CREATE TABLE evidence (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind            TEXT NOT NULL,
+    project         TEXT NOT NULL,
+    created         TEXT NOT NULL,
+    project_removed INTEGER NOT NULL DEFAULT 0,
+    lesson_id       INTEGER REFERENCES lessons (id) ON DELETE SET NULL,
+    run_id          INTEGER,
+    data_json       TEXT NOT NULL,
+    at              TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+CREATE INDEX evidence_of_project ON evidence (project, created);
+CREATE TABLE changes (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    action     TEXT NOT NULL,
+    by_json    TEXT NOT NULL,
+    items_json TEXT NOT NULL,
+    note       TEXT NOT NULL DEFAULT '',
+    undoes     INTEGER,
+    at         TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+CREATE TABLE global_proposals (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    action          TEXT NOT NULL,
+    target          INTEGER,
+    text            TEXT,
+    proposed_text   TEXT,
+    reason          TEXT NOT NULL DEFAULT '',
+    rests_on_json   TEXT NOT NULL,
+    project         TEXT NOT NULL,
+    created         TEXT NOT NULL,
+    project_removed INTEGER NOT NULL DEFAULT 0,
+    lesson_id       INTEGER REFERENCES lessons (id) ON DELETE SET NULL,
+    run_id          INTEGER,
+    state           TEXT NOT NULL DEFAULT 'open',
+    record_id       INTEGER,
+    told            INTEGER NOT NULL DEFAULT 1,
+    created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    decided_at      TEXT
+);
+CREATE TABLE cards (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    lesson_id   INTEGER NOT NULL REFERENCES lessons (id) ON DELETE CASCADE,
+    run_id      INTEGER REFERENCES runs (id) ON DELETE SET NULL,
+    message_id  INTEGER REFERENCES messages (id) ON DELETE SET NULL,
+    kind        TEXT NOT NULL,
+    spec_json   TEXT NOT NULL,
+    state       TEXT NOT NULL,
+    result_json TEXT,
+    told        INTEGER NOT NULL DEFAULT 1,
+    created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    updated_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+CREATE INDEX cards_of_lesson ON cards (lesson_id, id);
+PRAGMA user_version = 3;
+COMMIT;
+"""
+MIGRATIONS = {1: MIGRATE_1_TO_2, 2: MIGRATE_2_TO_3}
+
 # As gaggiclanker has them: WAL so that a reader never waits for the writer; foreign keys,
 # which SQLite leaves off per connection and the schema's ON DELETE CASCADE needs (a lesson
 # deleted takes its runs, messages and events); NORMAL, which with WAL risks only the last
@@ -80,11 +165,11 @@ class Database:
     def __init__(self, path):
         self.path = path
         self.conn = None
-        self.migrated = False
+        self.migrated = None   # the version the file was at, when it was brought up
 
     def connect(self):
         """Open the file, apply the pragmas, make the schema in a new file and bring a file of
-        version 1 to version 2. A file at another version is refused."""
+        an older version to this one, a version at a time. A file at another version is refused."""
         os.makedirs(os.path.dirname(self.path), mode=0o700, exist_ok=True)
         conn = sqlite3.connect(self.path, isolation_level=None)
         conn.row_factory = sqlite3.Row
@@ -95,19 +180,21 @@ class Database:
         if version == 0 and tables == 0:
             with open(SCHEMA_FILE) as fh:
                 conn.executescript(fh.read())
-        elif version == 1:
-            try:
-                conn.executescript(MIGRATE_1_TO_2)
-            except sqlite3.Error as exc:
-                if conn.in_transaction:
-                    conn.execute("ROLLBACK")
-                conn.close()
-                raise StoreError(f"The tutor's database {self.path} is at version 1 and could not be brought to version 2 ({exc}); "
-                                 "it is left as it was.") from None
-            self.migrated = True
+        elif version in MIGRATIONS:
+            self.migrated = version
+            while version in MIGRATIONS:
+                try:
+                    conn.executescript(MIGRATIONS[version])
+                except sqlite3.Error as exc:
+                    if conn.in_transaction:
+                        conn.execute("ROLLBACK")
+                    conn.close()
+                    raise StoreError(f"The tutor's database {self.path} is at version {version} and could not be brought to version "
+                                     f"{version + 1} ({exc}); it is left at version {version}.") from None
+                version += 1
         elif version != SCHEMA_VERSION:
             conn.close()
-            raise StoreError(f"The tutor's database {self.path} is at version {version}; this tutor service knows versions 1 and "
+            raise StoreError(f"The tutor's database {self.path} is at version {version}; this tutor service knows versions 1 to "
                              f"{SCHEMA_VERSION} only. Move the file away to start with an empty one, or run the version of "
                              "clanker-learn that wrote it.")
         self.conn = conn
@@ -155,6 +242,7 @@ def folder_of(row):
 
 def lesson_out(row, running=None):
     return {"id": row["id"], "project": row["project"], "created": row["created"], "title": row["title"], "kind": row["kind"],
+            "project_removed": bool(row["project_removed"]),
             "objective": row["objective"], "module": row["module_id"], "position": row["position"], "state": row["state"],
             "summary": row["summary"], "one_line": row["one_line"], "closed_at": row["closed_at"], "folder": folder_of(row),
             "created_at": row["created_at"], "updated_at": row["updated_at"], "running": running}
@@ -326,32 +414,87 @@ def link_proposals(db, proposal_ids, message_id):
 
 # --- messages -------------------------------------------------------------------------------
 
-def message_out(row, proposals=()):
+def message_out(row, proposals=(), cards=()):
     out = {"id": row["id"], "role": row["role"], "text": row["text"], "run_id": row["run_id"], "created_at": row["created_at"]}
     if row["role"] == "assistant":
         out["tools"] = json.loads(row["tools_json"] or "[]")
         out["proposals"] = [proposal_out(p) for p in proposals]
+        out["cards"] = [card_out(c) for c in cards]
     else:
         out["context"] = row["context"]
+        out["composed"] = bool(row["composed"])
     return out
 
 
 def messages(db, lesson_id):
-    by_message = {}
+    by_message, cards_of = {}, {}
     for row in db.all("SELECT * FROM proposals WHERE lesson_id = ? AND message_id IS NOT NULL ORDER BY id", (lesson_id,)):
         by_message.setdefault(row["message_id"], []).append(row)
-    return [message_out(row, by_message.get(row["id"], ())) for row in db.all("SELECT * FROM messages WHERE lesson_id = ? ORDER BY id", (lesson_id,))]
+    for row in db.all("SELECT * FROM cards WHERE lesson_id = ? AND message_id IS NOT NULL ORDER BY id", (lesson_id,)):
+        cards_of.setdefault(row["message_id"], []).append(row)
+    return [message_out(row, by_message.get(row["id"], ()), cards_of.get(row["id"], ()))
+            for row in db.all("SELECT * FROM messages WHERE lesson_id = ? ORDER BY id", (lesson_id,))]
 
 
 def message(db, message_id):
     return message_out(db.one("SELECT * FROM messages WHERE id = ?", (message_id,)),
-                       db.all("SELECT * FROM proposals WHERE message_id = ? ORDER BY id", (message_id,)))
+                       db.all("SELECT * FROM proposals WHERE message_id = ? ORDER BY id", (message_id,)),
+                       db.all("SELECT * FROM cards WHERE message_id = ? ORDER BY id", (message_id,)))
 
 
-def add_message(db, lesson_id, run_id, role, text, tools=(), context=""):
-    cursor = db.execute("INSERT INTO messages (lesson_id, run_id, role, text, tools_json, context) VALUES (?, ?, ?, ?, ?, ?)",
-                        (lesson_id, run_id, role, text, json.dumps(list(tools)), context))
+def add_message(db, lesson_id, run_id, role, text, tools=(), context="", composed=False):
+    cursor = db.execute("INSERT INTO messages (lesson_id, run_id, role, text, tools_json, context, composed) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (lesson_id, run_id, role, text, json.dumps(list(tools)), context, 1 if composed else 0))
     return cursor.lastrowid
+
+
+# --- cards: exercises and quick questions (cards.py says what they mean) ----------------------
+
+def card(db, card_id):
+    return db.one("SELECT * FROM cards WHERE id = ?", (card_id,))
+
+
+def card_out(row, reveal=False):
+    """A card as the page gets it. A question's right answer and its explanation are left out
+    until it is answered (`reveal` gives them, for the tutor)."""
+    spec = json.loads(row["spec_json"])
+    result = json.loads(row["result_json"]) if row["result_json"] else None
+    out = {"id": row["id"], "kind": row["kind"], "lesson_id": row["lesson_id"], "run_id": row["run_id"], "message_id": row["message_id"],
+           "state": row["state"], "created_at": row["created_at"], "updated_at": row["updated_at"]}
+    if row["kind"] == "exercise":
+        out.update(title=spec["title"], steps=spec["steps"], check=spec["check"], last_check=result)
+    else:
+        out.update(question=spec["question"], options=spec["options"], answer=result)
+        if reveal or row["state"] == "answered":
+            out.update(right_choice=spec["answer"], explanation=spec["explanation"])
+    return out
+
+
+def add_card(db, lesson_id, run_id, kind, spec):
+    state = "unchecked" if kind == "exercise" else "open"
+    cursor = db.execute("INSERT INTO cards (lesson_id, run_id, kind, spec_json, state) VALUES (?, ?, ?, ?, ?)",
+                        (lesson_id, run_id, kind, json.dumps(spec, ensure_ascii=False), state))
+    return card(db, cursor.lastrowid)
+
+
+def set_card(db, card_id, state, result, told):
+    db.execute(f"UPDATE cards SET state = ?, result_json = ?, told = ?, updated_at = {NOW} WHERE id = ?",
+               (state, json.dumps(result, ensure_ascii=False), 1 if told else 0, card_id))
+    return card(db, card_id)
+
+
+def link_cards(db, card_ids, message_id):
+    for card_id in card_ids:
+        db.execute("UPDATE cards SET message_id = ? WHERE id = ?", (message_id, card_id))
+
+
+def untold_cards(db, lesson_id):
+    return db.all("SELECT * FROM cards WHERE lesson_id = ? AND told = 0 ORDER BY updated_at, id", (lesson_id,))
+
+
+def mark_cards_told(db, card_ids):
+    for card_id in card_ids:
+        db.execute("UPDATE cards SET told = 1 WHERE id = ?", (card_id,))
 
 
 def set_context(db, message_id, context):

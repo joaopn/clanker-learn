@@ -18,7 +18,10 @@ the sandboxes (mcp.py): it takes only the token of a running answer, and answers
 routes below, as this one answers none of its.
 
 Every project has a Goals conversation and a study plan; a tutor's proposal of a plan, or of
-a change of it, is a card the learner edits and approves or dismisses here (plans.py).
+a change of it, is a card the learner edits and approves or dismisses here (plans.py). The
+knowledge base (knowledge.py) is read and changed here for the Knowledge page: the brief, the
+records, the global proposals, the lesson summaries, the change log and its undo; and the
+learner answers a lesson's question cards and presses Check on its exercises (cards.py).
 
 The HTTP contract (paths, bodies, the envelope) is the one the web server's relay is built
 against; see the web server's routes under /broker/tutor/.
@@ -32,6 +35,8 @@ import re
 import socket
 import sys
 
+import cards
+import knowledge
 import mcp
 import plans
 import store
@@ -52,7 +57,7 @@ TEXT_MAX = 32000
 INSTRUCTIONS_MAX = 100000
 TOKEN = re.compile(r"[\x21-\x7e]{1,4096}")   # printable, no spaces: it becomes an environment variable
 LISTEN_PROBE_PORT = 9
-STATUS = {"validation": 400, "unauthorized": 401, "not_found": 404, "busy": 409, "failed": 500}
+STATUS = {"validation": 400, "unauthorized": 401, "not_found": 404, "busy": 409, "conflict": 409, "failed": 500}
 
 
 class Refusal(Exception):
@@ -307,6 +312,223 @@ async def put_settings(request):
     return ok({"claude_token_set": bool(token)})
 
 
+# --- the knowledge base, for the Knowledge page (knowledge.py) ---------------------------------
+
+def record_view(db, row):
+    return dict(knowledge.record_out(row), rests_on_detail=knowledge.rests_detail(db, json.loads(row["rests_on_json"])))
+
+
+def text_in(body, key="text", required=True):
+    value = body.get(key)
+    if value is None and not required:
+        return None
+    if not isinstance(value, str):
+        raise Refusal("validation", f"`{key}` must be text.")
+    return value
+
+
+async def get_brief(request):
+    db = request.app["db"]
+    text, cut, parts = knowledge.brief(db)
+    return ok({"text": text, "cut": cut, "open_proposals": knowledge.open_global_count(db),
+               "parts": {"goals": [knowledge.record_out(r) for r in parts["goals"]],
+                         "preferences": [knowledge.record_out(r) for r in parts["preferences"]],
+                         "background": knowledge.record_out(parts["background"]) if parts["background"] else None,
+                         "global_insights": [knowledge.record_out(r) for r in parts["global_insights"]],
+                         "recently": [knowledge.summary_out(r) for r in parts["recently"]]}})
+
+
+async def list_records(request):
+    kind = request.query.get("kind")
+    if kind not in ("goal", "preference", "background", "insight", "global"):
+        raise Refusal("validation", "`kind` is goal, preference, background, insight or global.")
+    project = created = None
+    if "project" in request.query:
+        project, created = project_pair(request.query)
+    rows = knowledge.records(request.app["db"], kind, project, created, request.query.get("all") == "1")
+    return ok({"records": [knowledge.record_out(row) for row in rows]})
+
+
+async def add_record(request):
+    body = await body_of(request)
+    row = knowledge.learner_add(request.app["db"], body.get("kind"), text_in(body))
+    return ok({"record": knowledge.record_out(row)})
+
+
+def record_number(request):
+    db = request.app["db"]
+    return knowledge.record_or_refuse(db, number(request, "id"))["id"]
+
+
+async def get_record(request):
+    db = request.app["db"]
+    return ok({"record": record_view(db, knowledge.record_or_refuse(db, number(request, "id")))})
+
+
+async def edit_record(request):
+    body = await body_of(request)
+    text, kind = text_in(body, required=False), text_in(body, "insight_kind", required=False)
+    if text is None and kind is None:
+        raise Refusal("validation", "Give a `text`, an `insight_kind`, or both.")
+    row = knowledge.edit(request.app["db"], record_number(request), knowledge.LEARNER, text, kind)
+    return ok({"record": knowledge.record_out(row)})
+
+
+async def delete_record(request):
+    row = knowledge.delete(request.app["db"], record_number(request), knowledge.LEARNER)
+    return ok({"deleted": row["id"]})
+
+
+async def put_background(request):
+    row = knowledge.set_background(request.app["db"], text_in(await body_of(request)))
+    return ok({"record": knowledge.record_out(row) if row else None})
+
+
+async def get_evidence(request):
+    row = knowledge.evidence(request.app["db"], number(request, "id"))
+    if row is None:
+        raise Refusal("not_found", "There is no such evidence.")
+    return ok({"evidence": knowledge.evidence_out(row)})
+
+
+def global_view(db, row):
+    return dict(knowledge.global_proposal_out(db, row), rests_on_detail=knowledge.rests_detail(db, json.loads(row["rests_on_json"])))
+
+
+async def list_global_proposals(request):
+    db = request.app["db"]
+    state = request.query.get("state", "open")
+    if state not in ("open", "approved", "dismissed", "all"):
+        raise Refusal("validation", "`state` is open, approved, dismissed or all.")
+    return ok({"proposals": [global_view(db, row) for row in knowledge.global_proposals(db, state)], "open": knowledge.open_global_count(db)})
+
+
+def global_or_404(request):
+    row = knowledge.global_proposal(request.app["db"], number(request, "id"))
+    if row is None:
+        raise Refusal("not_found", "There is no such proposal.")
+    return row
+
+
+async def get_global_proposal(request):
+    return ok({"proposal": global_view(request.app["db"], global_or_404(request))})
+
+
+async def edit_global_proposal(request):
+    db = request.app["db"]
+    row = global_or_404(request)
+    body = await body_of(request)
+    text, reason = text_in(body, required=False), text_in(body, "reason", required=False)
+    if text is None and reason is None:
+        raise Refusal("validation", "Give a `text`, a `reason`, or both.")
+    return ok({"proposal": global_view(db, knowledge.edit_global_proposal(db, row["id"], text, reason))})
+
+
+async def approve_global_proposal(request):
+    db = request.app["db"]
+    row = global_or_404(request)
+    proposal, made = knowledge.approve_global(db, row["id"], text_in(await body_of(request), required=False))
+    return ok({"proposal": global_view(db, proposal), "record": knowledge.record_out(made)})
+
+
+async def dismiss_global_proposal(request):
+    db = request.app["db"]
+    return ok({"proposal": global_view(db, knowledge.dismiss_global(db, global_or_404(request)["id"]))})
+
+
+async def list_summaries(request):
+    query = request.query.get("q", "").strip()
+    return ok({"lessons": [knowledge.summary_out(row) for row in knowledge.summaries(request.app["db"], query or None)]})
+
+
+async def list_changes(request):
+    try:
+        before = int(request.query["before"]) if "before" in request.query else None
+        limit = min(200, max(1, int(request.query.get("limit", "50"))))
+    except ValueError:
+        raise Refusal("validation", "`before` and `limit` are numbers.") from None
+    out, after = knowledge.changes(request.app["db"], before, limit)
+    return ok({"changes": out, "next": after})
+
+
+async def undo_change(request):
+    return ok({"change": knowledge.undo(request.app["db"], number(request, "id"))})
+
+
+async def project_removed(request):
+    """A destroyed project: its knowledge kept and marked, or forgotten (`forget`); its lessons
+    and conversations removed either way. Called by the web server after a destroy."""
+    body = await body_of(request)
+    project, created = project_pair(body)
+    forget = body.get("forget", False)
+    if not isinstance(forget, bool):
+        raise Refusal("validation", "`forget` is true or false.")
+    if request.app["runner"].busy_in(project, created):
+        raise Refusal("busy", "The tutor is still answering in this project: stop its answers first.")
+    return ok({"project": project, "created": created, "forgotten": forget,
+               **knowledge.project_removed(request.app["db"], project, created, forget)})
+
+
+# --- the learner's side of a card (cards.py) -----------------------------------------------------
+
+def card_or_404(request, kind=None):
+    row = store.card(request.app["db"], number(request, "id"))
+    if row is None or (kind and row["kind"] != kind):
+        raise Refusal("not_found", f"There is no such {kind or 'card'}.")
+    return row
+
+
+async def get_card(request):
+    return ok({"card": store.card_out(card_or_404(request))})
+
+
+def as_message(body):
+    value = body.get("as_message", False)
+    if not isinstance(value, bool):
+        raise Refusal("validation", "`as_message` is true or false.")
+    return value
+
+
+def after_action(request, row, send):
+    """The card's new state shown in a running answer's stream; then, when asked and nothing is
+    being written in the lesson, the action sent as the learner's message, its text composed by
+    the system. Otherwise the tutor is told with the learner's next message."""
+    runner = request.app["runner"]
+    card = store.card_out(row)
+    runner.card_changed(card)
+    sent = None
+    if send:
+        started = runner.start(store.lesson(request.app["db"], row["lesson_id"]), cards.composed_text(row), composed=True)
+        if started is not None:
+            sent = {"run": started[0], "message": started[1]}
+    return ok({"card": store.card_out(store.card(request.app["db"], row["id"])), "sent": sent})
+
+
+async def check_card(request):
+    db = request.app["db"]
+    row = card_or_404(request, "exercise")
+    send = as_message(await body_of(request))
+    home = store.lesson(db, row["lesson_id"])
+    try:
+        outcome = await request.app["runner"].run_check(home["project"], json.loads(row["spec_json"])["check"]["command"])
+    except cards.CheckError as exc:
+        raise Refusal("validation", str(exc)) from None
+    return after_action(request, cards.record_check(db, store.card(db, row["id"]), outcome, "learner", None, told=False), send)
+
+
+async def answer_card(request):
+    db = request.app["db"]
+    row = card_or_404(request, "question")
+    body = await body_of(request)
+    send = as_message(body)
+    if row["state"] == "answered":
+        raise Refusal("validation", "This question is answered already.")
+    choice, options = body.get("choice"), json.loads(row["spec_json"])["options"]
+    if isinstance(choice, bool) or not isinstance(choice, int) or not 0 <= choice < len(options):
+        raise Refusal("validation", f"`choice` is the index of an option, 0 to {len(options) - 1}.")
+    return after_action(request, cards.record_answer(db, row, choice), send)
+
+
 # --- the application -------------------------------------------------------------------------
 
 @web.middleware
@@ -320,6 +542,9 @@ async def guarded(request, handler):
         return await handler(request)
     except Refusal as refusal:
         return refused(refusal.kind, refusal.message)
+    except knowledge.KnowledgeError as exc:
+        kind = "conflict" if isinstance(exc, knowledge.Conflict) else "not_found" if isinstance(exc, knowledge.Missing) else "validation"
+        return refused(kind, str(exc))
     except web.HTTPException as exc:
         if exc.status == 404:
             return refused("not_found", "There is no such route.")
@@ -347,6 +572,20 @@ def build_app(db, secret):
         web.get("/instructions", get_instructions), web.put("/instructions", put_instructions),
         web.post("/instructions/reset", reset_instructions),
         web.get("/activity", activity),
+        web.get("/knowledge/brief", get_brief),
+        web.get("/knowledge/records", list_records), web.post("/knowledge/records", add_record),
+        web.get("/knowledge/records/{id}", get_record), web.patch("/knowledge/records/{id}", edit_record),
+        web.delete("/knowledge/records/{id}", delete_record),
+        web.put("/knowledge/background", put_background),
+        web.get("/knowledge/evidence/{id}", get_evidence),
+        web.get("/knowledge/proposals", list_global_proposals), web.get("/knowledge/proposals/{id}", get_global_proposal),
+        web.patch("/knowledge/proposals/{id}", edit_global_proposal),
+        web.post("/knowledge/proposals/{id}/approve", approve_global_proposal),
+        web.post("/knowledge/proposals/{id}/dismiss", dismiss_global_proposal),
+        web.get("/knowledge/lessons", list_summaries),
+        web.get("/knowledge/changes", list_changes), web.post("/knowledge/changes/{id}/undo", undo_change),
+        web.post("/projects/removed", project_removed),
+        web.get("/cards/{id}", get_card), web.post("/cards/{id}/check", check_card), web.post("/cards/{id}/answer", answer_card),
         web.get("/settings", get_settings), web.put("/settings", put_settings),
     ])
 
@@ -387,7 +626,7 @@ def main():
         log.error("cannot start: %s", exc)
         raise SystemExit(1) from None
     if db.migrated:
-        log.info("the database was at version 1: brought to version %d in place", store.SCHEMA_VERSION)
+        log.info("the database was at version %d: brought to version %d in place", db.migrated, store.SCHEMA_VERSION)
     log.info("the tutor's instructions: %s", seeded)
     found = store.reconcile_running(db)
     app = build_app(db, secret)

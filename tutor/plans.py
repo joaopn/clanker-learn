@@ -1,5 +1,6 @@
 """Study plans and what a tutor is told: proposals checked and applied, the sentences that say
-how the learner changed one, a lesson's opening context, and its transcript.
+how the learner changed one, a lesson's opening context (with the learner's brief and the
+project's own insights, knowledge.py), and its transcript.
 
 New for clanker-learn; the rule that a proposal is applied only by the learner's action, and
 that the tutor is told the outcome with the next message, is gaggiclanker's (its proposal
@@ -13,6 +14,8 @@ dropped. Goals is never part of either.
 """
 import json
 
+import cards
+import knowledge
 import store
 
 TITLE_MAX = 200
@@ -245,6 +248,10 @@ def opening_context(db, row, fresh_reason=None, earlier=0):
         parts.append(f"This lesson's files are in {folder}/: keep notes.md there current as you teach (what was covered, the exercise in "
                      "progress, what is open); transcript.md is the conversation, written by clanker-learn after every answer. When the "
                      "objective is met, close the lesson with lesson_close.")
+    # What every tutor is told of the learner, then what only this project's tutors are told:
+    # another project's insights never enter it.
+    parts.append(knowledge.brief(db)[0])
+    parts.append(knowledge.project_insights_text(db, row["project"], row["created"]))
     if fresh_reason:
         parts.append(f"You are taking this conversation up afresh ({fresh_reason}): the learner's messages 1 to {earlier} here, and your "
                      "answers to them, were in an earlier session of yours that you do not have. Before you answer, read "
@@ -285,7 +292,7 @@ def transcript(db, row):
         lines += ["", f"Summary at its close: {row['summary']}"]
     lines += ["", "*Written by clanker-learn after every answer, from its own record: an edit here is overwritten.*", ""]
     for m in store.messages(db, row["id"]):
-        who = "The learner" if m["role"] == "user" else "The tutor"
+        who = "The tutor" if m["role"] != "user" else "The learner (a card's answer, written by clanker-learn)" if m.get("composed") else "The learner"
         lines += [f"## {who} · {m['created_at'][:16].replace('T', ' ')}", ""]
         if m["text"].strip():
             lines += [m["text"].strip(), ""]
@@ -298,4 +305,6 @@ def transcript(db, row):
             lines.append("")
         for p in m.get("proposals", []):
             lines += [*proposal_lines(p), ""]
+        for card in m.get("cards", []):
+            lines += [*cards.transcript_lines(card), ""]
     return "\n".join(lines).rstrip() + "\n"

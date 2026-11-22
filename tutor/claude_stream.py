@@ -20,6 +20,7 @@ PREVIEW = 2000      # of a tool's output, what the stream and the message keep
 LABEL = 200         # of a tool's label: one line
 DETAIL = 4000
 LEARN_PREFIX = "mcp__learn__"   # Claude Code's name for a tool of the server "learn"
+HIDDEN = {"quiz_ask": ("answer", "explanation")}   # arguments of a learn tool left out of its tool line
 
 
 def as_int(value):
@@ -74,7 +75,10 @@ def tool_view(name, arguments):
     name, or another tool by its name."""
     args = arguments if isinstance(arguments, dict) else {}
     if name.startswith(LEARN_PREFIX):
-        return "learn", one_line(name[len(LEARN_PREFIX):]), json.dumps(args, default=str, ensure_ascii=False)[:DETAIL]
+        tool = name[len(LEARN_PREFIX):]
+        # The tool line reaches the page: a question's right answer stays off it until answered.
+        shown = {k: v for k, v in args.items() if k not in HIDDEN.get(tool, ())}
+        return "learn", one_line(tool), json.dumps(shown, default=str, ensure_ascii=False)[:DETAIL]
     path = args.get("file_path") or args.get("notebook_path") or args.get("path") or ""
     if name == "Bash":
         command = str(args.get("command", ""))

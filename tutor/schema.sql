@@ -1,5 +1,5 @@
--- The tutor service's database: one file, /data/tutor/tutor.db, at user_version 2. A file at
--- version 1 is brought to 2 in place at start (store.MIGRATE_1_TO_2); any other version is
+-- The tutor service's database: one file, /data/tutor/tutor.db, at user_version 3. A file at
+-- version 1 or 2 is brought to 3 in place at start (store.MIGRATIONS); any other version is
 -- refused.
 
 -- A lesson belongs to a project as the pair (name, created): a new project with an old name
@@ -28,6 +28,7 @@ CREATE TABLE lessons (
     session_id      TEXT NOT NULL,
     session_started INTEGER NOT NULL DEFAULT 0,
     session_text    TEXT NOT NULL DEFAULT '',
+    project_removed INTEGER NOT NULL DEFAULT 0,
     created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
@@ -58,6 +59,8 @@ CREATE INDEX runs_of_lesson ON runs (lesson_id, id);
 
 -- `context` is what the tutor was told before the learner's own text (the lesson's opening
 -- context, the outcome of a proposal): sent with the message, never shown as the learner's.
+-- `composed` marks a learner's message whose text the system wrote (a card's answer sent as a
+-- message): never the learner's own words for the quote rule.
 CREATE TABLE messages (
     id         INTEGER PRIMARY KEY,
     lesson_id  INTEGER NOT NULL REFERENCES lessons (id) ON DELETE CASCADE,
@@ -66,6 +69,7 @@ CREATE TABLE messages (
     text       TEXT NOT NULL,
     tools_json TEXT NOT NULL DEFAULT '[]',
     context    TEXT NOT NULL DEFAULT '',
+    composed   INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 CREATE INDEX messages_of_lesson ON messages (lesson_id, id);
@@ -123,4 +127,102 @@ CREATE TABLE prompts (
     updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 
-PRAGMA user_version = 2;
+-- The knowledge base (knowledge.py), global to the installation. Its ids are never reused
+-- (AUTOINCREMENT): the change log and what a record rests on name them. A record is a goal, a
+-- preference, the background text (one), a project's insight or a global insight; `project`
+-- and `created` name the project it came from (an insight's owner), NULL for what the learner
+-- wrote; `project_removed` is set when that project was destroyed and its knowledge kept.
+-- `rests_on_json` is {"evidence": [ids], "insights": [ids]}; an insight a tutor changed is
+-- `retired`, with `replaced_by` the one that took its place (whose `replaces` names it).
+-- `by_json` is who wrote it: {"who": "learner"} or {"who": "tutor", project, created,
+-- lesson_id, run_id}.
+CREATE TABLE records (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind            TEXT NOT NULL,
+    text            TEXT NOT NULL,
+    insight_kind    TEXT,
+    project         TEXT,
+    created         TEXT,
+    project_removed INTEGER NOT NULL DEFAULT 0,
+    rests_on_json   TEXT NOT NULL DEFAULT '{"evidence": [], "insights": []}',
+    state           TEXT NOT NULL DEFAULT 'active',
+    replaces        INTEGER,
+    replaced_by     INTEGER,
+    reason          TEXT NOT NULL DEFAULT '',
+    by_json         TEXT NOT NULL,
+    created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+CREATE INDEX records_of_kind ON records (kind, state);
+
+-- What the system itself saw: a check that ran (`check`), a quoted sentence of the learner's
+-- (`quote`), an answered question (`answer`), a closed lesson (`completion`).
+CREATE TABLE evidence (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind            TEXT NOT NULL,
+    project         TEXT NOT NULL,
+    created         TEXT NOT NULL,
+    project_removed INTEGER NOT NULL DEFAULT 0,
+    lesson_id       INTEGER REFERENCES lessons (id) ON DELETE SET NULL,
+    run_id          INTEGER,
+    data_json       TEXT NOT NULL,
+    at              TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+CREATE INDEX evidence_of_project ON evidence (project, created);
+
+-- Every write to a record, append-only: who, and each record's state before and after (NULL
+-- where it did not exist). Undo applies `before` as a new change that names it (`undoes`).
+CREATE TABLE changes (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    action     TEXT NOT NULL,
+    by_json    TEXT NOT NULL,
+    items_json TEXT NOT NULL,
+    note       TEXT NOT NULL DEFAULT '',
+    undoes     INTEGER,
+    at         TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+-- A tutor's proposal of a global insight (`add`), or of the replacement or retirement of one
+-- in force (`target`): listed for the Knowledge page, applied only by the learner. `text` is
+-- as the learner edited it, `proposed_text` as the tutor wrote it; `told` is set once the
+-- proposing tutor was told the outcome, at the next message of its lesson.
+CREATE TABLE global_proposals (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    action          TEXT NOT NULL,
+    target          INTEGER,
+    text            TEXT,
+    proposed_text   TEXT,
+    reason          TEXT NOT NULL DEFAULT '',
+    rests_on_json   TEXT NOT NULL,
+    project         TEXT NOT NULL,
+    created         TEXT NOT NULL,
+    project_removed INTEGER NOT NULL DEFAULT 0,
+    lesson_id       INTEGER REFERENCES lessons (id) ON DELETE SET NULL,
+    run_id          INTEGER,
+    state           TEXT NOT NULL DEFAULT 'open',
+    record_id       INTEGER,
+    told            INTEGER NOT NULL DEFAULT 1,
+    created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    decided_at      TEXT
+);
+
+-- An exercise or a quick question a tutor set (cards.py), shown as a card in the message it
+-- came with. `spec_json` is what the tutor gave (a question's right answer among it, kept from
+-- the page until it is answered); `result_json` the last check, or the learner's answer;
+-- `told` is cleared when the learner acts, set once the tutor is told, at the next message.
+CREATE TABLE cards (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    lesson_id   INTEGER NOT NULL REFERENCES lessons (id) ON DELETE CASCADE,
+    run_id      INTEGER REFERENCES runs (id) ON DELETE SET NULL,
+    message_id  INTEGER REFERENCES messages (id) ON DELETE SET NULL,
+    kind        TEXT NOT NULL,
+    spec_json   TEXT NOT NULL,
+    state       TEXT NOT NULL,
+    result_json TEXT,
+    told        INTEGER NOT NULL DEFAULT 1,
+    created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    updated_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+CREATE INDEX cards_of_lesson ON cards (lesson_id, id);
+
+PRAGMA user_version = 3;
