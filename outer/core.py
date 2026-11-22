@@ -7,11 +7,15 @@ is there: the workspace and home folders, two key pairs, the provisioning folder
 the inner daemon, and the sandbox, one plain container on that network. So a project whose
 creation was cut short is finished by its next start.
 
-    /data/core/projects/<name>.json   the record: limits, whether it should be running
+    /data/core/projects/<name>.json   the record: limits, whether it should be running, its
+                                      agents, whether it has the editor, Claude's model and
+                                      effort
     /data/projects/<name>             the workspace        -> /workspace in the sandbox
     /data/homes/<name>                the home folder      -> /home/learner
     /data/core/provision/<name>       the tutor's public key, the sandbox's SSH host key,
-                                      sshd's settings      -> /etc/cl-provision, read-only
+                                      sshd's settings, which software the project has
+                                                           -> /etc/cl-provision, read-only
+    /data/dist                        the distributions (below) -> /opt/cl/dist, read-only
     /data/core/keys/<name>            the sandbox's host key pair (what provisioning copies)
                                       and the Shell password (provisioning gets its hash)
     /data/core/ports/<name>.json      the project's ports named by hand
@@ -26,6 +30,12 @@ The software projects get (Claude Code, the editor) is fetched once into a distr
     /data/dist-staging                where a distribution is built before it replaces the old
     /data/versions.local.env          versions raised by Refresh, over /opt/cl/versions.env
 
+Every project gets its own copy, in its home folder, as research-sandbox does it: the image's
+deploy script (/opt/cl/deploy, run as the sandbox user) copies a distribution into ~/.local.
+The sandbox's init runs it at every start for each agent the provisioning folder names, only
+while that agent's launcher is absent, so a copy that updated itself is kept; `agents_add` and
+`agents_update` run it in a running sandbox: the one command the core runs inside a sandbox.
+
 A sandbox is created without privilege, without a published port, without a restart policy
 (the init starts what should run, after the guard rules are in place) and without raw
 sockets: the services that will sit on its network also sit on another, and with hand-built
@@ -38,7 +48,8 @@ A destroy marks the record first ("destroying") and removes it last. A destroy t
 short is therefore never taken for a creation that was: nothing starts such a project, and
 running destroy again finishes it.
 
-This module is also the `cl` command: `cl create <name>`, `cl list`, and so on.
+This module is also the `cl` command: `cl create <name> [--agent claude] [--editor]
+[--claude-model M] [--claude-effort E]`, `cl list`, `cl agents add|update|model <name>`, and so on.
 """
 import argparse
 import base64
@@ -106,6 +117,13 @@ CRYPT_HASH = re.compile(r"\$6\$[./A-Za-z0-9]{1,16}\$[./A-Za-z0-9]{86}")   # SHA-
 SSH_PORT = 22
 FILES_SERVER_PORT = 7070      # sandbox/files_server.py
 EDITOR_PORT = 8443            # code-server, started by sandbox/sandbox_init.py
+DIST_MOUNT = "/opt/cl/dist"   # in the sandbox: /data/dist, read-only
+DEPLOY = "/opt/cl/deploy"     # in the sandbox image: sandbox/deploy.sh
+DEPLOY_TIMEOUT_S = 900        # one deploy of a distribution into a home
+DEPLOY_OUTPUT_BYTES = 4096    # of what a deploy prints, the end: the sandbox's to write
+SOFTWARE_FILE = "software.json"   # in the provisioning folder: the project's agents, editor, Claude's model and effort
+MODELS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models.json")   # RS's models/catalog.json
+CLAUDE_MODEL = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._\[\]-]{0,99}\Z")   # RS's CLAUDE_MODEL_RE, with a length
 PROC = "/proc"
 PROC_NET_BYTES = 1024 * 1024  # of each socket table: a sandbox can open sockets without end
 LABEL_CHARS = 64
@@ -241,9 +259,53 @@ def limit_args(limits, for_update=False):
 
 # --- records -------------------------------------------------------------------------------
 
-def new_record(name, limits=None):
+def new_record(name, limits=None, agents=(), editor=False, claude_model="", claude_effort=""):
+    model, effort = checked_claude_pair(claude_model, claude_effort)
     return {"name": valid_name(name), "created": datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds"),
-            "wanted": "running", "limits": checked_limits(limits)}
+            "wanted": "running", "limits": checked_limits(limits), "agents": checked_agents(agents), "editor": checked_editor(editor),
+            "claude_model": model, "claude_effort": effort}
+
+
+def model_catalog():
+    """Claude's model tiers and the efforts each takes, as RS has them."""
+    try:
+        with open(MODELS_FILE) as fh:
+            catalog = json.load(fh)
+        aliases = {m["alias"]: list(m["efforts"]) for m in catalog["models"]}
+        return aliases, list(catalog["efforts"])
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise CoreError(f"The model catalog {MODELS_FILE} cannot be read ({type(exc).__name__}).") from exc
+
+
+def checked_claude_pair(model, effort):
+    """A project's Claude model and effort, as RS checks them (_clean_claude_model,
+    _claude_effort_ok): each may be empty (Claude's own default); a model is a tier of the
+    catalog or a model id of a safe character set; an effort is one of the catalog's, and for a
+    tier only one that tier takes (haiku takes none)."""
+    if not isinstance(model, str) or not isinstance(effort, str):
+        raise CoreError("The model and the effort are words (or empty).")
+    if model and not CLAUDE_MODEL.match(model):
+        raise CoreError(f"{model[:40]!r} is not a model: a tier (as opus) or a model id of letters, digits and . _ - [ ].")
+    if effort:
+        tiers, efforts = model_catalog()
+        if effort not in efforts:
+            raise CoreError(f"{effort[:40]!r} is not an effort (there is {', '.join(efforts)}).")
+        if model in tiers and effort not in tiers[model]:
+            raise CoreError(f"{model} takes no effort {effort}" + (f" (it takes {', '.join(tiers[model])})." if tiers[model] else "."))
+    return model, effort
+
+
+def checked_agents(agents):
+    """A project's agents: a list of names from the closed set, each once, in the order given."""
+    if isinstance(agents, str) or not isinstance(agents, (list, tuple)) or not all(isinstance(one, str) for one in agents):
+        raise CoreError("The agents are a list of names.")
+    return [known_agent(agent) for agent in dict.fromkeys(agents)]
+
+
+def checked_editor(editor):
+    if not isinstance(editor, bool):
+        raise CoreError("editor must be true or false.")
+    return editor
 
 
 def write_record(record):
@@ -291,6 +353,11 @@ def read_record(name):
         if record["name"] != name or record["wanted"] not in WANTED or not isinstance(record["created"], str):
             raise ValueError("not this project's record")
         record["limits"] = checked_limits(record["limits"])
+        # A record made before projects had agents: none, and the editor, which every
+        # sandbox had then.
+        record["agents"] = checked_agents(record.get("agents", []))
+        record["editor"] = checked_editor(record.get("editor", True))
+        record["claude_model"], record["claude_effort"] = checked_claude_pair(record.get("claude_model", ""), record.get("claude_effort", ""))
         return record
     except FileNotFoundError as exc:
         raise CoreError(f"There is no project named {name}.") from exc
@@ -415,19 +482,38 @@ DIST_BUILD_TIMEOUT_S = 1200      # one installer run; the container is ended aft
 UPSTREAM_TIMEOUT_S = 15          # curl's --max-time when upstream is asked, as in RS
 BUILD_HOME = "/build"            # the build container's home: the staging folder
 MARK = ".cl-dist"                # inside a distribution, written last: the tree is whole
-# The closed table of what can be pulled. `dist` is the place under /data/dist; `launcher`
-# the program, relative to the distribution; `in_tree` where the launcher must lead, with the
+# Claude Code's settings, as RS ships them (cli/rscore.py, _AGENT_SETTINGS_JSON), verbatim:
+# installed into a project's ~/.claude once, never over the learner's own.
+AGENT_SETTINGS_JSON = json.dumps(
+    {"permissions": {"defaultMode": "bypassPermissions"}, "theme": "dark",
+     "env": {"CLAUDE_CODE_DISABLE_MOUSE_CLICKS": "1"},
+     "attribution": {"commit": "", "pr": "", "sessionUrl": False},
+     "remoteControlAtStartup": False,
+     "feedbackDrafts": "off"},
+    indent=2) + "\n"
+# Open VSX's name for this machine (RS pins linux-x64; the extension is built for both).
+EXT_PLATFORM = {"aarch64": "linux-arm64", "arm64": "linux-arm64"}.get(os.uname().machine, "linux-x64")
+# The closed table of what can be pulled. `dist` is the place under /data/dist; `local` where
+# the installer's ~/.local goes inside it ("" for the distribution itself); `launcher` the
+# program, relative to the distribution; `in_tree` where the launcher must lead, with the
 # version in it; `installer` the vendor's script and the shell and arguments it is run with.
+# An agent's tree is RS's fixed one: local/ (with the agent's editor extension tucked inside
+# it, at `ext.file`) and the agent's settings beside it (`files`).
 SOFTWARE = {
     "claude": {
         "kind": "agent", "label": "Claude Code", "key": "CLAUDE_CODE_VERSION", "report": "agents",
-        "dist": "agents/claude", "launcher": "bin/claude", "in_tree": re.compile(r"share/claude/versions/([^/]+)"),
+        "dist": "agents/claude", "local": "local", "launcher": "local/bin/claude",
+        "in_tree": re.compile(r"local/share/claude/versions/([^/]+)"),
         "installer": "https://claude.ai/install.sh", "shell": "bash", "args": ("{version}",),
         "upstream": "https://downloads.claude.ai/claude-code-releases/latest",   # a bare version
+        "ext": {"key": "CLAUDE_CODE_EXT_VERSION", "file": "share/rs-agent-ext/anthropic.claude-code.vsix",
+                "url": f"https://open-vsx.org/api/Anthropic/claude-code/{EXT_PLATFORM}/{{version}}/file/Anthropic.claude-code-{{version}}@{EXT_PLATFORM}.vsix",
+                "upstream": f"https://open-vsx.org/api/Anthropic/claude-code/{EXT_PLATFORM}"},   # JSON, its "version"
+        "files": {"claude/settings.json": AGENT_SETTINGS_JSON},
     },
     "code-server": {
         "kind": "editor", "label": "the editor (code-server)", "key": "CODE_SERVER_VERSION", "report": "editor",
-        "dist": "editor", "launcher": "bin/code-server", "in_tree": re.compile(r"lib/code-server-([^/]+)/bin/code-server"),
+        "dist": "editor", "local": "", "launcher": "bin/code-server", "in_tree": re.compile(r"lib/code-server-([^/]+)/bin/code-server"),
         "installer": "https://code-server.dev/install.sh", "shell": "sh", "args": ("--method", "standalone", "--version", "{version}"),
         "upstream": "https://github.com/coder/code-server/releases/latest",      # redirects to .../tag/v<version>
     },
@@ -464,7 +550,8 @@ def dist_paths(software):
     return {"root": root, "sidecar": root + ".json", "staging": f"{DATA}/dist-staging/{software}",
             "old": f"{DATA}/dist-staging/{software}.old", "container": f"cl-dist-{software}",
             "preload": f"{PRELOAD}/dist/{spec['dist']}", "preload_json": f"{PRELOAD}/dist/{spec['dist']}.json",
-            "installer": f"{PRELOAD}/installers/{software}.sh", "upstream": f"{PRELOAD}/upstream/{software}"}
+            "installer": f"{PRELOAD}/installers/{software}.sh", "upstream": f"{PRELOAD}/upstream/{software}",
+            "ext_file": f"{PRELOAD}/installers/{software}.vsix", "ext_upstream": f"{PRELOAD}/upstream/{software}-ext"}
 
 
 def versions_local():
@@ -504,6 +591,23 @@ def pin(software):
     return checked_version(value, f"{spec['key']} (in {VERSIONS_FILE} or {versions_local()})")
 
 
+def ext_pin(software):
+    """The version of the agent's editor extension in effect, checked; None for software that
+    has none."""
+    ext = known_software(software).get("ext")
+    if ext is None:
+        return None
+    value = load_versions().get(ext["key"])
+    if value is None:
+        raise CoreError(f"No version of the extension of {software} is pinned ({ext['key']} in {VERSIONS_FILE}).")
+    return checked_version(value, f"{ext['key']} (in {VERSIONS_FILE} or {versions_local()})")
+
+
+def pin_keys(software):
+    spec = known_software(software)
+    return [spec["key"], *([spec["ext"]["key"]] if "ext" in spec else [])]
+
+
 def write_pins(lines):
     """The override file, replaced whole: a reader never sees half of it."""
     os.makedirs(DATA, exist_ok=True)
@@ -525,7 +629,7 @@ def set_version_pin(key, value):
     """Raise a pin in the local override. Never down, and an unchanged pin is not written (a
     line that only repeats the repository's value would keep the pin from following the
     repository later). True when the file was written."""
-    if key not in {spec["key"] for spec in SOFTWARE.values()}:
+    if key not in {key for software in SOFTWARE for key in pin_keys(software)}:
         raise CoreError(f"{key!r} is not a version clanker-learn pins.")
     checked_version(value, f"The new {key}")
     with flocked("versions.lock"):
@@ -543,13 +647,15 @@ def set_version_pin(key, value):
 
 
 def pin_reset(software):
-    """"Use repo version": take the software's key out of the local override. Nothing to take
-    out is no error. Refused while that software is being built."""
+    """"Use repo version": take the software's keys (an agent's and its extension's) out of the
+    local override. Nothing to take out is no error. Refused while that software is being built."""
     spec = known_software(software)
     with build_lane(software), flocked("versions.lock"):
-        removed = spec["key"] in parse_pins(versions_local())
-        if removed:
-            write_pins(pin_lines_without(spec["key"]))
+        removed = False
+        for key in pin_keys(software):
+            if key in parse_pins(versions_local()):
+                write_pins(pin_lines_without(key))
+                removed = True
     return {"software": software, "key": spec["key"], "removed": removed, "version": pin(software)}
 
 
@@ -624,12 +730,15 @@ def pulled(software):
             mark = json.loads(fh.read(4096))
         if not os.path.lexists(os.path.join(p["root"], spec["launcher"])):
             return None
-        return {"version": checked_version(mark["version"], "The pulled version"), "pulled_at": str(mark.get("pulled_at", ""))}
+        out = {"version": checked_version(mark["version"], "The pulled version"), "pulled_at": str(mark.get("pulled_at", ""))}
+        if "ext" in spec:
+            out["ext_version"] = checked_version(mark["ext_version"], "The pulled extension's version")
+        return out
     except (OSError, ValueError, KeyError, TypeError, CoreError):
         return None
 
 
-def relativize_launcher(root, launcher):
+def relativize_launcher(root, launcher, local=""):
     """The installer links the launcher to an absolute path under the build's home, which
     leads nowhere in a project's home: it is made relative, as RS does. Any other absolute
     link is left for the check to refuse."""
@@ -639,7 +748,7 @@ def relativize_launcher(root, launcher):
     target = os.readlink(path)
     prefix = BUILD_HOME + "/.local/"
     if target.startswith(prefix):
-        relative = os.path.relpath(os.path.join(root, target[len(prefix):]), os.path.dirname(path))
+        relative = os.path.relpath(os.path.join(root, local, target[len(prefix):]), os.path.dirname(path))
         tmp = path + ".cl-tmp"
         with contextlib.suppress(FileNotFoundError):
             os.remove(tmp)
@@ -688,16 +797,44 @@ def fresh_folder(path, owner=None):
         os.chown(path, owner, owner)
 
 
-def install_dist(software, tree, version, say):
+def arrange_tree(software, captured):
+    """The distribution's tree from the ~/.local an installer left: that folder itself, or, for
+    an agent, RS's fixed tree around it (local/, and the agent's settings beside it). What the
+    installer left in state/ (its locks) is not part of it."""
+    spec = known_software(software)
+    if os.path.islink(captured) or not os.path.isdir(captured):   # before anything is written into it: never through a link
+        raise CoreError("the installer left no folder of its own (a link, or nothing)")
+    remove_path(os.path.join(captured, "state"))
+    if not spec["local"]:
+        return captured
+    tree = os.path.join(os.path.dirname(captured), "tree")
+    fresh_folder(tree)
+    os.rename(captured, os.path.join(tree, spec["local"]))
+    for relative, text in spec.get("files", {}).items():
+        os.makedirs(os.path.dirname(os.path.join(tree, relative)), mode=0o755, exist_ok=True)
+        write_file(os.path.join(tree, relative), text, 0o644)
+    return tree
+
+
+def install_dist(software, tree, version, say, ext_version=None):
     """Mark a checked tree and put it in the distribution's place by renames: the old one is
     moved aside only once the new one is whole, and removed only after the new one is in. The
     folders above are never replaced: running sandboxes have /data/dist mounted."""
-    p = dist_paths(software)
+    p, spec = dist_paths(software), SOFTWARE[software]
     if os.path.islink(tree) or not os.path.isdir(tree):   # before anything is written into it: never through a link
         raise CoreError("the installer left no folder of its own (a link, or nothing)")
-    relativize_launcher(tree, SOFTWARE[software]["launcher"])
+    relativize_launcher(tree, spec["launcher"], spec["local"])
     check_tree(software, tree, version)
     mark = {"version": version, "pulled_at": now_utc()}
+    if "ext" in spec:
+        # The extension rides inside local/ (RS's "tuck"): a tree without it is refused.
+        ext_file = os.path.join(tree, spec["local"], spec["ext"]["file"])
+        if os.path.islink(ext_file) or not os.path.isfile(ext_file) or not os.path.getsize(ext_file):
+            raise CoreError(f"the distribution has no editor extension ({spec['local']}/{spec['ext']['file']})")
+        for relative in spec.get("files", {}):
+            if not os.path.isfile(os.path.join(tree, relative)) or os.path.islink(os.path.join(tree, relative)):
+                raise CoreError(f"the distribution has no {relative}")
+        mark["ext_version"] = checked_version(ext_version, "The extension's version")
     write_json(os.path.join(tree, MARK), mark)   # last: a tree without it was cut short, and is not copied
     os.makedirs(os.path.dirname(p["root"]), mode=0o755, exist_ok=True)
     remove_path(p["old"])   # left by a swap that was cut short
@@ -719,12 +856,15 @@ def install_dist(software, tree, version, say):
 DROPPED = ("--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--user", f"{SANDBOX_UID}:{SANDBOX_UID}")
 
 
-def build_dist(software, version, say=say_nothing):
+def build_dist(software, version, say=say_nothing, ext_version=None):
     """Run the installer of `software` at `version` in a throwaway container of the sandbox
     image, on the fenced build network, with no capability, as the sandbox's user, its home the
-    staging folder; check what it left, and install it. Three attempts, as RS."""
+    staging folder; for an agent, fetch its editor extension (at `ext_version`, else its pin)
+    into the ~/.local it left, as RS does; check what it left, and install it. Three attempts,
+    as RS."""
     spec, p = known_software(software), dist_paths(software)
     checked_version(version, f"The version of {spec['label']}")
+    ext_version = (ext_version or ext_pin(software)) if "ext" in spec else None
     image = ensure_image(say, "sandbox")
     if not there_is("network", BUILD_NET):
         docker("network", "create", BUILD_NET)
@@ -733,6 +873,16 @@ def build_dist(software, version, say=say_nothing):
     mounts, script = [], f'set -euo pipefail; curl -fsSL "$0" | {spec["shell"]} -s -- "$@"'
     if os.path.isfile(p["installer"]):   # the tests' way in: the build network reaches no test server
         mounts, script = ["-v", f"{p['installer']}:/opt/cl-installer:ro"], f'set -euo pipefail; {spec["shell"]} /opt/cl-installer "$@"'
+    if ext_version is not None:
+        checked_version(ext_version, f"The version of the extension of {spec['label']}")
+        place = f'"$HOME/.local/{spec["ext"]["file"]}"'
+        script += f'; mkdir -p "$(dirname {place})"; '
+        if os.path.isfile(p["ext_file"]):   # the tests' way in, as the installer's
+            mounts += ["-v", f"{p['ext_file']}:/opt/cl-ext.vsix:ro"]
+            script += f"cp /opt/cl-ext.vsix {place}"
+        else:
+            mounts += ["-e", "CL_EXT_URL=" + spec["ext"]["url"].format(version=ext_version)]
+            script += f'curl -fsSL --compressed -o {place} "$CL_EXT_URL"'
     last = ""
     try:
         for attempt in range(1, DIST_ATTEMPTS + 1):
@@ -751,7 +901,7 @@ def build_dist(software, version, say=say_nothing):
                 last = f"the installer failed (exit {done.returncode}): " + (done.stderr.strip() or done.stdout.strip())[-500:]
                 continue
             try:
-                return install_dist(software, os.path.join(p["staging"], ".local"), version, say)
+                return install_dist(software, arrange_tree(software, os.path.join(p["staging"], ".local")), version, say, ext_version)
             except CoreError as exc:
                 last = str(exc)
     finally:
@@ -769,16 +919,18 @@ def take_preloaded(software, say=say_nothing):
         return None
     try:
         with open(p["preload_json"]) as fh:
-            version = checked_version(json.loads(fh.read(4096))["version"], f"The version in {p['preload_json']}")
+            given = json.loads(fh.read(4096))
+        version = checked_version(given["version"], f"The version in {p['preload_json']}")
+        ext_version = checked_version(given["ext_version"], f"The extension's version in {p['preload_json']}") if "ext" in spec else None
     except (OSError, ValueError, KeyError, TypeError) as exc:
         raise CoreError(f"{p['preload_json']} cannot be read ({type(exc).__name__}).") from exc
     say(f"taking {spec['label']} {version} from {p['preload']}")
     os.makedirs(f"{DATA}/dist-staging", mode=0o700, exist_ok=True)
     fresh_folder(p["staging"])
     try:
-        tree = os.path.join(p["staging"], ".local")
+        tree = os.path.join(p["staging"], "tree")
         shutil.copytree(p["preload"], tree, symlinks=True)
-        return install_dist(software, tree, version, say)
+        return install_dist(software, tree, version, say, ext_version)
     finally:
         shutil.rmtree(p["staging"], ignore_errors=True)
 
@@ -834,16 +986,46 @@ def upstream_version(software):
     return checked_version(answer, f"Upstream's newest version of {spec['label']}")
 
 
+def upstream_ext_version(software):
+    """The newest version of an agent's editor extension on Open VSX (its metadata's
+    "version"), asked as upstream_version asks, or read from the preload folder."""
+    spec, p = known_software(software), dist_paths(software)
+    if os.path.isfile(p["ext_upstream"]):
+        answer = read_bounded(p["ext_upstream"], 256).strip()
+    else:
+        image = ensure_image(kind="sandbox")
+        if not there_is("network", BUILD_NET):
+            docker("network", "create", BUILD_NET)
+        try:
+            done = docker("run", "--rm", "--network", BUILD_NET, *DROPPED, "--entrypoint", "curl", image, "-fsSL", "--max-time",
+                          str(UPSTREAM_TIMEOUT_S), "--max-filesize", "4000000", spec["ext"]["upstream"], timeout=UPSTREAM_TIMEOUT_S + 60, check=False)
+        except CoreError as exc:
+            raise CoreError(f"Open VSX could not be asked for the newest extension of {spec['label']}: {exc}") from exc
+        if done.returncode != 0:
+            raise CoreError(f"Open VSX could not be asked for the newest extension of {spec['label']}: {(done.stderr.strip() or 'curl failed')[-300:]}")
+        try:
+            answer = json.loads(done.stdout).get("version")
+        except (ValueError, AttributeError, RecursionError):
+            answer = None
+    return checked_version(answer, f"Open VSX's newest version of the extension of {spec['label']}")
+
+
 def refresh_check(software):
-    """The version in effect, upstream's newest, and whether upstream's is newer. Changes
-    nothing."""
+    """The version in effect, upstream's newest, and whether upstream's is newer; for an agent
+    also its editor extension's two, resolved independently as RS does (Open VSX can trail
+    the release by hours), and "newer" when either is. Changes nothing."""
     current, latest = pin(software), upstream_version(software)
-    return {"software": software, "version": current, "upstream": latest, "newer": is_newer(latest, current)}
+    out = {"software": software, "version": current, "upstream": latest, "newer": is_newer(latest, current)}
+    if "ext" in SOFTWARE[software]:
+        ext_current, ext_latest = ext_pin(software), upstream_ext_version(software)
+        out.update(ext_version=ext_current, ext_upstream=ext_latest, newer=out["newer"] or is_newer(ext_latest, ext_current))
+    return out
 
 
 def software_refresh(software, say=say_nothing):
-    """Refresh: if upstream has a newer version, raise the pin to it and pull it; otherwise
-    there is nothing to do (a pin is never moved down)."""
+    """Refresh: if upstream has a newer version (of an agent or of its extension), raise the
+    pins that are behind and pull; otherwise there is nothing to do (a pin is never moved
+    down)."""
     spec = known_software(software)
     with build_lane(software):
         say(f"asking upstream for the newest version of {spec['label']}")
@@ -851,9 +1033,20 @@ def software_refresh(software, say=say_nothing):
         if not check["newer"]:
             say(f"{spec['label']} {check['version']} is in effect and upstream's newest is {check['upstream']}: nothing to do")
             return dict(check, bumped=False)
-        say(f"raising {spec['key']} from {check['version']} to {check['upstream']}")
-        set_version_pin(spec["key"], check["upstream"])
-        return dict(check, previous=check["version"], version=check["upstream"], bumped=True, pulled=build_dist(software, check["upstream"], say))
+        version = check["upstream"] if is_newer(check["upstream"], check["version"]) else check["version"]
+        ext_version = None
+        if "ext" in spec:
+            ext_version = check["ext_upstream"] if is_newer(check["ext_upstream"], check["ext_version"]) else check["ext_version"]
+            if ext_version != check["ext_version"]:
+                say(f"raising {spec['ext']['key']} from {check['ext_version']} to {ext_version}")
+                set_version_pin(spec["ext"]["key"], ext_version)
+        if version != check["version"]:
+            say(f"raising {spec['key']} from {check['version']} to {version}")
+            set_version_pin(spec["key"], version)
+        out = dict(check, previous=check["version"], version=version, bumped=True, pulled=build_dist(software, version, say, ext_version))
+        if "ext" in spec:
+            out.update(previous_ext=check["ext_version"], ext_version=ext_version)
+        return out
 
 
 # Named as RS names them.
@@ -861,6 +1054,15 @@ def known_agent(agent):
     if agent not in AGENTS:
         raise CoreError(f"There is no agent named {str(agent)[:40]!r} (there is {', '.join(AGENTS)}).")
     return agent
+
+
+def refuse_unpulled(agents, editor):
+    """What a project is to be given must be pulled; refused in RS's words where it is not."""
+    for agent in agents:
+        if pulled(agent) is None:
+            raise CoreError(f"agent {agent!r}: no cached dist — pull it under Settings → Software first")
+    if editor and pulled("code-server") is None:
+        raise CoreError("editor: no cached dist — pull it under Settings → Software first")
 
 
 def agent_pull(agent="claude", say=say_nothing):
@@ -887,10 +1089,10 @@ def editor_refresh(say=say_nothing):
     return software_refresh("code-server", say)
 
 
-def dist_status_word(have, version):
+def dist_status_word(have, version, ext_version=None):
     if have is None:
         return "not pulled"
-    return "up to date" if have["version"] == version else STALE
+    return "up to date" if have["version"] == version and have.get("ext_version") == ext_version else STALE
 
 
 def software_status():
@@ -907,11 +1109,19 @@ def software_status():
         row = {"id": software, "kind": spec["kind"], "row": f"{spec['kind']}: {software}", "label": spec["label"],
                "key": spec["key"], "pulled": pulled(software), "version": None, "repo_version": base.get(spec["key"]),
                "overridden": spec["key"] in override, "building": now == software}
+        ext_version = None
+        if "ext" in spec:
+            row.update(ext_key=spec["ext"]["key"], ext_version=None, ext_repo_version=base.get(spec["ext"]["key"]))
+            row["overridden"] = row["overridden"] or spec["ext"]["key"] in override
         try:
             row["version"] = pin(software)
+            if "ext" in spec:
+                row["ext_version"] = ext_version = ext_pin(software)
         except CoreError as exc:
             row["problem"] = problem or str(exc)
-        row["status"] = dist_status_word(row["pulled"], row["version"])   # a version that cannot be read is never "up to date"
+        # A version that cannot be read is never "up to date"; an agent is stale when either
+        # its pin or its extension's moved since the pull.
+        row["status"] = dist_status_word(row["pulled"], row["version"], ext_version)
         rows.append(row)
     return rows
 
@@ -943,6 +1153,11 @@ def container_args(record, image):
         "-v", f"{p['workspace']}:/workspace",
         "-v", f"{p['home']}:/home/{SANDBOX_USER}",
         "-v", f"{p['provision']}:/etc/cl-provision:ro",
+        # Every distribution, read-only: what the sandbox's deploy script copies from. The
+        # folder above them all, because a Pull swaps a distribution by renames inside it,
+        # which a running sandbox sees (a mount of the distribution itself would stay on the
+        # folder that was renamed away).
+        "-v", f"{DATA}/dist:{DIST_MOUNT}:ro",
         *limit_args(record["limits"]),
         image,
     ]
@@ -1021,9 +1236,10 @@ def host_fingerprint(name):
     return "SHA256:" + base64.b64encode(hashlib.sha256(blob).digest()).decode("ascii").rstrip("=")
 
 
-def write_provisioning(name):
-    """The provisioning folder, written afresh from what the core holds. Files are replaced in
-    place, never the folder: a running sandbox has it mounted."""
+def write_provisioning(record):
+    """The provisioning folder, written afresh from what the core holds and the project's
+    record. Files are replaced in place, never the folder: a running sandbox has it mounted."""
+    name = record["name"]
     p = paths(name)
     tutor_key, host_key = f"{p['tutor_keys']}/id_ed25519", f"{p['host_keys']}/ssh_host_ed25519_key"
     keygen(tutor_key, f"cl-tutor-{name}")
@@ -1038,6 +1254,10 @@ def write_provisioning(name):
         "ssh_host_ed25519_key": (read_text(host_key), 0o600),
         "ssh_host_ed25519_key.pub": (host_public, 0o644),
         "shell_password_hash": (crypt_hash(password) + "\n", 0o600),
+        # What the sandbox's init deploys at start, whether it starts the editor, and the model
+        # and effort the deploy script writes into Claude Code's settings.
+        SOFTWARE_FILE: (json.dumps({"agents": record["agents"], "editor": record["editor"],
+                                    "claude": {"model": record["claude_model"], "effort": record["claude_effort"]}}) + "\n", 0o644),
     }
     for filename, (text, mode) in wanted.items():
         write_file(os.path.join(p["provision"], filename), text, mode)
@@ -1055,7 +1275,10 @@ def ensure(record, say=say_nothing):
         os.makedirs(p[key], mode=0o755, exist_ok=True)
         if os.stat(p[key]).st_uid != SANDBOX_UID:  # new, or made by a call that was killed before this line
             os.chown(p[key], SANDBOX_UID, SANDBOX_UID)
-    write_provisioning(name)
+    write_provisioning(record)
+    # The source of the distributions' mount, made here with the modes a sandbox user can
+    # read, and not left to the daemon, which makes a missing source folder its own way.
+    os.makedirs(f"{DATA}/dist/agents", mode=0o755, exist_ok=True)
     if not there_is("network", p["network"]):
         docker("network", "create", "--label", f"cl.project={name}", p["network"])
     # The network first, then the web server onto it: web_up, the other way round, makes its
@@ -1145,6 +1368,7 @@ def status(name):
     p = paths(name)
     container = inspect_container(p["container"])
     out = {"name": name, "created": record["created"], "wanted": record["wanted"], "limits": record["limits"],
+           "agents": record["agents"], "editor": record["editor"], "claude_model": record["claude_model"], "claude_effort": record["claude_effort"],
            "state": "missing", "address": "", "image": "", "container": "", "setup": ""}
     if container:
         out["state"] = "running" if container["State"].get("Running") else "stopped"
@@ -1167,7 +1391,8 @@ def list_projects():
             out.append(status(name))
         except CoreError as exc:  # the record is fine; the daemon could not say how the sandbox is
             out.append({"name": name, "created": record["created"], "wanted": record["wanted"], "limits": record["limits"],
-                        "state": "unknown", "address": "", "image": "", "container": "", "setup": "", "problem": str(exc)})
+                        "agents": record["agents"], "editor": record["editor"], "claude_model": record["claude_model"],
+                        "claude_effort": record["claude_effort"], "state": "unknown", "address": "", "image": "", "container": "", "setup": "", "problem": str(exc)})
     return out
 
 
@@ -1381,15 +1606,21 @@ def port_list(name):
     return {"project": name, "ports": read_ports(name)}
 
 
-def create(name, limits=None, say=say_nothing):
+def create(name, limits=None, say=say_nothing, agents=(), editor=False, claude_model="", claude_effort=""):
+    """A new project with the agents and the editor asked for (none by default), each of which
+    must be pulled, and Claude's model and effort (Claude's own default when empty): what is
+    asked for is checked before anything is made, as RS does."""
     valid_name(name)
+    agents, editor = checked_agents(agents), checked_editor(editor)
+    checked_claude_pair(claude_model, claude_effort)
+    refuse_unpulled(agents, editor)
     with locked(name):
         if os.path.exists(paths(name)["record"]):
             raise CoreError(f"A project named {name} exists. (If it is being destroyed, `destroy {name}` finishes that.)")
         left = leftovers(name)
         if left:
             raise CoreError(f"Something of an earlier project named {name} is left ({', '.join(left)}). `destroy {name}` clears it.")
-        record = new_record(name, limits)
+        record = new_record(name, limits, agents, editor, claude_model, claude_effort)
         try:
             write_record(record)
             ensure(record, say)
@@ -1460,6 +1691,133 @@ def set_limits(name, pids=UNCHANGED, memory=UNCHANGED, cpus=UNCHANGED):
         record["limits"] = checked_limits(dict(record["limits"], **changed))
         write_record(record)
         return dict(status(name), notes=apply_limits(record))
+
+
+# --- agents in a running project -----------------------------------------------------------
+#
+# As RS's Add and Update in a project's Config box: live, nothing restarted. The core runs the
+# image's deploy script in the sandbox, as the sandbox user (the home is the learner's, and
+# links in it must not be followed with root's rights): the one command the core runs inside a
+# sandbox. Its argument list is fixed but for one id of the closed table, checked.
+
+def has_dist_mount(container):
+    """Whether a sandbox was created with the distributions mounted (since projects have
+    agents). One created before cannot be deployed into until it is recreated."""
+    return any(mount.get("Destination") == DIST_MOUNT for mount in container.get("Mounts") or [])
+
+
+def deployable_sandbox(name):
+    container = inspect_container(paths(name)["container"])
+    if container is None or not container["State"].get("Running"):
+        raise CoreError("Start the project to update its agents")
+    if not has_dist_mount(container):
+        raise CoreError(f"The sandbox of {name} was made before projects had agents: recreate the project first "
+                        "(its workspace and home folder are kept).")
+    return container
+
+
+def tail_of(command, limit, timeout):
+    """Run a command: its exit status (None when it was ended for taking too long) and the last
+    `limit` bytes of what it printed, standard error included. What a sandbox prints is the
+    sandbox's to choose: it is read to the end but never kept whole."""
+    with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL) as process:
+        tail, deadline = b"", time.monotonic() + timeout
+        try:
+            while select.select([process.stdout], [], [], max(0, deadline - time.monotonic()))[0]:
+                chunk = os.read(process.stdout.fileno(), 65536)
+                if not chunk:
+                    break
+                tail = (tail + chunk)[-limit:]
+            else:
+                return None, tail.decode(errors="replace")
+            return process.wait(timeout=30), tail.decode(errors="replace")
+        except subprocess.TimeoutExpired:
+            return None, tail.decode(errors="replace")
+        finally:
+            if process.poll() is None:
+                process.kill()
+
+
+def deploy_agents(name, agents):
+    """Deploy each of `agents` into the running sandbox of `name`, in the deploy script's update
+    mode: the program is overwritten, settings and logins are left alone. Refused while one of
+    them is being built, or is not pulled. Returns {agent: version deployed}."""
+    p, deployed = paths(name), {}
+    for agent in agents:
+        spec = known_software(known_agent(agent))
+        if building_now() == agent:
+            raise CoreError(f"{spec['label']} is being built now; try again when that is done.")
+        refuse_unpulled([agent], False)
+        version = pulled(agent)["version"]
+        run_deploy(p["container"], "update", agent, f"{spec['label']} could not be deployed into {name}")
+        deployed[agent] = version
+    return deployed
+
+
+def run_deploy(container, mode, agent, failed):
+    """The image's deploy script in a running sandbox, as the sandbox user, with a time limit:
+    the one command the core runs in a sandbox. `mode` and `agent` are words of closed sets,
+    never a request's text. Returns the last line it printed; raises `failed` and why."""
+    if mode not in ("update", "settings") or agent not in AGENTS:
+        raise CoreError(f"There is no deploy {str(mode)[:20]} {str(agent)[:20]}.")
+    command = ["docker", "exec", "--user", SANDBOX_USER, container, "timeout", str(DEPLOY_TIMEOUT_S), DEPLOY, mode, agent]
+    try:
+        code, said = tail_of(command, DEPLOY_OUTPUT_BYTES, DEPLOY_TIMEOUT_S + 60)
+    except OSError as exc:
+        raise CoreError("The inner Docker daemon did not answer `docker exec`.") from exc
+    last = "".join(c if c.isprintable() else "?" for c in (said.strip().splitlines() or [""])[-1])[-300:]
+    if code != 0:
+        raise CoreError(f"{failed}: " + ("it took too long" if code in (None, 124) else last or f"exit {code}"))
+    return last
+
+
+def agents_add(name, agent="claude"):
+    """Add an agent to a running project, live: deployed into its home (over a copy that is
+    there, as Update does), then written into its record and its provisioning folder, which
+    its init reads at the next start. Adding one the project has is no error."""
+    valid_name(name)
+    known_agent(agent)
+    with locked(name):
+        record = not_being_destroyed(read_record(name))
+        deployable_sandbox(name)
+        deployed = deploy_agents(name, [agent])
+        if agent not in record["agents"]:
+            record["agents"] = [*record["agents"], agent]
+            write_record(record)
+            write_provisioning(record)
+        return {"project": name, "agents": record["agents"], "deployed": deployed}
+
+
+def agents_update(name):
+    """Update in a project's Config box: deploy the pulled version of every agent the running
+    project has. The editor is not touched: a newer one reaches a project at its next start."""
+    valid_name(name)
+    with locked(name):
+        record = not_being_destroyed(read_record(name))
+        deployable_sandbox(name)
+        if not record["agents"]:
+            raise CoreError(f"Project {name} has no agents to update.")
+        return {"project": name, "agents": record["agents"], "deployed": deploy_agents(name, record["agents"])}
+
+
+def agents_model(name, model=None, effort=None):
+    """Set or clear Claude's model and effort of a running project (RS's Config box, Agents):
+    None keeps what the project has, "" clears it (Claude's own default). Written into the
+    record and the provisioning folder, then into ~/.claude/settings.json in the sandbox by
+    the deploy script, as RS's _write_agent_settings does. "applied" says whether there was a
+    settings file to write into: one that is installed later gets the pair then."""
+    valid_name(name)
+    with locked(name):
+        record = not_being_destroyed(read_record(name))
+        model = record["claude_model"] if model is None else model
+        effort = record["claude_effort"] if effort is None else effort
+        model, effort = checked_claude_pair(model, effort)
+        deployable_sandbox(name)
+        record["claude_model"], record["claude_effort"] = model, effort
+        write_record(record)
+        write_provisioning(record)
+        said = run_deploy(paths(name)["container"], "settings", "claude", f"The model and effort could not be written into the settings of {name}")
+        return {"project": name, "claude_model": model, "claude_effort": effort, "applied": not said.endswith("settings absent")}
 
 
 def remove_everything(name):
@@ -1842,12 +2200,26 @@ def main(argv=None):
                 one.add_argument("agent", nargs="?", default="claude", choices=AGENTS)
             if action == "refresh":
                 one.add_argument("--check", action="store_true", help="only say whether upstream has a newer version")
+    deploys = verbs.add_parser("agents", help="add an agent to a running project, or update its agents").add_subparsers(dest="action", required=True)
+    one = deploys.add_parser("add", help="deploy an agent into a running project and add it to the project")
+    one.add_argument("name")
+    one.add_argument("agent", nargs="?", default="claude")
+    deploys.add_parser("update", help="deploy the pulled version of every agent of a running project").add_argument("name")
+    one = deploys.add_parser("model", help="set Claude's model and effort of a running project (an empty value clears it)")
+    one.add_argument("name")
+    one.add_argument("--model", help="a tier (opus, sonnet, haiku, fable) or a model id")
+    one.add_argument("--effort", help="low, medium, high, xhigh or max")
     for verb in ("status", "create", "start", "stop", "recreate", "destroy", "limits"):
         one = verbs.add_parser(verb)
         one.add_argument("name")
         if verb in ("create", "limits"):
             for option in ("pids", "memory", "cpus"):
                 one.add_argument(f"--{option}", help="a number (memory: 512m, 2g), or none")
+        if verb == "create":
+            one.add_argument("--agent", action="append", default=[], dest="agents", help="an agent to add (claude); again for another")
+            one.add_argument("--editor", action="store_true", help="give the project the editor")
+            one.add_argument("--claude-model", default="", help="Claude's model: a tier (opus, sonnet, haiku, fable) or a model id")
+            one.add_argument("--claude-effort", default="", help="Claude's effort: low, medium, high, xhigh or max")
     args = parser.parse_args(argv)
 
     def say(message):
@@ -1870,6 +2242,13 @@ def main(argv=None):
                 out = software_pull(software, say)
             else:
                 out = refresh_check(software) if args.check else software_refresh(software, say)
+        elif args.verb == "agents":
+            if args.action == "add":
+                out = agents_add(args.name, args.agent)
+            elif args.action == "update":
+                out = agents_update(args.name)
+            else:
+                out = agents_model(args.name, args.model, args.effort)
         elif args.verb == "start-wanted":
             out = start_wanted(say)
         elif args.verb == "status":
@@ -1877,7 +2256,8 @@ def main(argv=None):
         elif args.verb in ("create", "limits"):
             given = {k: limit_option(getattr(args, k), k) for k in ("pids", "memory", "cpus")}
             if args.verb == "create":
-                out = create(args.name, {k: v for k, v in given.items() if v is not UNCHANGED}, say)
+                out = create(args.name, {k: v for k, v in given.items() if v is not UNCHANGED}, say, args.agents, args.editor,
+                             args.claude_model, args.claude_effort)
             else:
                 out = set_limits(args.name, **given)
         elif args.verb == "start":

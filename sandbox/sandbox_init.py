@@ -24,11 +24,18 @@
   7. What /workspace/.learn/services lists is started as the sandbox user, one line each,
      `name: command`, with its output in /workspace/.learn/logs/<name>.log. They are started,
      not watched: one that ends stays down until the next start.
+  8. Each agent the provisioning folder names (software.json) is deployed into the home by
+     /opt/cl/deploy, run as the sandbox user with a time limit, one after the other: copied
+     from the distributions (/opt/cl/dist, read-only) only while its launcher is not in the
+     home, so a copy that updated itself is kept; its settings installed once, with the
+     project's model and effort. None of this holds up sshd, the files server, code-server
+     or a stop; what the deploy says is in the container's log.
 
 Then it waits, and starts sshd, the files server or code-server again if one of them ends. On a stop it
 asks every other process to end, gives them a few seconds, and exits; what is left is ended
 with the container.
 """
+import json
 import os
 import pwd
 import re
@@ -54,6 +61,10 @@ SERVICE_NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,31}")
 MAX_SERVICES = 64
 SERVICES_BYTES = 64 * 1024
 CRYPT_HASH = re.compile(r"\$6\$[./A-Za-z0-9]{1,16}\$[./A-Za-z0-9]{86}")   # as the core writes it
+SOFTWARE_FILE = os.path.join(PROVISION, "software.json")
+AGENTS = ("claude",)            # the core's closed set (outer/core.py, AGENTS)
+DEPLOY = "/opt/cl/deploy"
+DEPLOY_TIMEOUT_S = 900
 
 
 def log(message):
@@ -269,6 +280,32 @@ def start_listed_services(user, path=SERVICES):
     return started
 
 
+def provisioned_agents(path=SOFTWARE_FILE):
+    """The agents the provisioning folder names, from the closed set; none where the file is
+    missing or holds anything else."""
+    try:
+        with open(path, "rb") as fh:
+            named = json.loads(fh.read(4096)).get("agents")
+    except (OSError, ValueError, RecursionError, AttributeError):
+        return []
+    return [agent for agent in AGENTS if isinstance(named, list) and agent in named]
+
+
+def next_deploy(user, deploying, owed):
+    """One deploy at a time: once the one running has ended, the next agent of `owed` is
+    started. Returns the deploy running now, or None."""
+    if deploying is not None and deploying.poll() is None:
+        return deploying
+    while owed:
+        agent = owed.pop(0)
+        try:
+            # Its output goes to the container's log, as this init's does.
+            return as_user(user, ["timeout", str(DEPLOY_TIMEOUT_S), DEPLOY, "start", agent])
+        except OSError as exc:
+            log(f"{agent} could not be deployed: {exc}")
+    return None
+
+
 def end_the_others(grace_s=STOP_GRACE_S):
     """Ask every other process of the container to end, and wait for them a little."""
     try:
@@ -313,9 +350,11 @@ def main():
             setup = start_setup(user)
     except OSError as exc:
         log(f"the setup recipe could not be run: {exc}")
+    owed, deploying = provisioned_agents(), None
     log("up")
     while not stopping:
         keep_running(services, running, tried)
+        deploying = next_deploy(user, deploying, owed)
         setup = setup_ended(setup)
         if setup is None and listed is None:
             listed = start_listed_services(user)

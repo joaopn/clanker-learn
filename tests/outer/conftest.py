@@ -127,8 +127,15 @@ def preload(web_image, sandbox_image, tmp_path_factory):
     pins = core.parse_pins(str(REPO / "versions.env"))
     for place, launcher, version, program in (("agents/claude", "claude", pins["CLAUDE_CODE_VERSION"], "share/claude/versions/{v}"),
                                               ("editor", "code-server", pins["CODE_SERVER_VERSION"], "lib/code-server-{v}/bin/code-server")):
-        stand_in_dist(folder / "dist" / place, launcher, program.format(v=version), version)
-        (folder / "dist" / f"{place}.json").write_text(json.dumps({"version": version}))
+        if launcher == "claude":   # RS's tree: local/ with the extension in it, the settings beside
+            stand_in_dist(folder / "dist" / place / "local", launcher, program.format(v=version), version)
+            for name, text in (("local/share/rs-agent-ext/anthropic.claude-code.vsix", "a stand-in"), ("claude/settings.json", core.AGENT_SETTINGS_JSON)):
+                (folder / "dist" / place / name).parent.mkdir(parents=True, exist_ok=True)
+                (folder / "dist" / place / name).write_text(text)
+                (folder / "dist" / place / name).chmod(0o644)
+        else:
+            stand_in_dist(folder / "dist" / place, launcher, program.format(v=version), version)
+        (folder / "dist" / f"{place}.json").write_text(json.dumps({"version": version, "ext_version": pins["CLAUDE_CODE_EXT_VERSION"]}))
         (folder / "dist" / f"{place}.json").chmod(0o644)
     for above in (folder / "dist", folder / "dist" / "agents"):
         above.chmod(0o755)

@@ -72,7 +72,7 @@ def test_the_image_tag_follows_the_definition_and_nothing_else(tmp_path):
     assert core.image_tag(str(tmp_path)) not in (tag, changed)
 
 
-def test_a_sandbox_is_created_plain_fenced_and_with_its_three_mounts(monkeypatch):
+def test_a_sandbox_is_created_plain_fenced_and_with_its_four_mounts(monkeypatch):
     monkeypatch.setattr(core, "DATA", "/data")
     record = core.new_record("kafka", {"pids": 512, "memory": 2 * 1024 ** 3, "cpus": 1.5})
     # The whole list, so that nothing can be added to it unseen: no privilege, no restart
@@ -84,6 +84,7 @@ def test_a_sandbox_is_created_plain_fenced_and_with_its_three_mounts(monkeypatch
         "-v", "/data/projects/kafka:/workspace",
         "-v", "/data/homes/kafka:/home/learner",
         "-v", "/data/core/provision/kafka:/etc/cl-provision:ro",
+        "-v", "/data/dist:/opt/cl/dist:ro",
         "--pids-limit", "512",
         "--memory", "2147483648", "--memory-swap", "2147483648",
         "--cpu-period", "100000", "--cpu-quota", "150000",
@@ -1458,12 +1459,12 @@ def test_the_shell_password_is_made_once_kept_and_handed_over_as_its_hash(monkey
     core's keys, the same after a second provisioning; the provisioning folder holds its
     hash (which openssl gives back for the same salt) and not the password."""
     monkeypatch.setattr(core, "DATA", str(tmp_path))
-    core.write_provisioning("kafka")
+    core.write_provisioning(core.new_record("kafka"))
     p = core.paths("kafka")
     password = core.shell_password("kafka")
     assert len(password) == 32 and password.isalnum() and os.path.dirname(p["shell_password"]) == p["host_keys"]
     assert oct(os.stat(p["shell_password"]).st_mode & 0o777) == "0o600"
-    core.write_provisioning("kafka")
+    core.write_provisioning(core.new_record("kafka"))
     assert core.shell_password("kafka") == password
     hashed = (tmp_path / "core" / "provision" / "kafka" / "shell_password_hash").read_text().strip()
     assert core.CRYPT_HASH.fullmatch(hashed) and oct(os.stat(f"{p['provision']}/shell_password_hash").st_mode & 0o777) == "0o600"
@@ -1675,6 +1676,11 @@ def test_the_sandbox_user_gets_the_password_from_its_hash_and_keeps_its_own_with
 CLAUDE, EDITOR = "2.1.330", "4.126.0"
 
 
+def vsix(local):
+    (local / "share" / "rs-agent-ext").mkdir(parents=True, exist_ok=True)
+    (local / "share" / "rs-agent-ext" / "anthropic.claude-code.vsix").write_text("a stand-in")
+
+
 def stand_in(root, software, version, absolute=False):
     """A tree as the installer leaves it: the launcher a link to the versioned program, which
     is a tiny script. `absolute`: the link as the installer makes it, into the build's home."""
@@ -1716,6 +1722,8 @@ class Builds:
         staging = next(a.split(":")[0] for a in args if a.endswith(":/build"))
         version = self.leaves or args[-1]
         stand_in(pathlib.Path(staging) / ".local", software, version, absolute=True)
+        if software == "claude":   # the extension, fetched after the installer
+            vsix(pathlib.Path(staging) / ".local")
         return answer(0)
 
     def runs(self):
@@ -1728,7 +1736,7 @@ def dists(monkeypatch, tmp_path):
     monkeypatch.setattr(core, "LOCKS", str(tmp_path / "locks"))
     monkeypatch.setattr(core, "PRELOAD", str(tmp_path / "preload"))
     base = tmp_path / "versions.env"
-    base.write_text(f"# the repository's\nCLAUDE_CODE_VERSION={CLAUDE}\nCODE_SERVER_VERSION={EDITOR}\n")
+    base.write_text(f"# the repository's\nCLAUDE_CODE_VERSION={CLAUDE}\nCODE_SERVER_VERSION={EDITOR}\nCLAUDE_CODE_EXT_VERSION={CLAUDE}\n")
     monkeypatch.setattr(core, "VERSIONS_FILE", str(base))
     builds = Builds()
     monkeypatch.setattr(core, "docker", builds)
@@ -1743,15 +1751,15 @@ def local_pins(tmp_path):
 
 def test_the_repository_ships_both_pins_and_the_image_has_them():
     repo = pathlib.Path(__file__).resolve().parents[2]
-    assert core.parse_pins(str(repo / "versions.env")) == {"CLAUDE_CODE_VERSION": CLAUDE, "CODE_SERVER_VERSION": EDITOR}
+    assert core.parse_pins(str(repo / "versions.env")) == {"CLAUDE_CODE_VERSION": CLAUDE, "CODE_SERVER_VERSION": EDITOR, "CLAUDE_CODE_EXT_VERSION": CLAUDE}
     assert "COPY versions.env /opt/cl/versions.env" in (repo / "outer" / "Dockerfile").read_text()
 
 
 def test_the_local_override_wins_key_by_key(dists, tmp_path):
-    assert core.load_versions() == {"CLAUDE_CODE_VERSION": CLAUDE, "CODE_SERVER_VERSION": EDITOR}
+    assert core.load_versions() == {"CLAUDE_CODE_VERSION": CLAUDE, "CODE_SERVER_VERSION": EDITOR, "CLAUDE_CODE_EXT_VERSION": CLAUDE}
     (tmp_path / "data").mkdir()
     (tmp_path / "data" / "versions.local.env").write_text("# mine\n\nCLAUDE_CODE_VERSION = 2.1.400\n")
-    assert core.load_versions() == {"CLAUDE_CODE_VERSION": "2.1.400", "CODE_SERVER_VERSION": EDITOR}
+    assert core.load_versions() == {"CLAUDE_CODE_VERSION": "2.1.400", "CODE_SERVER_VERSION": EDITOR, "CLAUDE_CODE_EXT_VERSION": CLAUDE}
     assert (core.pin("claude"), core.pin("code-server")) == ("2.1.400", EDITOR)
 
 
@@ -1809,13 +1817,13 @@ def test_versions_are_compared_number_by_number(newer, than):
 
 def test_the_launcher_link_is_made_relative(tmp_path):
     tree = stand_in(tmp_path / "local", "claude", CLAUDE, absolute=True)
-    core.relativize_launcher(str(tree), "bin/claude")
+    core.relativize_launcher(str(tmp_path), "local/bin/claude", "local")
     assert os.readlink(tree / "bin" / "claude") == f"../share/claude/versions/{CLAUDE}"
-    core.check_tree("claude", str(tree), CLAUDE)
+    core.check_tree("claude", str(tmp_path), CLAUDE)
 
 
 @pytest.mark.parametrize("spoil, why", [
-    (lambda tree: (tree / "bin" / "claude").unlink(), "left no bin/claude"),
+    (lambda tree: (tree / "bin" / "claude").unlink(), "left no local/bin/claude"),
     (lambda tree: relink(tree, "/usr/bin/env"), "outside the distribution"),
     (lambda tree: relink(tree, "../../../../../../etc/passwd"), "leads outside the distribution"),
     (lambda tree: relink(tree, "../share/claude"), "does not lead to a program"),
@@ -1823,12 +1831,12 @@ def test_the_launcher_link_is_made_relative(tmp_path):
     (lambda tree: (tree / f"share/claude/versions/{CLAUDE}").chmod(0o644), "does not lead to a program"),
 ])
 def test_a_tree_whose_launcher_is_not_the_version_wanted_is_refused(tmp_path, spoil, why):
-    tree = stand_in(tmp_path / "local", "claude", CLAUDE)
+    tree = stand_in(tmp_path / "one" / "local", "claude", CLAUDE)
     spoil(tree)
     with pytest.raises(core.CoreError, match=why):
-        core.check_tree("claude", str(tree), CLAUDE)
+        core.check_tree("claude", str(tree.parent), CLAUDE)
     with pytest.raises(core.CoreError, match=f"holds version {CLAUDE}, not 2.1.400"):
-        core.check_tree("claude", str(stand_in(tmp_path / "other", "claude", CLAUDE)), "2.1.400")
+        core.check_tree("claude", str(stand_in(tmp_path / "other" / "local", "claude", CLAUDE).parent), "2.1.400")
 
 
 def relink(tree, target):
@@ -1841,15 +1849,18 @@ def test_a_pull_runs_the_installer_without_privileges_checks_marks_and_swaps(dis
     out = core.software_pull("claude", said.append)
     root = tmp_path / "data" / "dist" / "agents" / "claude"
     assert out["software"] == "claude" and out["version"] == CLAUDE
-    assert os.readlink(root / "bin" / "claude") == f"../share/claude/versions/{CLAUDE}"
-    assert json.loads((root / ".cl-dist").read_text()) == json.loads((root.parent / "claude.json").read_text()) == {"version": CLAUDE, "pulled_at": out["pulled_at"]}
-    assert core.pulled("claude") == {"version": CLAUDE, "pulled_at": out["pulled_at"]}
+    assert os.readlink(root / "local" / "bin" / "claude") == f"../share/claude/versions/{CLAUDE}"
+    assert (root / "claude" / "settings.json").read_text() == core.AGENT_SETTINGS_JSON and not (root / "local" / "state").exists()
+    mark = {"version": CLAUDE, "pulled_at": out["pulled_at"], "ext_version": CLAUDE}
+    assert json.loads((root / ".cl-dist").read_text()) == json.loads((root.parent / "claude.json").read_text()) == mark
+    assert core.pulled("claude") == mark
     run, = dists.runs()
     staging = str(tmp_path / "data" / "dist-staging" / "claude")
     assert run[:run.index("cl-sandbox:abc") + 1] == (
         "run", "--rm", "--name", "cl-dist-claude", "--network", "cl-build", "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
-        "--user", "1000:1000", "-e", "HOME=/build", "-v", f"{staging}:/build", "--entrypoint", "timeout", "cl-sandbox:abc")
-    assert run[-3] == 'set -euo pipefail; curl -fsSL "$0" | bash -s -- "$@"' and run[-2:] == ("https://claude.ai/install.sh", CLAUDE)
+        "--user", "1000:1000", "-e", "HOME=/build", "-v", f"{staging}:/build", "-e", run[run.index("HOME=/build") + 4], "--entrypoint", "timeout", "cl-sandbox:abc")
+    assert run[-3].startswith('set -euo pipefail; curl -fsSL "$0" | bash -s -- "$@"; ') and run[-2:] == ("https://claude.ai/install.sh", CLAUDE)
+    assert f"CL_EXT_URL=https://open-vsx.org/api/Anthropic/claude-code/{core.EXT_PLATFORM}/{CLAUDE}/file/" in run[run.index("-e", run.index("HOME=/build")) + 1]
     assert ("rm", "-f", "-v", "cl-dist-claude") in dists.calls[:dists.calls.index(run)]     # a leftover goes first
     assert os.listdir(tmp_path / "data" / "dist-staging") == []
     assert said[-1] == f"Claude Code {CLAUDE} is pulled"
@@ -1870,7 +1881,7 @@ def test_a_new_pull_replaces_the_old_tree_and_leaves_the_folders_above_in_place(
     folders = (os.stat(agents.parent).st_ino, os.stat(agents).st_ino)
     core.set_version_pin("CLAUDE_CODE_VERSION", "2.1.400")
     core.software_pull("claude")
-    assert core.pulled("claude")["version"] == "2.1.400" and not (agents / "claude" / "share" / "claude" / "versions" / CLAUDE).exists()
+    assert core.pulled("claude")["version"] == "2.1.400" and not (agents / "claude" / "local" / "share" / "claude" / "versions" / CLAUDE).exists()
     assert (os.stat(agents.parent).st_ino, os.stat(agents).st_ino) == folders
     assert sorted(os.listdir(agents)) == ["claude", "claude.json"] and os.listdir(agents.parent.parent / "dist-staging") == []
 
@@ -1885,8 +1896,8 @@ def test_a_build_that_fails_its_check_three_times_leaves_the_old_distribution(di
     with pytest.raises(core.CoreError, match=f"Claude Code 2.1.400 could not be pulled in 3 attempts: {why}"):
         core.software_pull("claude")
     assert len(dists.runs()) == 3
-    assert core.pulled("claude") == {"version": CLAUDE, "pulled_at": old["pulled_at"]}
-    assert (tmp_path / "data" / "dist" / "agents" / "claude" / "share" / "claude" / "versions" / CLAUDE).is_file()
+    assert core.pulled("claude") == {"version": CLAUDE, "pulled_at": old["pulled_at"], "ext_version": CLAUDE}
+    assert (tmp_path / "data" / "dist" / "agents" / "claude" / "local" / "share" / "claude" / "versions" / CLAUDE).is_file()
     assert os.listdir(tmp_path / "data" / "dist-staging") == [] and dists.calls[-1] == ("rm", "-f", "-v", "cl-dist-claude")
 
 
@@ -1897,7 +1908,7 @@ def test_an_installer_in_the_preload_folder_is_run_in_place_of_the_vendors(dists
     core.software_pull("claude")
     run, = dists.runs()
     assert run[run.index("-v") + 2:run.index("-v") + 4] == ("-v", f"{installer}:/opt/cl-installer:ro")
-    assert run[-3] == 'set -euo pipefail; bash /opt/cl-installer "$@"' and run[-1] == CLAUDE
+    assert run[-3].startswith('set -euo pipefail; bash /opt/cl-installer "$@"; ') and run[-1] == CLAUDE
 
 
 def test_a_second_build_while_one_runs_is_refused_naming_what_is_built(dists, tmp_path):
@@ -1950,11 +1961,12 @@ def test_the_status_words(dists, tmp_path):
 
 
 def test_upstream_is_asked_from_a_throwaway_container_and_its_answer_checked(dists):
-    dists.upstream = {"https://downloads.claude.ai/claude-code-releases/latest": "2.1.400\n",
+    dists.upstream = {"https://downloads.claude.ai/claude-code-releases/latest": "2.1.400\n", core.SOFTWARE["claude"]["ext"]["upstream"]: '{"version": "2.1.401"}',
+
                       "https://github.com/coder/code-server/releases/latest": "https://github.com/coder/code-server/releases/tag/v4.127.0"}
-    assert core.refresh_check("claude") == {"software": "claude", "version": CLAUDE, "upstream": "2.1.400", "newer": True}
+    assert core.refresh_check("claude") == {"software": "claude", "version": CLAUDE, "upstream": "2.1.400", "newer": True, "ext_version": CLAUDE, "ext_upstream": "2.1.401"}
     assert core.editor_refresh_check() == {"software": "code-server", "version": EDITOR, "upstream": "4.127.0", "newer": True}
-    claude, editor = dists.runs()
+    claude, _ext, editor = dists.runs()
     assert claude[:claude.index("cl-sandbox:abc") + 1] == ("run", "--rm", "--network", "cl-build", "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
                                                            "--user", "1000:1000", "--entrypoint", "curl", "cl-sandbox:abc")
     assert claude[claude.index("cl-sandbox:abc") + 1:][:3] == ("-fsSL", "--max-time", "15")
@@ -1979,8 +1991,10 @@ def test_an_answer_from_upstream_that_is_not_a_version_is_refused(dists, softwar
 def test_refresh_raises_the_pin_and_pulls_only_when_upstream_is_newer(dists, tmp_path):
     (tmp_path / "preload" / "upstream").mkdir(parents=True)
     (tmp_path / "preload" / "upstream" / "claude").write_text(CLAUDE + "\n")
+    (tmp_path / "preload" / "upstream" / "claude-ext").write_text(CLAUDE + "\n")
     said = []
-    assert core.agent_refresh(say=said.append) == {"software": "claude", "version": CLAUDE, "upstream": CLAUDE, "newer": False, "bumped": False}
+    assert core.agent_refresh(say=said.append) == {"software": "claude", "version": CLAUDE, "upstream": CLAUDE, "newer": False, "bumped": False,
+                                                   "ext_version": CLAUDE, "ext_upstream": CLAUDE}
     assert said[-1].endswith("nothing to do") and dists.runs() == [] and local_pins(tmp_path) is None
     (tmp_path / "preload" / "upstream" / "claude").write_text("2.1.300\n")                 # older: never down
     assert core.agent_refresh()["bumped"] is False and local_pins(tmp_path) is None
@@ -2000,8 +2014,14 @@ def test_unknown_software_is_refused_by_name():
 
 def preloaded(tmp_path, software, version):
     place = {"claude": "agents/claude", "code-server": "editor"}[software]
-    stand_in(tmp_path / "preload" / "dist" / place, software, version)
-    (tmp_path / "preload" / "dist" / f"{place}.json").write_text(json.dumps({"version": version}))
+    root = tmp_path / "preload" / "dist" / place
+    if software == "claude":   # RS's tree: local/ with the extension in it, the settings beside
+        vsix(stand_in(root / "local", software, version))
+        (root / "claude").mkdir()
+        (root / "claude" / "settings.json").write_text("{}")
+    else:
+        stand_in(root, software, version)
+    (tmp_path / "preload" / "dist" / f"{place}.json").write_text(json.dumps({"version": version, "ext_version": version}))
 
 
 def test_the_keeper_takes_a_preloaded_distribution_and_builds_nothing(dists, tmp_path):
