@@ -518,10 +518,16 @@ class Runner:
             turn.tools[data["id"]] = (tool, stretch["stored"])
         elif kind == "tool_result" and data["id"] in turn.tools:
             tool, stored = turn.tools[data["id"]]
+            if turn.cancel_requested and not data["ok"]:
+                # Ended by Stop: the agent's own words for it are addressed to the model ("The
+                # user doesn't want to proceed…"); the learner is shown it did not finish.
+                data = dict(data, ok=None, output=store.UNFINISHED, unfinished=True)
+                tool["unfinished"] = True
             tool.update(ok=data["ok"], output=data["output"])
             if stored is not None:   # its message was stored already: keep it up to date
                 row = self.db.one("SELECT tools_json FROM messages WHERE id = ?", (stored,))
-                tools = [dict(t, ok=tool["ok"], output=tool["output"]) if t["id"] == tool["id"] else t for t in json.loads(row["tools_json"])]
+                tools = [dict(t, ok=tool["ok"], output=tool["output"], **({"unfinished": True} if tool.get("unfinished") else {}))
+                         if t["id"] == tool["id"] else t for t in json.loads(row["tools_json"])]
                 self.db.execute("UPDATE messages SET tools_json = ? WHERE id = ?", (json.dumps(tools), stored))
         self.emit(turn, kind, data)
 
@@ -621,7 +627,7 @@ class Runner:
             try:
                 # A tool line still without a result when the answer ended never gets one.
                 for tool, _stored in turn.tools.values():
-                    if tool["ok"] is None:
+                    if tool["ok"] is None and not tool.get("unfinished"):
                         tool.update(unfinished=True, output=tool["output"] or store.UNFINISHED)
                         self.emit(turn, "tool_result", {"id": tool["id"], "ok": None, "output": tool["output"], "unfinished": True})
                 self.flush(turn)

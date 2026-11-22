@@ -3686,8 +3686,8 @@ function renderDefaultAgent(note) {
         for (const pane of Object.values(S.panes)) if (pane.kind === "lesson" && !pane.turn) pane.reload();
     });
     box.replaceChildren(h("div", { class: "form" },
-        formRow("Default agent", sel, "Lessons that have not chosen an agent follow this one, also ones already started: " +
-            "the agent then takes the lesson up from its files."),
+        formRow("Default agent", sel, "Lessons that have not started and have not chosen an agent follow this one. A lesson under way " +
+            "stays with the agent that began it, until you choose another in its header."),
         h("p", { class: "note" }, "A project's tutor can only use an agent the project has: pi is added in the project's gear, under Agents, " +
             "and logged in by running pi in its Shell."),
         said));

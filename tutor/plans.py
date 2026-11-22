@@ -137,10 +137,11 @@ def apply_change(db, project, created, modules):
 
 def describe_changes(proposed, approved, dropped=()):
     """How the learner's approved version differs from what was proposed, as sentences for the
-    tutor. Lessons are matched by id, else by title, else by objective; one whose title and
-    objective both changed reads as removed and added. `dropped` is what a change proposed to
-    drop: a lesson of it the learner placed is kept, and an existing lesson the proposal placed
-    that the learner left out is dropped."""
+    tutor, also shown to the learner on the card after "You" (so they name neither reader as
+    "you" otherwise). Lessons are matched by id, else by title, else by objective; one whose
+    title and objective both changed reads as removed and added. `dropped` is what a change
+    proposed to drop: a lesson of it the learner placed is kept, and an existing lesson the
+    proposal placed that the learner left out is dropped."""
     to_drop = {item.get("id") for item in dropped if item.get("id")}
     def flat(modules):
         return [dict(item, module=index, module_title=module["title"]) for index, module in enumerate(modules) for item in module["lessons"]]
@@ -158,7 +159,7 @@ def describe_changes(proposed, approved, dropped=()):
                 break
         if match is None:
             if item.get("id") in to_drop:
-                sentences.append(f"kept the lesson “{item['title']}”, which you proposed to drop, in the module “{item['module_title']}”")
+                sentences.append(f"kept the lesson “{item['title']}”, which the proposal dropped, in the module “{item['module_title']}”")
             else:
                 sentences.append(f"added the lesson “{item['title']}” (objective: {item['objective']})")
             continue
@@ -174,7 +175,7 @@ def describe_changes(proposed, approved, dropped=()):
             sentences.append(f"moved “{item['title']}” to the module “{item['module_title']}”")
     for i, old in enumerate(before):
         if i not in used:
-            sentences.append(f"dropped the lesson “{old['title']}”, which you proposed to keep" if old.get("id")
+            sentences.append(f"dropped the lesson “{old['title']}”, which the proposal kept" if old.get("id")
                              else f"removed the lesson “{old['title']}”")
     if same_shape:
         for old, new in zip(proposed, approved, strict=True):
