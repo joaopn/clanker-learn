@@ -1,4 +1,4 @@
-"""clanker-learn's tutor service: a conversation per lesson, with Claude Code in the sandbox.
+"""clanker-learn's tutor service: a conversation per lesson, with Claude Code or pi in the sandbox.
 
 It runs in the inner container `cl-tutor`, on the front network with no published port, with
 no capability, and listens on its front-network address only (port 7801): the web server
@@ -13,7 +13,7 @@ and its events are stored before they are published, so that a stream that comes
 replays what it missed (sse.py). One running turn per lesson; lessons run side by side, in
 the same project too.
 
-A second listener, on every address, port 7802, is the "learn" tool server for Claude Code in
+A second listener, on every address, port 7802, is the "learn" tool server for the agents in
 the sandboxes (mcp.py): it takes only the token of a running answer, and answers none of the
 routes below, as this one answers none of its.
 
@@ -144,7 +144,15 @@ def lesson_or_404(request):
 
 
 def lesson_view(request, row):
-    return store.lesson_out(row, request.app["runner"].running_run(row["id"]))
+    return dict(store.lesson_out(row, request.app["runner"].running_run(row["id"])), agent_in_effect=store.agent_of(request.app["db"], row))
+
+
+def agent_in(body, key):
+    """An agent's name from a body: claude, pi, or null for the default."""
+    agent = body.get(key)
+    if agent is not None and agent not in store.AGENTS:
+        raise Refusal("validation", f"`{key}` is claude, pi, or null for the default agent.")
+    return agent
 
 
 # --- the routes ------------------------------------------------------------------------------
@@ -176,15 +184,23 @@ async def get_lesson(request):
 
 
 async def edit_lesson(request):
+    """A lesson's title, objective, or agent (`agent`: claude, pi, or null for the default one).
+    The agent is not changed while an answer is being written in the lesson."""
+    db = request.app["db"]
     row = lesson_or_404(request)
     body = await body_of(request)
-    if "title" not in body and "objective" not in body:
-        raise Refusal("validation", "Give a `title`, an `objective`, or both.")
+    if not {"title", "objective", "agent"} & set(body):
+        raise Refusal("validation", "Give a `title`, an `objective`, an `agent`, or more than one.")
     if row["kind"] == "goals" and "title" in body:
         raise Refusal("validation", "Goals keeps its name.")
     title = title_of(body) if "title" in body else None
     objective = objective_of(body) if "objective" in body else None
-    return ok(lesson_view(request, store.edit_lesson(request.app["db"], row["id"], title, objective)))
+    if "agent" in body:
+        agent = agent_in(body, "agent")
+        if request.app["runner"].running_run(row["id"]):
+            raise Refusal("busy", "The tutor is writing an answer in this lesson: switch agents once it is done, or stop it.")
+        store.set_lesson_agent(db, row["id"], agent)
+    return ok(lesson_view(request, store.edit_lesson(db, row["id"], title, objective)))
 
 
 async def delete_lesson(request):
@@ -297,19 +313,35 @@ async def activity(request):
     return ok({"running": request.app["runner"].activity()})
 
 
-async def get_settings(_request):
-    return ok({"claude_token_set": bool(turn.read_token())})
+def settings_out(db):
+    return {"claude_token_set": bool(turn.read_token()), "default_agent": store.default_agent(db)}
+
+
+async def get_settings(request):
+    return ok(settings_out(request.app["db"]))
 
 
 async def put_settings(request):
-    token = (await body_of(request)).get("claude_token")
-    if not isinstance(token, str):
-        raise Refusal("validation", "`claude_token` must be a string (empty removes it).")
-    token = token.strip()
-    if token and not TOKEN.fullmatch(token):
-        raise Refusal("validation", "That is not a token: it is one word of printable characters, as `claude setup-token` gives it.")
-    turn.write_token(token)
-    return ok({"claude_token_set": bool(token)})
+    """The Claude token (`claude_token`; empty removes it) and the default agent
+    (`default_agent`: claude, pi, or null for claude), either or both."""
+    db = request.app["db"]
+    body = await body_of(request)
+    if "claude_token" not in body and "default_agent" not in body:
+        raise Refusal("validation", "Give a `claude_token`, a `default_agent`, or both.")
+    token = None
+    if "claude_token" in body:
+        token = body["claude_token"]
+        if not isinstance(token, str):
+            raise Refusal("validation", "`claude_token` must be a string (empty removes it).")
+        token = token.strip()
+        if token and not TOKEN.fullmatch(token):
+            raise Refusal("validation", "That is not a token: it is one word of printable characters, as `claude setup-token` gives it.")
+    agent = agent_in(body, "default_agent") if "default_agent" in body else None
+    if token is not None:
+        turn.write_token(token)
+    if "default_agent" in body:
+        store.set_setting(db, "default_agent", agent)
+    return ok(settings_out(db))
 
 
 # --- the knowledge base, for the Knowledge page (knowledge.py) ---------------------------------

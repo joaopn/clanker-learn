@@ -222,10 +222,11 @@ def plan_lines(db, row):
     return lines
 
 
-def opening_context(db, row, fresh_reason=None, earlier=0):
+def opening_context(db, row, fresh_reason=None, earlier=0, taught_by=None):
     """The first message of a new session carries this before the learner's text. With
-    `fresh_reason`, the session replaces one the tutor no longer has: it is told which turns it
-    did not see, and where to read them."""
+    `fresh_reason`, the session replaces one the tutor no longer has, or takes the lesson up
+    from the other agent (`taught_by`, its name): it is told which turns it did not see, and
+    where to read them."""
     folder = store.folder_of(row)
     if row["kind"] == "goals":
         parts = [(f"[clanker-learn: this is the Goals conversation of the project “{row['project']}”, where the learner and you agree on what "
@@ -252,12 +253,28 @@ def opening_context(db, row, fresh_reason=None, earlier=0):
     # another project's insights never enter it.
     parts.append(knowledge.brief(db)[0])
     parts.append(knowledge.project_insights_text(db, row["project"], row["created"]))
-    if fresh_reason:
+    if fresh_reason and taught_by:
+        parts.append(f"You are taking this conversation up afresh ({fresh_reason}): the learner's messages 1 to {earlier} here, and the "
+                     f"answers {taught_by} gave them, are not in this session of yours. Before you answer, read "
+                     f"{folder}/transcript.md (the whole conversation so far) and {folder}/notes.md (the notes kept on it, if any), and "
+                     "say in a sentence that you took the lesson up from its files.")
+    elif fresh_reason:
         parts.append(f"You are taking this conversation up afresh ({fresh_reason}): the learner's messages 1 to {earlier} here, and your "
                      "answers to them, were in an earlier session of yours that you do not have. Before you answer, read "
                      f"{folder}/transcript.md (the whole conversation so far) and {folder}/notes.md (your notes, if you kept them), and "
                      "say in a sentence that you took the lesson up from its files.")
     return "\n\n".join(parts) + "]"
+
+
+def missed_note(row, first, last, who):
+    """Before the learner's text, for a session resumed after turns the other agent answered."""
+    folder = store.folder_of(row)
+    one = first == last
+    which, verb, them = (f"message {first}", "was", "it") if one else (f"messages {first} to {last}", "were", "them")
+    by = f"{verb} answered by {who}, another tutor, in a session of its own" if who else "did not reach this session of yours"
+    return (f"[clanker-learn: while you were away from this lesson, the learner's {which} here {by}: you have not seen {them}. "
+            f"Before you answer, read {them} in {folder}/transcript.md (the whole conversation) and {folder}/notes.md, and go on "
+            "from where the lesson stands now.]")
 
 
 # --- a lesson's transcript ---------------------------------------------------------------------
@@ -291,8 +308,15 @@ def transcript(db, row):
     if row["summary"]:
         lines += ["", f"Summary at its close: {row['summary']}"]
     lines += ["", "*Written by clanker-learn after every answer, from its own record: an edit here is overwritten.*", ""]
+    number = 0
     for m in store.messages(db, row["id"]):
-        who = "The tutor" if m["role"] != "user" else "The learner (a card's answer, written by clanker-learn)" if m.get("composed") else "The learner"
+        # Which agent wrote an answer (a lesson can change hands, and the one taking it up reads
+        # this), and the learner's messages numbered as the notes to a tutor count them.
+        if m["role"] != "user":
+            who = f"The tutor ({store.AGENT_NAMES.get(m.get('agent'), 'Claude Code')})"
+        else:
+            number += 1
+            who = f"The learner, message {number}" + (" (a card's answer, written by clanker-learn)" if m.get("composed") else "")
         lines += [f"## {who} · {m['created_at'][:16].replace('T', ' ')}", ""]
         if m["text"].strip():
             lines += [m["text"].strip(), ""]

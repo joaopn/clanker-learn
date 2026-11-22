@@ -1,5 +1,6 @@
-"""The tutor service's store: one SQLite file, its lessons, plans, messages, runs, events,
-proposals, cards, the audit of the "learn" tools, and the tutor's instructions. The knowledge
+"""The tutor service's store: one SQLite file, its lessons (with their agent and their sessions,
+one per agent), plans, messages, runs, events, proposals, cards, the audit of the "learn"
+tools, the tutor's instructions and the service's settings (the default agent). The knowledge
 base lives in the same file; its functions are in knowledge.py.
 
 Lifted from gaggiclanker (the maintainer's project, AGPL like this one): the connection and its
@@ -19,7 +20,7 @@ import sqlite3
 import unicodedata
 import uuid
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 SCHEMA_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "schema.sql")
 NOW = "strftime('%Y-%m-%dT%H:%M:%fZ','now')"
 LESSONS_DIR = "/workspace/.learn/lessons"
@@ -143,7 +144,38 @@ CREATE INDEX cards_of_lesson ON cards (lesson_id, id);
 PRAGMA user_version = 3;
 COMMIT;
 """
-MIGRATIONS = {1: MIGRATE_1_TO_2, 2: MIGRATE_2_TO_3}
+# Version 3 (step 4) to 4 (step 6, two agents): a lesson's agent (NULL for the default one), its
+# sessions kept per agent (the one Claude Code session a lesson had is carried over, as having
+# seen every message of the lesson so far), the agent that answered each run, and the service's
+# settings (the default agent).
+MIGRATE_3_TO_4 = """
+BEGIN;
+ALTER TABLE lessons ADD COLUMN agent TEXT;
+ALTER TABLE runs ADD COLUMN agent TEXT NOT NULL DEFAULT 'claude';
+CREATE TABLE sessions (
+    lesson_id    INTEGER NOT NULL REFERENCES lessons (id) ON DELETE CASCADE,
+    agent        TEXT NOT NULL,
+    session_id   TEXT NOT NULL,
+    started      INTEGER NOT NULL DEFAULT 0,
+    text_hash    TEXT NOT NULL DEFAULT '',
+    seen_message INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (lesson_id, agent)
+);
+INSERT INTO sessions (lesson_id, agent, session_id, started, text_hash, seen_message)
+    SELECT id, 'claude', session_id, session_started, session_text,
+           CASE WHEN session_started THEN coalesce((SELECT max(messages.id) FROM messages WHERE messages.lesson_id = lessons.id AND role = 'user'), 0) ELSE 0 END
+    FROM lessons;
+ALTER TABLE lessons DROP COLUMN session_id;
+ALTER TABLE lessons DROP COLUMN session_started;
+ALTER TABLE lessons DROP COLUMN session_text;
+CREATE TABLE settings (name TEXT PRIMARY KEY, value TEXT NOT NULL);
+PRAGMA user_version = 4;
+COMMIT;
+"""
+MIGRATIONS = {1: MIGRATE_1_TO_2, 2: MIGRATE_2_TO_3, 3: MIGRATE_3_TO_4}
+AGENTS = ("claude", "pi")
+AGENT_NAMES = {"claude": "Claude Code", "pi": "pi"}
+DEFAULT_AGENT = "claude"
 
 # As gaggiclanker has them: WAL so that a reader never waits for the writer; foreign keys,
 # which SQLite leaves off per connection and the schema's ON DELETE CASCADE needs (a lesson
@@ -245,7 +277,7 @@ def lesson_out(row, running=None):
             "project_removed": bool(row["project_removed"]),
             "objective": row["objective"], "module": row["module_id"], "position": row["position"], "state": row["state"],
             "summary": row["summary"], "one_line": row["one_line"], "closed_at": row["closed_at"], "folder": folder_of(row),
-            "created_at": row["created_at"], "updated_at": row["updated_at"], "running": running}
+            "agent": row["agent"], "created_at": row["created_at"], "updated_at": row["updated_at"], "running": running}
 
 
 ORDER = "ORDER BY kind = 'goals' DESC, position, id"
@@ -265,8 +297,8 @@ def lesson(db, lesson_id):
 def ensure_goals(db, project, created):
     row = db.one("SELECT * FROM lessons WHERE project = ? AND created = ? AND kind = 'goals'", (project, created))
     if row is None:
-        cursor = db.execute("INSERT INTO lessons (project, created, title, kind, state, slug, session_id) VALUES (?, ?, ?, 'goals', 'not_started', 'goals', ?)",
-                            (project, created, GOALS_TITLE, str(uuid.uuid4())))
+        cursor = db.execute("INSERT INTO lessons (project, created, title, kind, state, slug) VALUES (?, ?, ?, 'goals', 'not_started', 'goals')",
+                            (project, created, GOALS_TITLE))
         row = lesson(db, cursor.lastrowid)
     return row
 
@@ -280,9 +312,9 @@ def add_lesson(db, project, created, title, objective="", module_id=None, positi
     if position is None:
         position = next_position(db, project, created)
     # The state is given: a file brought from version 1 keeps that version's default ('open').
-    cursor = db.execute("INSERT INTO lessons (project, created, title, objective, module_id, position, state, slug, session_id) "
-                        "VALUES (?, ?, ?, ?, ?, ?, 'not_started', ?, ?)",
-                        (project, created, title, objective, module_id, position, slug_of(title), str(uuid.uuid4())))
+    cursor = db.execute("INSERT INTO lessons (project, created, title, objective, module_id, position, state, slug) "
+                        "VALUES (?, ?, ?, ?, ?, ?, 'not_started', ?)",
+                        (project, created, title, objective, module_id, position, slug_of(title)))
     return lesson(db, cursor.lastrowid)
 
 
@@ -316,10 +348,59 @@ def has_messages(db, lesson_id):
     return db.one("SELECT 1 FROM messages WHERE lesson_id = ? LIMIT 1", (lesson_id,)) is not None
 
 
-def set_session(db, lesson_id, session_id, started, text_hash=None):
-    db.execute("UPDATE lessons SET session_id = ?, session_started = ? WHERE id = ?", (session_id, 1 if started else 0, lesson_id))
+def set_lesson_agent(db, lesson_id, agent):
+    db.execute(f"UPDATE lessons SET agent = ?, updated_at = {NOW} WHERE id = ?", (agent, lesson_id))
+    return lesson(db, lesson_id)
+
+
+# --- a lesson's sessions, one per agent --------------------------------------------------------
+# `started`: a turn of that agent made it; `text_hash`: the instructions it was made with;
+# `seen_message`: the id of the last learner's message that session saw (the turns after it,
+# answered by the other agent, are the ones it missed).
+
+def session(db, lesson_id, agent):
+    """The lesson's session of `agent`, made (not started) the first time it is asked for."""
+    row = db.one("SELECT * FROM sessions WHERE lesson_id = ? AND agent = ?", (lesson_id, agent))
+    if row is None:
+        db.execute("INSERT INTO sessions (lesson_id, agent, session_id) VALUES (?, ?, ?)", (lesson_id, agent, str(uuid.uuid4())))
+        row = db.one("SELECT * FROM sessions WHERE lesson_id = ? AND agent = ?", (lesson_id, agent))
+    return row
+
+
+def set_session(db, lesson_id, agent, session_id, started, text_hash=None, seen_message=None):
+    session(db, lesson_id, agent)
+    db.execute("UPDATE sessions SET session_id = ?, started = ? WHERE lesson_id = ? AND agent = ?",
+               (session_id, 1 if started else 0, lesson_id, agent))
+    if not started:
+        db.execute("UPDATE sessions SET seen_message = 0 WHERE lesson_id = ? AND agent = ?", (lesson_id, agent))
     if text_hash is not None:
-        db.execute("UPDATE lessons SET session_text = ? WHERE id = ?", (text_hash, lesson_id))
+        db.execute("UPDATE sessions SET text_hash = ? WHERE lesson_id = ? AND agent = ?", (text_hash, lesson_id, agent))
+    if seen_message is not None:
+        db.execute("UPDATE sessions SET seen_message = ? WHERE lesson_id = ? AND agent = ?", (seen_message, lesson_id, agent))
+
+
+# --- the service's settings ---------------------------------------------------------------------
+
+def setting(db, name, default=None):
+    row = db.one("SELECT value FROM settings WHERE name = ?", (name,))
+    return row["value"] if row else default
+
+
+def set_setting(db, name, value):
+    if value is None:
+        db.execute("DELETE FROM settings WHERE name = ?", (name,))
+    else:
+        db.execute("INSERT INTO settings (name, value) VALUES (?, ?) ON CONFLICT (name) DO UPDATE SET value = excluded.value", (name, value))
+
+
+def default_agent(db):
+    agent = setting(db, "default_agent")
+    return agent if agent in AGENTS else DEFAULT_AGENT
+
+
+def agent_of(db, row):
+    """The agent that teaches a lesson: its own choice, else the default one."""
+    return row["agent"] if row["agent"] in AGENTS else default_agent(db)
 
 
 def done_lessons(db, project, created):
@@ -414,9 +495,14 @@ def link_proposals(db, proposal_ids, message_id):
 
 # --- messages -------------------------------------------------------------------------------
 
+# A message with the agent of its run: the one that wrote an assistant's message.
+MESSAGE_ROWS = "SELECT messages.*, runs.agent AS agent FROM messages LEFT JOIN runs ON runs.id = messages.run_id"
+
+
 def message_out(row, proposals=(), cards=()):
     out = {"id": row["id"], "role": row["role"], "text": row["text"], "run_id": row["run_id"], "created_at": row["created_at"]}
     if row["role"] == "assistant":
+        out["agent"] = row["agent"]
         out["tools"] = json.loads(row["tools_json"] or "[]")
         out["proposals"] = [proposal_out(p) for p in proposals]
         out["cards"] = [card_out(c) for c in cards]
@@ -433,11 +519,11 @@ def messages(db, lesson_id):
     for row in db.all("SELECT * FROM cards WHERE lesson_id = ? AND message_id IS NOT NULL ORDER BY id", (lesson_id,)):
         cards_of.setdefault(row["message_id"], []).append(row)
     return [message_out(row, by_message.get(row["id"], ()), cards_of.get(row["id"], ()))
-            for row in db.all("SELECT * FROM messages WHERE lesson_id = ? ORDER BY id", (lesson_id,))]
+            for row in db.all(f"{MESSAGE_ROWS} WHERE messages.lesson_id = ? ORDER BY messages.id", (lesson_id,))]
 
 
 def message(db, message_id):
-    return message_out(db.one("SELECT * FROM messages WHERE id = ?", (message_id,)),
+    return message_out(db.one(f"{MESSAGE_ROWS} WHERE messages.id = ?", (message_id,)),
                        db.all("SELECT * FROM proposals WHERE message_id = ? ORDER BY id", (message_id,)),
                        db.all("SELECT * FROM cards WHERE message_id = ? ORDER BY id", (message_id,)))
 
@@ -504,7 +590,7 @@ def set_context(db, message_id, context):
 # --- runs (gaggiclanker's ChatRunsRepository) -------------------------------------------------
 
 def run_out(row):
-    return {"id": row["id"], "lesson_id": row["lesson_id"], "status": row["status"], "error": row["error"],
+    return {"id": row["id"], "lesson_id": row["lesson_id"], "agent": row["agent"], "status": row["status"], "error": row["error"],
             "started_at": row["started_at"], "finished_at": row["finished_at"]}
 
 
@@ -512,8 +598,8 @@ def run(db, run_id):
     return db.one("SELECT * FROM runs WHERE id = ?", (run_id,))
 
 
-def start_run(db, lesson_id):
-    cursor = db.execute("INSERT INTO runs (lesson_id) VALUES (?)", (lesson_id,))
+def start_run(db, lesson_id, agent):
+    cursor = db.execute("INSERT INTO runs (lesson_id, agent) VALUES (?, ?)", (lesson_id, agent))
     return run(db, cursor.lastrowid)
 
 
@@ -532,9 +618,9 @@ def latest_usage(db, lesson_id):
 def ended_runs(db, lesson_id):
     """The runs of a lesson that did not end well (stopped, failed, interrupted), for the
     conversation to say so where they stand."""
-    rows = db.all("SELECT id, status, error FROM runs WHERE lesson_id = ? AND status IN ('cancelled', 'failed', 'interrupted') ORDER BY id",
+    rows = db.all("SELECT id, agent, status, error FROM runs WHERE lesson_id = ? AND status IN ('cancelled', 'failed', 'interrupted') ORDER BY id",
                   (lesson_id,))
-    return [{"id": row["id"], "status": row["status"], "error": row["error"]} for row in rows]
+    return [{"id": row["id"], "agent": row["agent"], "status": row["status"], "error": row["error"]} for row in rows]
 
 
 INTERRUPTED = "The tutor service restarted while this answer was being written."

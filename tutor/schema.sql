@@ -1,5 +1,5 @@
--- The tutor service's database: one file, /data/tutor/tutor.db, at user_version 3. A file at
--- version 1 or 2 is brought to 3 in place at start (store.MIGRATIONS); any other version is
+-- The tutor service's database: one file, /data/tutor/tutor.db, at user_version 4. A file at
+-- version 1, 2 or 3 is brought to 4 in place at start (store.MIGRATIONS); any other version is
 -- refused.
 
 -- A lesson belongs to a project as the pair (name, created): a new project with an old name
@@ -8,9 +8,8 @@
 -- not_started until it has a message, then in_progress; done once a tutor closed it (with its
 -- summary and one line); dropped when a change of plan took it out after it was started.
 -- `slug` is fixed at creation: it names the lesson's folder in the workspace, which a rename
--- must not move. Its Claude Code session is one per lesson; `session_started` says whether a
--- turn has made it, `session_text` the hash of the instructions it was made with (a session
--- made with other instructions is replaced by a fresh one, taken up from the lesson's files).
+-- must not move. `agent` is the agent that teaches it (claude or pi), NULL for the default one
+-- (the setting `default_agent`); its sessions are in `sessions`, one per agent.
 CREATE TABLE lessons (
     id              INTEGER PRIMARY KEY,
     project         TEXT NOT NULL,
@@ -25,10 +24,8 @@ CREATE TABLE lessons (
     one_line        TEXT NOT NULL DEFAULT '',
     closed_at       TEXT,
     slug            TEXT NOT NULL DEFAULT '',
-    session_id      TEXT NOT NULL,
-    session_started INTEGER NOT NULL DEFAULT 0,
-    session_text    TEXT NOT NULL DEFAULT '',
     project_removed INTEGER NOT NULL DEFAULT 0,
+    agent           TEXT,
     created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
@@ -45,13 +42,30 @@ CREATE TABLE modules (
 );
 CREATE INDEX modules_of_project ON modules (project, created);
 
--- One turn: the learner's message and what the tutor did with it.
+-- A lesson's session of one agent (Claude Code's or pi's own memory of the conversation, a
+-- cache: the lesson's files are the truth). `started` says whether a turn has made it,
+-- `text_hash` the hash of the instructions it was made with (a session made with other
+-- instructions is replaced by a fresh one, taken up from the lesson's files), `seen_message`
+-- the id of the last learner's message it saw: the turns after it were answered by the other
+-- agent, and it is told of them when it takes the lesson back.
+CREATE TABLE sessions (
+    lesson_id    INTEGER NOT NULL REFERENCES lessons (id) ON DELETE CASCADE,
+    agent        TEXT NOT NULL,
+    session_id   TEXT NOT NULL,
+    started      INTEGER NOT NULL DEFAULT 0,
+    text_hash    TEXT NOT NULL DEFAULT '',
+    seen_message INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (lesson_id, agent)
+);
+
+-- One turn: the learner's message and what the tutor did with it; `agent` answered it.
 CREATE TABLE runs (
     id          INTEGER PRIMARY KEY,
     lesson_id   INTEGER NOT NULL REFERENCES lessons (id) ON DELETE CASCADE,
     status      TEXT NOT NULL DEFAULT 'running',
     error       TEXT NOT NULL DEFAULT '',
     usage_json  TEXT,
+    agent       TEXT NOT NULL DEFAULT 'claude',
     started_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     finished_at TEXT
 );
@@ -225,4 +239,10 @@ CREATE TABLE cards (
 );
 CREATE INDEX cards_of_lesson ON cards (lesson_id, id);
 
-PRAGMA user_version = 3;
+-- The service's settings, by name: `default_agent` (claude or pi; claude when it is not set).
+CREATE TABLE settings (
+    name  TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
+PRAGMA user_version = 4;

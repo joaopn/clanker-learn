@@ -1,31 +1,34 @@
-"""A turn: the learner's message to the project's Claude Code, in its sandbox, over SSH.
+"""A turn: the learner's message to the project's agent, Claude Code or pi, in its sandbox, over SSH.
 
-As step 0's spike drove it (its drive.py: the launch over SSH, stream-json in and out, the
-session created then resumed, the interrupt as a control message, the run's processes found
-by a tag in their environment and ended as root), with gaggiclanker's reader of the stream
-(claude_stream.py).
+As step 0's spike drove both (its drive.py: the launch over SSH, the session created then
+resumed, the interrupt, the run's processes found by a tag in their environment and ended as
+root), with gaggiclanker's reader of Claude Code's stream (claude_stream.py) and a reader of
+pi's (pi_stream.py). What differs between the two agents is in agents.py; the rest is here.
 
 The service starts `ssh` as a child, with the project's key and known_hosts, to
-learner@cl-sb-<project>, which runs Claude Code in /workspace with the tutor's text appended
-to its system prompt. One Claude Code session per lesson: `--session-id` at its first turn,
-`--resume` afterwards. No model is named: the project's own settings decide, and its own login
-is used unless a token is set in Settings. The token reaches the turn only through the
-environment (sent over SSH as CL_CLAUDE_TOKEN, exported as CLAUDE_CODE_OAUTH_TOKEN by the remote
-command before it becomes Claude Code): never on a command line, in a log or in an event.
-CL_RUN_ID, the run's id, is in the environment of Claude Code and of every command it runs:
-Stop and the clean-up at start end exactly the processes that carry it, and never those of
-another lesson's turn in the same sandbox.
+learner@cl-sb-<project>, which runs the lesson's agent in /workspace with the tutor's text
+appended to its system prompt. One session per lesson and agent: made at that agent's first
+turn of the lesson, resumed afterwards. No model is named: the project's own settings of that
+agent decide, and its own login is used (for Claude Code, unless a token is set in Settings).
+The token reaches the turn only through the environment (sent over SSH as CL_CLAUDE_TOKEN,
+exported as CLAUDE_CODE_OAUTH_TOKEN by the remote command before it becomes Claude Code):
+never on a command line, in a log or in an event. CL_RUN_ID, the run's id, is in the
+environment of the agent and of every command it runs: Stop and the clean-up at start end
+exactly the processes that carry it, and never those of another lesson's turn in the same
+sandbox.
 
-The tutor's text is the one in force in the database (an editable copy of tutor.md). Claude
-Code gets one tool server, "learn" (mcp.py), with --strict-mcp-config; the run's token for it
-goes over SSH as CL_RUN_TOKEN and dies with the run. The first message of a new session
-carries the lesson's opening context before the learner's text (plans.opening_context), stored
-apart from it; a session that is gone, or was made with other instructions, is replaced by a
-fresh one told to take the lesson up from its files, transcript.md (written here after every
-answer) and notes.md (kept by the tutor).
+The tutor's text is the one in force in the database (an editable copy of tutor.md), the same
+for both agents. Each gets one tool server, "learn" (mcp.py); the run's token for it goes over
+SSH as CL_RUN_TOKEN and dies with the run. The first message of a new session carries the
+lesson's opening context before the learner's text (plans.opening_context), stored apart from
+it; a session that is gone, was made with other instructions, or is the first of an agent
+taking up a lesson the other one taught, is a fresh one told to take the lesson up from its
+files, transcript.md (written here after every answer) and notes.md (kept by the tutor). An
+agent whose session is current but missed turns the other agent answered resumes it, told
+which turns it missed and where they are (plans.missed_note).
 
 An exercise's check (run_check) is run by the service over its own SSH channel, not through
-Claude Code: as the sandbox user, in /workspace, with no credential sent, for at most CHECK_S,
+the agent: as the sandbox user, in /workspace, with no credential sent, for at most CHECK_S,
 tagged CL_CHECK_ID (its time limit and Stop end it by that tag) and, during a turn, CL_RUN_ID.
 """
 import asyncio
@@ -37,12 +40,13 @@ import secrets
 import shlex
 import uuid
 
+import agents
 import cards
 import knowledge
 import mcp
 import plans
 import store
-from claude_stream import StreamReader
+from agents import START_PROJECT, UNREACHABLE
 
 log = logging.getLogger("tutor")
 
@@ -51,31 +55,21 @@ KEYS = f"{DATA}/keys"
 TOKEN_FILE = f"{DATA}/claude_token"
 TUTOR_TEXT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tutor.md")
 USER = "learner"
-MCP_URL = f"http://cl-tutor:{mcp.PORT}/mcp"
-# The one tool server a turn gets. Claude Code expands ${CL_RUN_TOKEN} from its environment,
-# where it came over SSH: the token is never on a command line.
-MCP_CONFIG = json.dumps({"mcpServers": {"learn": {"type": "http", "url": MCP_URL, "headers": {"Authorization": "Bearer ${CL_RUN_TOKEN}"}}}})
 TRANSCRIPT_S = 30
 IDLE_S = 30 * 60           # no overall limit (installing software takes long), but a line every half hour
 STOP_GRACE_S = 5           # after the interrupt, before the run's processes are ended as root
-END_S = 15                 # after the result, for Claude Code to end once its input is closed
+END_S = 15                 # after the end of the answer, for the agent to end once its input is closed
 CLEANUP_S = 30
 CHECK_S = 30               # an exercise's check command, before it is ended
 CHECK_KEEP = 4000          # of a check's output, the end of it, what is stored
 LINE_LIMIT = 16 * 1024 * 1024   # a whole file read by a tool comes back on one line
 STDERR_KEEP = 4096
 
-START_PROJECT = "Start the project first."
-NO_CLAUDE = "This project has no Claude Code: add it in the project's gear, under Agents."
-NOT_LOGGED_IN = "Claude Code is not logged in in this project: run claude in its Shell and log in there, or set a token under Settings → Tutor."
 SESSION_GONE_NOTE = ("*The tutor's earlier turns of this lesson are gone from the project, so it starts this one afresh "
                      "and takes the lesson up from its files.*\n\n")
 SESSION_GONE = "your earlier session of it is gone from the project"
 TEXT_CHANGED = "the tutor's instructions changed since your earlier session of it"
-UNREACHABLE = ("Could not resolve hostname", "Name or service not known", "Temporary failure in name resolution", "Connection refused",
-               "No route to host", "timed out", "Connection closed by", "Connection reset")
-LOGIN_SIGNS = ("/login", "not logged in", "invalid api key", "oauth token", "authentication_error", "invalid bearer token",
-               "credit balance", "please log in")
+TAKEN_OVER = "until now another agent taught this lesson"
 
 # The run's processes, found as the sandbox user and ended as root. Root in a sandbox has no
 # CAP_SYS_PTRACE, so it cannot read the environment of the learner's processes, while the
@@ -149,18 +143,6 @@ def ssh_argv(project, send=()):
     for name in send:
         argv += ["-o", f"SendEnv={name}"]
     return [*argv, f"{USER}@cl-sb-{project}"]
-
-
-def claude_command(session_id, resume, text):
-    flags = ["claude", "--print", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
-             "--include-partial-messages", "--permission-mode", "bypassPermissions", "--append-system-prompt", text,
-             "--mcp-config", MCP_CONFIG, "--strict-mcp-config",
-             "--resume" if resume else "--session-id", session_id]
-    # The token, when one came, becomes Claude Code's here, in the environment only. Without
-    # ENABLE_TOOL_SEARCH=false Claude Code hides a server's tools behind its tool search, and
-    # the model is never told they exist (step 0's spike).
-    return ('cd /workspace && if [ -n "${CL_CLAUDE_TOKEN:-}" ]; then export CLAUDE_CODE_OAUTH_TOKEN="$CL_CLAUDE_TOKEN"; fi; '
-            "unset CL_CLAUDE_TOKEN; export ENABLE_TOOL_SEARCH=false; exec " + " ".join(shlex.quote(part) for part in flags))
 
 
 async def kill_tagged(project, run_id, tag=None):
@@ -255,9 +237,11 @@ async def run_check(project, command, run_id=None, check_id=None):
 class Turn:
     """What the service holds of a running turn."""
 
-    def __init__(self, lesson, run_id, token, text):
+    def __init__(self, lesson, run_id, token, text, agent):
         self.lesson_id, self.project, self.created = lesson["id"], lesson["project"], lesson["created"]
         self.kind = lesson["kind"]
+        self.agent = agent          # "claude" or "pi": the one answering
+        self.adapter = agents.ADAPTERS[agent]
         self.run_id = run_id
         self.token = token          # the "learn" tools' bearer token of this run, alive while it runs
         self.text = text            # the instructions in force when it started
@@ -265,8 +249,10 @@ class Turn:
         self.message_id = None      # the learner's message
         self.notes = []             # the outcomes of proposals it is told, before the learner's text
         self.fresh = None           # why its session is a fresh one taken up from the files, if it is
+        self.missed = None          # the learner's messages its resumed session did not see: (first, last, who answered)
         self.seq = 0
         self.proc = None
+        self.reader = None          # the reader of the agent's output, while it runs
         self.cancel_requested = False
         self.done = asyncio.Event()
         self.stretch = {"text": [], "tools": [], "proposals": [], "cards": []}   # the assistant's message being written
@@ -299,7 +285,8 @@ class Runner:
         return [dict(event, run_id=run_id) for event in store.events_since(self.db, run_id, after)]
 
     def activity(self):
-        return [{"project": t.project, "created": t.created, "lesson_id": t.lesson_id, "run_id": t.run_id} for t in self.by_lesson.values()]
+        return [{"project": t.project, "created": t.created, "lesson_id": t.lesson_id, "run_id": t.run_id, "agent": t.agent}
+                for t in self.by_lesson.values()]
 
     def start(self, lesson, text, composed=False):
         """The learner's message stored and its turn started, or None when a turn of this
@@ -309,17 +296,20 @@ class Runner:
             return None
         db = self.db
         instructions = store.instructions(db)["text"]
-        fresh = None
-        if lesson["session_started"] and lesson["session_text"] and lesson["session_text"] != store.text_hash(instructions):
-            # The session was made with other instructions, which Claude Code keeps as it first
+        agent = store.agent_of(db, lesson)
+        session = store.session(db, lesson["id"], agent)
+        fresh = missed = None
+        if session["started"] and session["text_hash"] and session["text_hash"] != store.text_hash(instructions):
+            # The session was made with other instructions, which the agent keeps as it first
             # had them: a new one, taken up from the lesson's files.
             fresh = TEXT_CHANGED
-            store.set_session(db, lesson["id"], str(uuid.uuid4()), False)
-            lesson = store.lesson(db, lesson["id"])
-        run = store.start_run(db, lesson["id"])
+            store.set_session(db, lesson["id"], agent, str(uuid.uuid4()), False)
+        elif session["started"]:
+            missed = self.missed(lesson["id"], agent, session["seen_message"])
+        run = store.start_run(db, lesson["id"], agent)
         token = secrets.token_urlsafe(32)
-        turn = Turn(lesson, run["id"], token, instructions)
-        turn.fresh = fresh
+        turn = Turn(lesson, run["id"], token, instructions, agent)
+        turn.fresh, turn.missed = fresh, missed
         # What the learner decided or did since the last message, outside the conversation: the
         # proposals, the global insights proposed here, the cards they answered or checked.
         outcomes = store.untold_outcomes(db, lesson["id"])
@@ -338,15 +328,38 @@ class Runner:
         self.tasks.spawn(f"run-{run['id']}", self._turn(turn, text))
         return store.run_out(run), store.message(db, turn.message_id)
 
+    def missed(self, lesson_id, agent, seen_message):
+        """The learner's messages after `seen_message` (the last one this agent's session saw),
+        as (first, last, the agents that answered them), numbered as the conversation counts
+        them; None when it missed none."""
+        rows = self.db.all("SELECT messages.id, runs.agent FROM messages LEFT JOIN runs ON runs.id = messages.run_id "
+                           "WHERE messages.lesson_id = ? AND messages.role = 'user' ORDER BY messages.id", (lesson_id,))
+        after = [(number, row["agent"]) for number, row in enumerate(rows, 1) if row["id"] > seen_message]
+        if not after:
+            return None
+        who = sorted({a for _n, a in after if a and a != agent})
+        return after[0][0], after[-1][0], " and ".join(store.AGENT_NAMES.get(a, a) for a in who) or None
+
     def context(self, turn, lesson):
         """What goes before the learner's text: the opening context on a new session (naming the
-        files and the turns it did not see, when it replaces one), the outcomes of proposals."""
+        files and the turns it did not see, when it replaces one or takes the lesson up from
+        the other agent), a note of the turns a resumed session missed, the outcomes of proposals."""
         parts = []
-        if not lesson["session_started"]:
-            earlier = self.db.one("SELECT count(*) FROM messages WHERE lesson_id = ? AND role = 'user' AND id < ?",
-                                  (lesson["id"], turn.message_id or 1 << 62))[0]
-            parts.append(plans.opening_context(self.db, lesson, turn.fresh, earlier) if turn.fresh or not earlier
-                         else plans.opening_context(self.db, lesson, "your earlier session of it did not start", earlier))
+        session = store.session(self.db, lesson["id"], turn.agent)
+        if not session["started"]:
+            earlier = self.db.all("SELECT runs.agent FROM messages LEFT JOIN runs ON runs.id = messages.run_id "
+                                  "WHERE messages.lesson_id = ? AND messages.role = 'user' AND messages.id < ?",
+                                  (lesson["id"], turn.message_id or 1 << 62))
+            others = sorted({row["agent"] for row in earlier if row["agent"] and row["agent"] != turn.agent})
+            taught_by = " and ".join(store.AGENT_NAMES.get(a, a) for a in others) or None
+            if turn.fresh or not earlier:
+                parts.append(plans.opening_context(self.db, lesson, turn.fresh, len(earlier), taught_by))
+            elif taught_by:
+                parts.append(plans.opening_context(self.db, lesson, TAKEN_OVER, len(earlier), taught_by))
+            else:
+                parts.append(plans.opening_context(self.db, lesson, "your earlier session of it did not start", len(earlier)))
+        elif turn.missed:
+            parts.append(plans.missed_note(lesson, *turn.missed))
         return "\n\n".join(parts + turn.notes)
 
     async def write_transcript(self, lesson_id):
@@ -394,8 +407,11 @@ class Runner:
         turn = self.by_run.get(run_id)
         if turn is not None and not turn.cancel_requested:
             turn.cancel_requested = True
-            # Claude Code's own interrupt first; it ends the turn with a result line.
-            await self._write(turn, {"type": "control_request", "request_id": f"stop-{run_id}", "request": {"subtype": "interrupt"}})
+            if turn.reader is not None:
+                turn.reader.cancel()
+            # The agent's own interrupt first (Claude Code's control message, pi's abort); it ends
+            # the turn with the agent's last word on it.
+            await self._write(turn, turn.adapter.interrupt(run_id))
             self.tasks.spawn(f"stop-{run_id}", self._force_stop(turn))
             for check_id, project in list(self.checks.get(run_id, {}).items()):
                 self.tasks.spawn(f"stop-check-{check_id}", kill_tagged(project, run_id, f"CL_CHECK_ID={check_id}"))
@@ -470,31 +486,40 @@ class Runner:
             with contextlib.suppress(ProcessLookupError):
                 turn.proc.kill()
 
+    async def _send(self, turn, reader):
+        """What the reader has for the agent's input, written; the input closed when the reader
+        says so."""
+        for obj in reader.take():
+            await self._write(turn, obj)
+        proc = turn.proc
+        if reader.close_input and proc is not None and proc.stdin is not None and not proc.stdin.is_closing():
+            proc.stdin.close()
+
     async def _turn(self, turn, text):
         status, error, usage = "failed", "", None
         try:
-            lesson = store.lesson(self.db, turn.lesson_id)
-            session_id, resume = lesson["session_id"], bool(lesson["session_started"])
+            session = store.session(self.db, turn.lesson_id, turn.agent)
+            session_id, resume = session["session_id"], bool(session["started"])
             context = store.message(self.db, turn.message_id)["context"]
-            if turn.fresh:
+            if turn.fresh or turn.missed:
                 await self.write_transcript(turn.lesson_id)
             for _attempt in range(3):
                 sent = f"{context}\n\n{text}" if context else text
                 outcome, error, usage, seen = await self._attempt(turn, sent, session_id, resume)
                 if seen:
-                    store.set_session(self.db, turn.lesson_id, session_id, True, store.text_hash(turn.text))
-                if outcome == "session gone":      # its session file is gone: a fresh session, taken up from the files
+                    store.set_session(self.db, turn.lesson_id, turn.agent, session_id, True, store.text_hash(turn.text), turn.message_id)
+                if outcome == "session gone":      # its session is gone: a fresh session, taken up from the files
                     session_id, resume = str(uuid.uuid4()), False
-                    store.set_session(self.db, turn.lesson_id, session_id, False)
+                    store.set_session(self.db, turn.lesson_id, turn.agent, session_id, False)
                     self.on_event(turn, "text_delta", {"text": SESSION_GONE_NOTE})
-                    turn.fresh = SESSION_GONE
+                    turn.fresh, turn.missed = SESSION_GONE, None
                     context = self.context(turn, store.lesson(self.db, turn.lesson_id))
                     store.set_context(self.db, turn.message_id, context)
                     await self.write_transcript(turn.lesson_id)
                     continue
                 if outcome == "session exists":    # made by a turn that failed after creating it
                     resume = True
-                    store.set_session(self.db, turn.lesson_id, session_id, True)
+                    store.set_session(self.db, turn.lesson_id, turn.agent, session_id, True)
                     continue
                 status = outcome
                 break
@@ -507,11 +532,11 @@ class Runner:
             try:
                 self.flush(turn)
                 if status == "ok":
-                    self.emit(turn, "completed", {"usage": usage})
+                    self.emit(turn, "completed", {"usage": usage, "agent": turn.agent})
                 elif status == "cancelled":
-                    self.emit(turn, "cancelled", {})
+                    self.emit(turn, "cancelled", {"agent": turn.agent})
                 else:
-                    self.emit(turn, "error", {"message": error})
+                    self.emit(turn, "error", {"message": error, "agent": turn.agent})
                 store.finish_run(self.db, turn.run_id, status, error if status == "failed" else "", usage)
                 store.touch_lesson(self.db, turn.lesson_id)
             finally:
@@ -522,21 +547,22 @@ class Runner:
                 self.tasks.spawn(f"transcript-{turn.run_id}", self.write_transcript(turn.lesson_id))
 
     async def _attempt(self, turn, text, session_id, resume):
-        """One launch of Claude Code. Returns (outcome, error, usage, whether its session
+        """One launch of the agent. Returns (outcome, error, usage, whether its session
         started): outcome is "ok", "cancelled", "failed", or "session gone" / "session exists"
         for the caller to try again."""
         if turn.cancel_requested:
             return "cancelled", "", None, False
         if not os.path.isfile(f"{KEYS}/{turn.project}/id_ed25519"):
             return "failed", START_PROJECT, None, False
-        token = read_token()
+        adapter = turn.adapter
         env = dict(os.environ, CL_RUN_ID=str(turn.run_id), CL_RUN_TOKEN=turn.token)
         send = ["CL_RUN_ID", "CL_RUN_TOKEN"]
+        token = read_token() if adapter.uses_token() else ""
         if token:
             env["CL_CLAUDE_TOKEN"] = token
             send.append("CL_CLAUDE_TOKEN")
-        reader = StreamReader(lambda kind, data: self.on_event(turn, kind, data))
-        proc = await asyncio.create_subprocess_exec(*ssh_argv(turn.project, send), claude_command(session_id, resume, turn.text), env=env,
+        reader = turn.reader = adapter.reader(lambda kind, data: self.on_event(turn, kind, data), text, resume, turn.run_id)
+        proc = await asyncio.create_subprocess_exec(*ssh_argv(turn.project, send), adapter.command(session_id, resume, turn.text), env=env,
                                                     stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
                                                     stderr=asyncio.subprocess.PIPE, limit=LINE_LIMIT)
         turn.proc = proc
@@ -549,22 +575,23 @@ class Runner:
         err_task = asyncio.ensure_future(drain_stderr())
         idle = False
         try:
-            await self._write(turn, {"type": "user", "message": {"role": "user", "content": text}})
+            await self._send(turn, reader)
             if turn.cancel_requested:   # Stop came while it was starting: the interrupt goes now
-                await self._write(turn, {"type": "control_request", "request_id": f"stop-{turn.run_id}", "request": {"subtype": "interrupt"}})
+                await self._write(turn, adapter.interrupt(turn.run_id))
             while True:
                 try:
-                    line = await asyncio.wait_for(proc.stdout.readline(), END_S if reader.result else IDLE_S)
+                    line = await asyncio.wait_for(proc.stdout.readline(), END_S if reader.finished else IDLE_S)
                 except ValueError:      # a line longer than LINE_LIMIT: skipped
                     continue
                 except TimeoutError:
-                    idle = reader.result is None
+                    idle = not reader.finished
                     break
                 if not line:
                     break
                 reader.feed(line)
-                if reader.result is not None and proc.stdin is not None and not proc.stdin.is_closing():
-                    proc.stdin.close()   # the turn is over: Claude Code ends once its input is closed
+                # The answer is over when the agent says so (Claude Code's result line, pi's
+                # agent_settled), never because its input was closed: pi ends when it is.
+                await self._send(turn, reader)
         finally:
             if idle:
                 await kill_tagged(turn.project, turn.run_id)
@@ -578,36 +605,6 @@ class Runner:
                 await proc.wait()
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(err_task, 5)
-            turn.proc = None
+            turn.proc = turn.reader = None
         said = stderr.decode(errors="replace").strip()
-        return (*judge(reader, proc.returncode, said, turn.cancel_requested, idle), reader.usage(), reader.session_seen)
-
-
-def judge(reader, code, stderr, cancelled, idle):
-    """(outcome, error) of a launch, from its result line, its exit code and what it said on
-    standard error: a sentence a person can act on where there is one."""
-    if cancelled:
-        return "cancelled", ""
-    if idle:
-        return "failed", "The tutor's Claude Code wrote nothing for 30 minutes, so the turn was ended."
-    result = reader.result
-    said = " ".join(str(part) for part in ((result or {}).get("result"), *((result or {}).get("errors") or []), stderr) if part)
-    lowered = said.lower()
-    if "no conversation found" in lowered:
-        return "session gone", ""
-    if "already in use" in lowered and "session" in lowered:
-        return "session exists", ""
-    if result is not None and not result.get("is_error"):
-        return "ok", ""
-    if any(sign in lowered for sign in LOGIN_SIGNS) or (result or {}).get("api_error_status") in (401, 403):
-        return "failed", NOT_LOGGED_IN
-    if result is not None:
-        return "failed", "Claude Code reported an error: " + (said[:300] or str(result.get("subtype") or "with no reason"))
-    if code == 127 and "no claude code" in lowered:
-        return "failed", NO_CLAUDE
-    if code == 255 and any(sign in stderr for sign in UNREACHABLE):
-        return "failed", START_PROJECT
-    if code == 255:
-        return "failed", "The tutor could not log in to the project's sandbox: " + (stderr.splitlines()[-1][:300] if stderr else "ssh failed")
-    last = stderr.splitlines()[-1][:300] if stderr else "it said nothing"
-    return "failed", f"Claude Code ended without an answer (exit {code}): {last}"
+        return (*adapter.judge(reader, proc.returncode, said, turn.cancel_requested, idle), reader.usage(), reader.session_seen)

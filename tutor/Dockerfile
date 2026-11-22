@@ -1,4 +1,4 @@
-# The tutor service's image: a conversation per lesson, with Claude Code in the project's
+# The tutor service's image: a conversation per lesson, with Claude Code or pi in the project's
 # sandbox (tutor/server.py), as an inner container of clanker-learn. Built by the core in the
 # inner daemon, on a network the guard rules fence, the first time clanker-learn starts with
 # its web server on.
@@ -13,7 +13,7 @@ RUN set -eux; \
     apt-get install -y --no-install-recommends tini python3 python3-aiohttp openssh-client; \
     rm -rf /var/lib/apt/lists/*
 
-COPY server.py store.py sse.py tasks.py turn.py claude_stream.py mcp.py tools.py plans.py knowledge.py cards.py schema.sql tutor.md /opt/cl/tutor/
+COPY server.py store.py sse.py tasks.py turn.py agents.py claude_stream.py pi_stream.py mcp.py tools.py plans.py knowledge.py cards.py schema.sql tutor.md /opt/cl/tutor/
 
 WORKDIR /opt/cl/tutor
 STOPSIGNAL SIGTERM

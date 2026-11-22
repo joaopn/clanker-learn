@@ -1,4 +1,4 @@
-"""The "learn" tool server: MCP over HTTP, for Claude Code in a project's sandbox.
+"""The "learn" tool server: MCP over HTTP, for Claude Code and pi in a project's sandbox.
 
 The transport is lifted from research-sandbox (the maintainer's project),
 container/role-mcp/daemon.py (handle_mcp, _rpc_result, _rpc_error, _tool_text_result): one
