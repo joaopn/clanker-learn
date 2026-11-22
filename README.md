@@ -1,168 +1,60 @@
 # clanker-learn
 
-A self-hosted tutor: you learn a technical subject by doing it in a real environment, with a tutor that knows what you already know. One container, no tool on the host.
+A tutor you run on your own machine. You learn a technical subject by doing it, in a real Linux environment, with a tutor that works in that environment beside you and remembers what you told it about yourself.
 
-It is being built. What exists so far is the outer container and, inside it, projects with their sandboxes, the broker, the web server, and its page: projects, a terminal, the editor and the web apps of a sandbox in the browser, Claude Code in the projects that are given it, and the tutor: a conversation per lesson, in which Claude Code works in the project's sandbox. A project opens on Goals, where the tutor proposes a study plan you edit and approve. The knowledge base is not built yet.
+It is for one person who wants to learn something hands-on (a database, a language, a tool, a piece of infrastructure) and would rather keep the whole thing on their own computer. The tutor is Claude Code, driven by your own Claude subscription.
 
-## The outer container
+## What it looks like
 
-`outer/` builds the one container clanker-learn runs in. It holds a Docker daemon of its own, which runs the sandboxes, and the guard rules that fence them. Build it from the repository's root:
+- You make a **project** for each subject. A project is a sandbox: a Linux container of its own with a workspace folder, a terminal, a code editor, and room to install and run whatever the subject needs.
+- A project opens on **Goals**: a conversation in which the tutor asks what you want to be able to do, what you know already and how much time you have. It then proposes a **study plan** as a card: modules of small lessons, each with an objective. You edit the card and approve it, and the lessons appear in the list.
+- A **lesson** is a conversation with the tutor. It explains, then builds small working examples in the workspace, runs commands, installs software, starts servers, and shows diagrams, plots, pictures and pages it made. Each thing it does in the sandbox is a line you can open. You work in the same sandbox in the Shell and Editor tabs beside the conversation, and each web app started there gets a tab of its own.
+- The tutor **keeps a brief about you**: your goals and how you want to be taught, in your own typed words; the lessons you finished, in any project; and notes on how you learn, each resting on something it saw. Every tutor reads the brief when a lesson starts.
+
+## What it needs
+
+- A Linux machine with Docker. It runs as one container, which holds a Docker daemon of its own for the sandboxes. Only x86-64 has been run so far.
+- A Claude subscription, for Claude Code. You log in once per project, or set one token for every project in Settings.
+- The internet: at the first start clanker-learn builds its images and fetches Claude Code and the editor, and the sandboxes reach the internet while you work.
+
+## The quickest start
+
+From a copy of this repository:
 
 ```
 docker build -t clanker-learn -f outer/Dockerfile .
-```
-
-Start it in one of two ways, and say which:
-
-```
-docker run -d --name clanker-learn --stop-timeout 60 --runtime=sysbox-runc -e CL_MODE=sysbox \
-    -p 127.0.0.1:7788:7788 -p 127.0.0.1:8080:8080 -p 127.0.0.1:11100-11164:11100-11164 -p 127.0.0.1:11200-11299:11200-11299 -v clanker-learn-docker:/var/lib/docker -v clanker-learn-data:/data clanker-learn
-
 docker run -d --name clanker-learn --stop-timeout 60 --privileged -e CL_MODE=privileged \
-    -p 127.0.0.1:7788:7788 -p 127.0.0.1:8080:8080 -p 127.0.0.1:11100-11164:11100-11164 -p 127.0.0.1:11200-11299:11200-11299 -v clanker-learn-docker:/var/lib/docker -v clanker-learn-data:/data clanker-learn
-```
-
-Give it its own namespaces and its own init: no `--pid=host`, `--network=host`, `--cgroupns=host`, `--init` or other entrypoint, and no network shared with another container (`--network=container:…`). With them its rules and its daemon would act on the machine's own processes, network or control groups, so it refuses to start and says which one it found. Two limits:
-
-- It tells `--network=host` by the bridges of the machine's Docker (`docker0`, `br-…`). On a machine whose Docker has none, or names its only bridge differently, the flag goes unnoticed. A network shared with another container is refused only when a Docker daemon's bridges are already in it, which usually means not at the first start and at every later one.
-- On a machine with cgroup v1, Docker's default is the machine's control groups: add `--cgroupns=private` to the command.
-
-On sysbox the container is confined from the host: a process that gets out of a sandbox into it is still not root on the machine. Privileged, the container is root-equivalent on the host: what then stands between a sandbox and the host is an ordinary container boundary and the guard rules. Only the privileged way is exercised by the tests so far; the sysbox way has not been run.
-
-At every start the container applies the guard rules, starts its daemon, checks the rules, and runs one self-test container. If any of that fails it ends everything it started and says why: in `docker logs`, and as a 503 answer on port 8080. (Refused because its network is not its own, as with `--network=host`, it opens no port, because the port would be someone else's: `docker logs` says why.) It does the same if, while running, the rules are lost and cannot be put back, or the daemon dies.
-
-### The first start
-
-The page is at `https://127.0.0.1:7788`. Its certificate is its own, made by clanker-learn and signed by nobody else, so the browser warns the first time: accept it for that address once.
-
-While no password is set, the page asks for a set-up code and a new password. The container prints the code in its log at every start while no password exists:
-
-```
+    -p 127.0.0.1:7788:7788 -p 127.0.0.1:8080:8080 \
+    -p 127.0.0.1:11100-11164:11100-11164 -p 127.0.0.1:11200-11299:11200-11299 \
+    -v clanker-learn-docker:/var/lib/docker -v clanker-learn-data:/data \
+    clanker-learn
 docker logs clanker-learn
 ```
 
-The code is good until the container stops or a password is set. `docker exec -i clanker-learn cl passwd` sets the password without it (see the broker, below).
+Open `https://127.0.0.1:7788` in a browser on the same machine, accept its self-made certificate, and type the set-up code that the log shows to choose your password. Then press `+ New project`.
 
-The first start takes a few minutes longer: the web server's image is built then, once, and needs the internet. `http://127.0.0.1:8080/state.json` says `web: preparing` meanwhile, then `web: up`; once the page answers, the sandbox image is built too (`sandbox_image`), so that the first project starts sooner, and then Claude Code and the editor are fetched, once (`agents` and `editor`: `pulling`, then `ready: <version>`; about two minutes more). A project cannot be given something that is not fetched yet.
+This runs the container privileged, which makes it root-equivalent on your machine. [INSTALL.md](INSTALL.md) says what that gives up, and how to run it on sysbox instead.
 
-### The page
+## How far it is built
 
-After the login the projects are listed down the left side. `+ New project` makes one and shows its progress. Its box asks what the project gets: under Agents, Claude Code (ticked by default, with the model and the effort it starts on), and the editor (ticked by default). The gear beside a project starts, stops and recreates it, changes its limits, and destroys it (which asks for the password again); its Agents section adds Claude Code to a project that has none, updates it to the fetched version, and changes its model and effort, all while the project runs and without a restart.
+It is a first version, being built in steps. What exists: projects and their sandboxes; the page with the Shell, the Editor, web-app tabs and ports; Claude Code and the editor fetched once and copied into each project, and updated from Settings; Goals and the study plan; lessons as conversations with the tutor, with diagrams, plots, pictures and pages; tabs side by side; the tutor's records about you, and the brief every tutor reads; backups and restores, as commands.
 
-A project opens into its lessons in the list: Goals first, then the plan's lessons under their modules, each with its state; `+ New lesson` adds one by hand. A project's tabs can be dragged apart into up to three columns shown side by side (drag a tab to the side of the tab area; drag the line between two columns to change their widths). A project has these tabs:
+What does not exist yet:
 
-- **The open lesson**: the conversation with the tutor (see The tutor, below).
-- **Shell**: a terminal in the sandbox. It keeps its session when the tab or the browser is closed.
-- **Editor**, in a project that has the editor: the code editor (code-server) on the project's workspace, where its files are browsed and edited. It starts at the first visit, with Python and Jupyter extensions and, in a project with Claude Code, its panel.
-- **One tab per web app** that listens in the sandbox. It appears a few seconds after the app starts listening, and is marked when the app is gone.
-- **Ports**: name a port by hand, as a web app (a tab, behind your login) or as raw TCP (an address, with **no login in front of it**).
+- A second agent. Only Claude Code drives the tutor; pi is planned.
+- The Knowledge page, where you would read and change what the tutor keeps about you and approve the insights it proposes for every project. The tutor keeps its records already; the page comes with the next change.
+- Exercises and quick questions as cards in the conversation. The tutor can set them, but the page does not show them yet: you see only the tool line.
+- Backups on the page. They are made and restored with the `cl` command for now.
 
-Every web tab, the Editor included, is served on a port of its own from the first range below. Some browsers want the certificate accepted once for each such address: if a tab stays empty, use its "open in a new tab" link, accept the certificate there, and reload the tab.
+## Documents
 
-The password never leaves the browser: the page sends a proof derived from it. The browser's storage holds only which project, lesson and tab were last shown.
-
-### The tutor
-
-A lesson is a conversation with a tutor, and the tutor is the project's own Claude Code, working in the project's sandbox with the model and effort the project was given. So a lesson needs a project that has Claude Code and is running.
-
-- **Goals and the plan.** A project's first conversation is Goals: the tutor asks what you want to be able to do, what you know and how much time you have, and proposes a study plan as a card. Change anything on the card (titles, objectives, lessons added, removed or moved), then approve it or dismiss it; on approval the lessons appear in the list. A tutor can later propose a change to the plan the same way; nothing changes until you approve it. The tutor is told what you decided with your next message.
-- **Lessons** can be opened in any order. A lesson's tutor is given its objective, its place in the plan and one line on each lesson already done. It closes the lesson with a short summary when the objective is met; you can still write in it.
-- **A lesson's files** are in the workspace under `.learn/lessons/`: the conversation written out, and the tutor's notes. If the tutor's own memory of a lesson is lost, it takes the lesson up from them.
-- **The tutor's instructions** can be read and changed in Settings, under Tutor, and put back to the shipped text. A lesson under way follows a new text from its next message.
-- What the tutor writes can be more than text: a diagram, an interactive plot, a picture or a page it made in the workspace, a link that opens a file in the Editor. None of it is fetched from outside the project or run on the page itself.
-
-- You write, the tutor answers as it goes: its text appears while it is written, and each thing it does in the sandbox (a command, a file it read or wrote) is a line you can open. What it installs and starts stays in the sandbox, where you work in the Shell and the Editor beside the conversation.
-- **Stop** ends an answer and what it was running. Closing the browser does not: the answer goes on and is there when you come back.
-- Lessons are independent: two can have their tutors working at once, also in one project, where both then work in the same sandbox. A lesson takes one message at a time.
-- Under the conversation a line says how full the tutor's context is.
-- **Signing in.** The tutor uses the project's own Claude Code login (run `claude` in its Shell once). Or set a Claude token in Settings, under Tutor (from `claude setup-token`): the tutor in every project then uses it, and a new project's first lesson works without a login. The token is kept in the `/data` volume and handed to each answer; code the tutor runs in the sandbox can read it, as it can read a project's own login.
-- The tutor runs as a service of its own inside clanker-learn (`state.json`: `tutor`). A sandbox reaches one thing of it: the tools a tutor uses while it answers (the plan, closing a lesson, proposing), and only with the pass of an answer that is being written. If it restarts while an answer is being written, that answer is shown as interrupted and the lesson takes the next message.
-- A lesson continues through Claude Code's own session in the project's home folder: `claude --resume` in the Shell lists it. If that session is lost, the conversation stays on the page and the tutor starts again without it, saying so.
-
-### Software
-
-The gear at the bottom of the project list opens Settings. Its Software table has a row for Claude Code and one for the editor: what is fetched, the version in effect, and whether the two agree.
-
-- **Pull** fetches that software again at the version in effect, and shows the log while it runs.
-- **Refresh** asks its maker for the newest version first, and offers to raise the version and pull it if there is a newer one. A version is never moved down.
-- **Use repo version** goes back to the version clanker-learn came with (`versions.env`).
-
-Each is fetched by its maker's own installer, in a container that is thrown away afterwards, and kept in the `/data` volume; one is fetched at a time. Running projects keep the versions they have until Update is pressed in their gear's Agents section; new projects get the fetched ones. A newer editor reaches a project at its next start.
-
-### Settings
-
-Each is given with `-e NAME=value` on the run command.
-
-- `CL_MODE`: `sysbox` or `privileged`, as above. It has no default.
-- `CL_WEB`: `on` (the default) or `off`. Off, no web server runs, and one left by an earlier start is removed; projects and the `cl` command work all the same.
-- `CL_WEB_PORT`: the page's port, 7788 by default. Publish the same port: `-e CL_WEB_PORT=8443 -p 127.0.0.1:8443:8443`.
-- `CL_ORIGIN_PORTS` (11100-11164 by default) and `CL_PASSTHROUGH_PORTS` (11200-11299 by default): two ranges of ports. A web app of a sandbox is shown on a port of its own from the first range. A raw TCP port of a sandbox named by hand is reached on a port of the second, which has no login in front of it. Publish the same ranges.
-- `CL_STATUS_PORT`: the port of the status answer (`state.json`), 8080 by default.
-
-The page's port and the two ranges are ports from 1024 to 65535, as `7788` or `11100-11164`, and none may overlap another or the status port. A wrong web setting leaves the container working, sandboxes, broker and all: `state.json` says `web: down` with the reason. A wrong `CL_STATUS_PORT` refuses the start; the status answer is then on 8080 and says why.
-
-## Projects and sandboxes
-
-A project is one sandbox: a container of its own inside clanker-learn, on a network of its own, with a workspace (`/workspace`), a home folder, a user (`learner`) who can become root, an SSH server for the tutor to come in by, the editor (code-server) on port 8443 if the project has it, and a small server that shows the workspace's files on port 7070. A sandbox reaches the internet and nothing private: not clanker-learn's container, not another sandbox, not your network. It has no raw sockets: packet capture does not work in it; `ping` still does.
-
-Projects are driven from the page, or by a command inside the container:
-
-```
-docker exec clanker-learn cl create kafka --memory 4g --cpus 2 --agent claude --editor
-docker exec clanker-learn cl list
-docker exec clanker-learn cl stop kafka
-docker exec clanker-learn cl start kafka
-docker exec clanker-learn cl limits kafka --memory 8g --pids none
-docker exec clanker-learn cl recreate kafka
-docker exec clanker-learn cl destroy kafka
-```
-
-- The first project on a new installation takes a few minutes: the sandbox image (`sandbox/`) is built then, once, and needs the internet.
-- What you install in a sandbox is still there after `stop` and `start`, and after clanker-learn itself is stopped and started; the projects that were running come back by themselves.
-- Limits apply at once. Two changes wait: removing a memory limit waits for the sandbox to be recreated, and on sysbox removing a processor limit waits for its next start. The command says so when it happens.
-- `recreate` gives the project a new container from the current sandbox image. The workspace and the home folder stay; what was installed elsewhere in the old container is gone, and the setup recipe (below) brings it back. A stopped project is running afterwards.
-- `destroy` removes the sandbox, its workspace and its home folder. If it is interrupted, run it again: a project being destroyed is never started.
-- Everything of a project but its container is in the `/data` volume: workspaces under `projects/`, home folders under `homes/`.
-- A project has its own copy of Claude Code and of the editor in its home folder, about 400 MB and 350 MB. You log in to Claude Code once per project, in its Shell (`claude`); it may update itself there. `cl create` gives a project neither unless asked (`--agent claude`, `--claude-model`, `--claude-effort`, `--editor`); `cl agents add|update|model <name>` are the gear's Agents section as commands, and `cl software`, `cl agent pull|refresh`, `cl editor pull|refresh` the Software table's.
-- A project made before projects had agents keeps working as it was. To give it Claude Code: recreate it, then add the agent in its gear.
-
-### What a sandbox brings back by itself
-
-Two files in the workspace, which the tutor will keep current and you can edit, say what a sandbox needs beyond its files:
-
-- `/workspace/.learn/setup.sh`, the setup recipe: what was installed. It runs once in every new container, as the sandbox user (who can `sudo`), so after a `recreate` the software is back. It does not run at a plain stop and start, where nothing was lost. `cl status` says how it went (`setup`: none, running, done, failed), and its output is in `/var/log/cl/setup.log` in the sandbox. If the sandbox is stopped while it runs, it runs again from the top at the next start, so it must be safe to run twice. A recipe that failed is not tried again until the next `recreate`, and one that never ends holds the services back: there is no time limit on it.
-- `/workspace/.learn/services`, what should be running: one line each, `name: command`. A name is lower-case letters, digits and dashes, starts with a letter or a digit and has at most 32 characters; other lines are skipped, with a line in the sandbox's log (`docker logs` of its container). At most 64 services and 64 KiB are read. They are started at every start of the sandbox, after the recipe, as the sandbox user, with their output in `/workspace/.learn/logs/<name>.log`. They are started, not watched: one that ends stays down until the next start. At a stop they are asked to end before they are killed.
-
-A server that listens only on the sandbox's loopback address (many development and notebook servers do by default) cannot be reached from outside the sandbox, so the page shows no tab for it. Inside the sandbox, `cl-expose 8888` puts it on the sandbox's own address; listed in the services file, that comes back too:
-
-```
-notebook: jupyter lab --port 8888
-notebook-tab: cl-expose 8888
-```
-
-Use it only for a server that listens on loopback. Listed for a server that listens on all addresses, it takes the port on the sandbox's address first and the server then fails to start there.
-
-## The broker
-
-The broker is the door through which the web server asks for anything that touches projects. It is a process of clanker-learn's container, started once the container is ready, and it listens on a unix socket (`/run/cl/broker/broker.sock`) that no sandbox has. It is the web server's one narrow place to ask.
-
-- It knows a short, closed list of things to do (list, status, create, start, stop, recreate, limits, destroy, how an operation stands, whether a first password can be set, and setting it; a project's Shell login for the terminal, what listens in its sandbox, and the ports named by hand: adding, removing and listing them). There is no way through it to the inner Docker itself.
-- Listing the projects, one project's status and how an operation stands need nothing. Everything else needs a session, which a login with the password gives; destroying a project needs the password again.
-- While no password is set, the first one can also be set from the page with the one-time set-up code printed in the container's log at its start. That works only while no password exists, never replaces one, and ten wrong codes within a minute shut it for a minute.
-- Set the password from the machine clanker-learn runs on. It is read from standard input, or asked for twice without echo at a terminal, and must have at least eight characters:
-
-  ```
-  docker exec -it clanker-learn cl passwd
-  ```
-
-  Setting it ends every session. What is stored is a hash, in the `/data` volume.
-- Create, start, stop, recreate and destroy run in the background, one per project at a time; a second request for a project that is being worked on is answered "busy" at once. The `cl` command and the broker never work on one project at the same time.
-- If the broker ends, clanker-learn starts it again; operations that were running go on. `http://127.0.0.1:8080/state.json` says `broker: up`.
-- The `cl` command inside the container asks for no password: whoever can run it is root in the container already.
-
-It speaks the protocol of RS's broker, so that RS's web server can be brought over with little change.
+- [INSTALL.md](INSTALL.md): running it, the first start, settings, where your data is, backups, updating, uninstalling, and what to do when it refuses to start.
+- [USING.md](USING.md): the page, projects, lessons, the Shell and the Editor, Settings, what the tutor keeps about you, and the `cl` command.
+- [SECURITY.md](SECURITY.md): what each part holds, what a sandbox can and cannot reach, and what is not protected.
 
 ## Tests
+
+For developers:
 
 ```
 python3 -m venv .venv && .venv/bin/pip install pytest ruff
@@ -171,3 +63,7 @@ python3 -m venv .venv && .venv/bin/pip install pytest ruff
 ```
 
 The tests marked `integration` start real containers and need a Docker daemon that can run a privileged one. They publish no port on the machine. Every container, network and named volume they create starts with `cl-test-` and is removed afterwards, each container together with the unnamed volumes the image gives it; the images they build, `cl-outer:test` and `cl-sandbox:<hash>`, are kept. One test lets clanker-learn build the sandbox image itself and takes a few minutes.
+
+## Licence
+
+clanker-learn is free software under the GNU Affero General Public License, version 3: see [LICENSE](LICENSE).
