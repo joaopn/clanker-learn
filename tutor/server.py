@@ -148,7 +148,8 @@ async def get_lesson(request):
     row = lesson_or_404(request)
     running = runner.running_run(row["id"])
     return ok({"lesson": lesson_view(request, row), "messages": store.messages(db, row["id"]),
-               "run": store.run_out(store.run(db, running)) if running else None, "usage": store.latest_usage(db, row["id"])})
+               "run": store.run_out(store.run(db, running)) if running else None, "usage": store.latest_usage(db, row["id"]),
+               "ended": store.ended_runs(db, row["id"])})
 
 
 async def rename_lesson(request):

@@ -157,6 +157,11 @@ class StreamReader:
     def _assistant(self, message):
         if not isinstance(message, dict):
             return
+        # A message Claude Code makes itself when no request could be made ("Not logged in ·
+        # Please run /login", an API error): not the tutor's words, and no request to count.
+        # The result line carries the same text, and the turn says it in a sentence of its own.
+        if message.get("model") == "<synthetic>":
+            return
         # Which request this block belongs to, and a fallback for a stream with no
         # `message_start`. Its usage is a copy of the request's, repeated per block: never summed.
         request = self._request(str(message.get("id") or f"anon-{len(self.order)}"))

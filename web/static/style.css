@@ -280,7 +280,11 @@ ul.plain { margin: 6px 0 6px 20px; line-height: 1.5; }
 .msg .body { line-height: 1.6; font-size: 14.5px; overflow-wrap: anywhere; }
 .msg.you .body { background: var(--bg-card); border: 1px solid var(--border); border-radius: 10px; padding: 8px 13px; display: inline-block; white-space: pre-wrap; max-width: 100%; }
 .pulse.typing { margin-left: 4px; vertical-align: middle; }
-.traces { margin-bottom: 8px; border-left: 2px solid #3a3a3a; padding-left: 10px; }
+.traces { margin: 6px 0 2px; border-left: 2px solid #3a3a3a; padding-left: 10px; }
+/* An answer is stored one stretch of text at a time: the stretches after the first read as one message. */
+.msg.tutor + .msg.tutor { margin-top: -16px; }
+.msg.tutor + .msg.tutor .av { visibility: hidden; }
+.msg.tutor + .msg.tutor .who { display: none; }
 .trace { margin: 2px 0; font-size: 12.5px; color: var(--fg-muted); }
 .trace summary { cursor: pointer; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .trace .tkind { color: var(--fg-faint); }

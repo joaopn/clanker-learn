@@ -896,6 +896,22 @@ async function refreshPorts(name) {
 // ---- the tutor: lessons under a project ---------------------------------------------------
 
 const tutorPath = (tail) => `/broker/tutor${tail}`;
+
+// The tutor service numbers its lessons, runs and messages; the page keeps every id as text
+// (a tab's name, the layout in browser storage), so the ids of an answer become text here.
+const TUTOR_ID_KEYS = new Set(["id", "lesson_id", "run_id", "running", "deleted"]);
+function idsAsText(v) {
+    if (Array.isArray(v)) return v.map(idsAsText);
+    if (!v || typeof v !== "object") return v;
+    const out = {};
+    for (const [k, x] of Object.entries(v)) out[k] = TUTOR_ID_KEYS.has(k) && Number.isInteger(x) ? String(x) : idsAsText(x);
+    return out;
+}
+async function tutorApi(method, tail, body) {
+    const r = await api(method, tutorPath(tail), body);
+    if (r.body && r.body.ok) r.body.result = idsAsText(r.body.result);
+    return r;
+}
 const lessonTab = (id) => `lesson:${id}`;
 const lessonTabId = (tab) => {
     if (typeof tab !== "string" || !tab.startsWith("lesson:")) return null;
@@ -928,7 +944,7 @@ function toggleLessons(name) {
 
 async function refreshLessons(name) {
     if (!S.loggedIn) return;
-    const r = await api("GET", tutorPath(`/project/${enc(name)}/lessons`));
+    const r = await tutorApi("GET", `/project/${enc(name)}/lessons`);
     if (!S.loggedIn) return;
     const res = r.body.ok && r.body.result;
     if (res && Array.isArray(res.lessons)) S.lessons[name] = { list: res.lessons.filter((l) => l && typeof l.id === "string"), error: null };
@@ -940,7 +956,7 @@ async function refreshLessons(name) {
 // With the page's other polls: who is working, and the lessons of the projects shown open.
 async function refreshTutor() {
     if (!S.loggedIn) return;
-    const r = await api("GET", tutorPath("/activity"));
+    const r = await tutorApi("GET", "/activity");
     if (!S.loggedIn) return;
     const res = r.body.ok && r.body.result;
     if (res && Array.isArray(res.running)) {
@@ -1006,7 +1022,7 @@ function newLessonDialog(name) {
         ev.preventDefault();
         if (!title.value.trim()) { said.textContent = "Give the lesson a title."; return; }
         go.disabled = true;
-        const r = await api("POST", tutorPath(`/project/${enc(name)}/lessons`), { title: title.value.trim() });
+        const r = await tutorApi("POST", `/project/${enc(name)}/lessons`, { title: title.value.trim() });
         go.disabled = false;
         if (!r.body.ok || !r.body.result || typeof r.body.result.id !== "string") { said.textContent = errText(r.body); return; }
         closeModal();
@@ -1030,7 +1046,7 @@ function lessonDialog(name, lesson) {
         ev.preventDefault();
         if (!title.value.trim()) { said.textContent = "Give the lesson a title."; return; }
         save.disabled = true;
-        const r = await api("PATCH", tutorPath(`/lessons/${enc(lesson.id)}`), { title: title.value.trim() });
+        const r = await tutorApi("PATCH", `/lessons/${enc(lesson.id)}`, { title: title.value.trim() });
         save.disabled = false;
         if (!r.body.ok) { said.textContent = errText(r.body); return; }
         closeModal();
@@ -1046,7 +1062,7 @@ function lessonDialog(name, lesson) {
     del.addEventListener("click", () => {
         const sure = h("button", { class: "danger", onclick: async () => {
             sure.disabled = true;
-            const r = await api("DELETE", tutorPath(`/lessons/${enc(lesson.id)}`));
+            const r = await tutorApi("DELETE", `/lessons/${enc(lesson.id)}`);
             sure.disabled = false;
             if (!r.body.ok) { said.textContent = errText(r.body); return; }
             closeModal();
@@ -1076,12 +1092,12 @@ function formatTokens(count) {
 const usageNum = (v) => (typeof v === "number" && Number.isFinite(v) ? v : null);
 
 // "Context 55k of 200k tokens (92% cached)": "of N" only with a window, the share only with
-// the last request's cache read; null (no line) when the size is unknown. A part that is
+// the last request's cache read; null (no line) when the size is unknown or zero. A part that is
 // missing is left out, never shown as zero.
 function contextFooter(usage) {
     if (!usage || typeof usage !== "object") return null;
     const context = usageNum(usage.context_tokens);
-    if (context === null) return null;
+    if (context === null || context <= 0) return null;   // no request was made (a refused turn)
     const win = usageNum(usage.context_window);
     let text = `Context ${formatTokens(context)}`;
     if (win !== null && win > 0) text += ` of ${formatTokens(win)}`;
@@ -1339,7 +1355,14 @@ function makeLessonPane(name, id) {
     const tellTrouble = (text) => { tell(text); trouble = true; };
     const clearTrouble = () => { if (trouble) tell(""); };
     pane.setTitle = (t) => { pane.title = t; titleEl.textContent = t; };
+    // The window comes with the turn's last line only: the figures sent while it is written
+    // keep the one known before, so the line does not change its form on the way.
+    let lastWindow = null;
     const setUsage = (usage) => {
+        if (usage && typeof usage === "object") {
+            if (usageNum(usage.context_window)) lastWindow = usage.context_window;
+            else if (lastWindow) usage = { ...usage, context_window: lastWindow };
+        }
         const text = contextFooter(usage);
         if (text) { ctx.textContent = text; ctx.hidden = false; }
     };
@@ -1350,7 +1373,8 @@ function makeLessonPane(name, id) {
         btn.title = busy ? "Stop the tutor's answer" : "Send (Enter; Shift+Enter for a new line)";
         stateEl.textContent = busy ? "the tutor is working…" : "";
     };
-    const sysline = (text, cls) => { inner.append(h("div", { class: "sysline" + (cls ? ` ${cls}` : "") }, h("span", {}, text))); toBottom(); };
+    const syslineEl = (text, cls) => h("div", { class: "sysline" + (cls ? ` ${cls}` : "") }, h("span", {}, text));
+    const sysline = (text, cls) => { inner.append(syslineEl(text, cls)); toBottom(); };
     const emptyNote = () => inner.querySelector(".empty");
 
     function messageEl(m) {
@@ -1366,8 +1390,10 @@ function makeLessonPane(name, id) {
         traces.hidden = !traces.childElementCount;
         if (you) body.textContent = String(m.text || "");
         else body.append(mdRender(String(m.text || "")));
-        const el = h("div", { class: `msg ${you ? "you" : "tutor"}` }, h("div", { class: "av" }, you ? "Y" : "T"),
-            h("div", { class: "mc" }, h("div", { class: "who" }, you ? "You" : "Tutor"), traces, body));
+        const el = h("div", { class: `msg ${you ? "you" : "tutor"}`, "data-run": m.run_id === undefined || m.run_id === null ? null : String(m.run_id) },
+            h("div", { class: "av" }, you ? "Y" : "T"),
+            // The tools a stretch of the answer used come after its text, as they were run.
+            h("div", { class: "mc" }, h("div", { class: "who" }, you ? "You" : "Tutor"), body, traces));
         return { el, body, traces };
     }
 
@@ -1377,7 +1403,9 @@ function makeLessonPane(name, id) {
         const d = messageEl({ role: "assistant", text: "" });
         d.text = "";
         d.toolIds = [];
-        d.body.append(h("span", { class: "pulse typing", title: "The tutor is working" }));
+        // The mark that it is being written comes last, under the tools it runs.
+        d.tail = h("div", {}, h("span", { class: "pulse typing", title: "The tutor is working" }));
+        d.el.querySelector(".mc").append(d.tail);
         inner.append(d.el);
         turn.draft = d;
         return d;
@@ -1390,7 +1418,6 @@ function makeLessonPane(name, id) {
             const d = turn.draft;
             if (!d) return;
             d.body.replaceChildren(mdRender(d.text));
-            if (pane.turn === turn) d.body.append(h("span", { class: "pulse typing" }));
             toBottom();
         });
     }
@@ -1401,7 +1428,7 @@ function makeLessonPane(name, id) {
         const d = turn.draft;
         if (d) {
             if (!d.text && !d.toolIds.length) d.el.remove();
-            else { d.body.replaceChildren(mdRender(d.text)); }
+            else { d.body.replaceChildren(mdRender(d.text)); d.tail.remove(); }
         }
         turn.draft = null;
         tell("");
@@ -1474,7 +1501,7 @@ function makeLessonPane(name, id) {
             onGone: () => { if (pane.turn === turn) { endTurn(turn); pane.reload(); } },
             // Before asking again: is this answer still being written? If not, show the lesson as stored.
             beforeRetry: async () => {
-                const r = await api("GET", tutorPath(`/lessons/${enc(id)}`));
+                const r = await tutorApi("GET", `/lessons/${enc(id)}`);
                 if (pane.turn !== turn) return false;
                 if (r.status === 404) { endTurn(turn); lessonGone(name, id); return false; }
                 if (!r.body.ok || !r.body.result) return true;
@@ -1491,7 +1518,7 @@ function makeLessonPane(name, id) {
         if (pane.loading) return;
         pane.loading = true;
         if (pane.turn) endTurn(pane.turn);
-        const r = await api("GET", tutorPath(`/lessons/${enc(id)}`));
+        const r = await tutorApi("GET", `/lessons/${enc(id)}`);
         pane.loading = false;
         if (S.panes[paneKey(name, lessonTab(id))] !== pane) return;   // closed meanwhile
         if (pane.el.hidden) { pane.stale = true; return; }            // left meanwhile
@@ -1520,6 +1547,14 @@ function makeLessonPane(name, id) {
             if (run && m.role === "assistant" && m.run_id === run.id) continue;
             inner.append(messageEl(m).el);
         }
+        // An answer that did not end well says so after its last part, as it did while it was written.
+        for (const e of (Array.isArray(res.ended) ? res.ended : [])) {
+            if (!e || typeof e !== "object") continue;
+            const parts = inner.querySelectorAll(`.msg[data-run="${CSS.escape(String(e.id))}"]`);
+            if (!parts.length) continue;
+            parts[parts.length - 1].after(e.status === "cancelled" ? syslineEl("stopped")
+                : syslineEl(typeof e.error === "string" && e.error ? e.error : "The tutor's answer failed.", "bad"));
+        }
         if (!inner.childElementCount && !run) inner.append(h("div", { class: "empty" }, "Write to the tutor to begin."));
         ctx.hidden = true;
         setUsage(res.usage);
@@ -1535,7 +1570,7 @@ function makeLessonPane(name, id) {
         pane.sending = true;
         btn.disabled = true;
         tell("");
-        const r = await api("POST", tutorPath(`/lessons/${enc(id)}/messages`), { text });
+        const r = await tutorApi("POST", `/lessons/${enc(id)}/messages`, { text });
         pane.sending = false;
         btn.disabled = false;
         const res = r.body.ok && r.body.result;
@@ -1561,7 +1596,7 @@ function makeLessonPane(name, id) {
         const turn = pane.turn;
         if (!turn) return;
         btn.disabled = true;
-        const r = await api("POST", tutorPath(`/runs/${enc(turn.runId)}/cancel`));
+        const r = await tutorApi("POST", `/runs/${enc(turn.runId)}/cancel`);
         btn.disabled = false;
         if (!r.body.ok) tell(errText(r.body));
     }
@@ -1587,7 +1622,7 @@ function makeLessonPane(name, id) {
 
 async function refreshTutorSettings() {
     if (!S.loggedIn) return;
-    const r = await api("GET", tutorPath("/settings"));
+    const r = await tutorApi("GET", "/settings");
     if (!S.loggedIn) return;
     if (r.body.ok && r.body.result && typeof r.body.result.claude_token_set === "boolean") { S.tutorSettings = r.body.result; S.tutorSettingsError = null; }
     else S.tutorSettingsError = errText(r.body);
@@ -1609,7 +1644,7 @@ function renderTutorSettings(note) {
     const token = h("input", { type: "password", autocomplete: "off", spellcheck: "false", placeholder: st.claude_token_set ? "a new token to replace it" : "the token" });
     const put = async (value, btn) => {
         btn.disabled = true;
-        const r = await api("PUT", tutorPath("/settings"), { claude_token: value });
+        const r = await tutorApi("PUT", "/settings", { claude_token: value });
         btn.disabled = false;
         token.value = "";
         if (!r.body.ok || !r.body.result || typeof r.body.result.claude_token_set !== "boolean") { renderTutorSettings({ text: errText(r.body), bad: true }); return; }

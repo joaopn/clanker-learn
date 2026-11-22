@@ -163,6 +163,14 @@ def latest_usage(db, lesson_id):
     return json.loads(row["usage_json"]) if row else None
 
 
+def ended_runs(db, lesson_id):
+    """The runs of a lesson that did not end well (stopped, failed, interrupted), for the
+    conversation to say so where they stand."""
+    rows = db.all("SELECT id, status, error FROM runs WHERE lesson_id = ? AND status IN ('cancelled', 'failed', 'interrupted') ORDER BY id",
+                  (lesson_id,))
+    return [{"id": row["id"], "status": row["status"], "error": row["error"]} for row in rows]
+
+
 INTERRUPTED = "The tutor service restarted while this answer was being written."
 
 

@@ -43,7 +43,7 @@ STDERR_KEEP = 4096
 
 START_PROJECT = "Start the project first."
 NO_CLAUDE = "This project has no Claude Code: add it in the project's gear, under Agents."
-NOT_LOGGED_IN = "Claude Code is not logged in in this project: run `claude` in its Shell and log in, or set a token in Settings."
+NOT_LOGGED_IN = "Claude Code is not logged in in this project: run claude in its Shell and log in there, or set a token under Settings → Tutor."
 SESSION_GONE_NOTE = ("*The tutor's earlier turns of this lesson are gone from the project, so it starts this one afresh: "
                      "it no longer has what was said before.*\n\n")
 UNREACHABLE = ("Could not resolve hostname", "Name or service not known", "Temporary failure in name resolution", "Connection refused",
