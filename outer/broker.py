@@ -75,6 +75,18 @@ belong to no project, RS's build lane: what is taken without waiting and handed 
 is the core's build lane instead of a project's lock, one build at a time ("busy" with the
 core's sentence while another runs; RS queues builds of other targets). Their records carry
 `project: null`, as RS's; `build_active` lists them, `lifecycle_active` the project ones.
+
+Settings -> Backup: `backup` is an operation that belongs to no project, as a build is, on a
+lane of its own (the core's backup lane: one backup or restore at a time); it does not hold
+the build lane, since what a build changes (the distributions) is not in a backup. The child
+copies each project under that project's lock, waiting for an operation on it to end, so that
+a create, destroy or start is never cut through; while it copies a project, that project's
+operations are refused as busy. `backup_active` lists the backup in flight. `backup_list` is a
+read; `backup_rm` (step-up: a backup may be the only copy of what was destroyed, as RS rules
+for its exports) and `backup_fetch` are audited and answered at once. `backup_fetch` links one
+backup into the web server's own folder for one download (core.backup_fetch says why not the
+folder of backups). A restore is not a verb: it replaces everything, and is the `cl` command
+only.
 """
 import base64
 import contextlib
@@ -119,15 +131,17 @@ WRONG_CODES, WRONG_WINDOW_S, SHUT_S = 10, 60, 60
 AUTH_VERBS = ("login", "logout")
 SETUP_VERBS = frozenset({"setup_needed", "first_password"})
 OPEN_VERBS = frozenset({"list", "status", "op"})
-STEP_UP_VERBS = frozenset({"destroy"})
+STEP_UP_VERBS = frozenset({"destroy", "backup_rm"})
 # Operations on a project: a child holds the project's lock (agents_add and agents_update run
 # here as RS runs its `update` and `agents_update`: on its lifecycle lane, with a log).
 OP_VERBS = frozenset({"create", "start", "stop", "recreate", "destroy", "agents_add", "agents_update"})
 # Operations that belong to no project (RS's build lane): a child holds the core's build lane
 # instead. Their log records carry `project: null`, as RS's do (its build ops have no name).
 BUILD_VERBS = frozenset({"agent_pull", "agent_refresh", "editor_pull", "editor_refresh"})
+# Every operation that belongs to no project: the builds, and the backup (on its own lane).
+LANE_VERBS = BUILD_VERBS | {"backup"}
 # Audited like the operations: `attach` hands out a credential, the others change something.
-AUDITED_VERBS = OP_VERBS | BUILD_VERBS | {"limits", "attach", "port_add", "port_remove", "agents_model", "pin_reset"}
+AUDITED_VERBS = OP_VERBS | LANE_VERBS | {"limits", "attach", "port_add", "port_remove", "agents_model", "pin_reset", "backup_rm", "backup_fetch"}
 # Answered by this process at once, under the project's lock taken without waiting.
 LOCKED_VERBS = frozenset({"limits", "port_add", "port_remove", "agents_model"})
 LIMITS = ("pids", "memory", "cpus")
@@ -164,6 +178,11 @@ FIELDS = {
     "port_list": frozenset({"name"}),
     "setup_needed": frozenset(),
     "first_password": frozenset({"code", "proof"}),
+    "backup": frozenset(),
+    "backup_active": frozenset(),
+    "backup_list": frozenset(),
+    "backup_rm": frozenset({"backup"}),
+    "backup_fetch": frozenset({"backup"}),
 }
 
 
@@ -257,10 +276,11 @@ def op_state(op_id):
     return dict(out, state="failed", msg="The operation ended without a result.")
 
 
-def ops_in_flight(builds=False):
+def ops_in_flight(builds=False, backups=False):
     """Every operation on a project whose child lives: {op_id, project, verb, state}, oldest
     first; with `builds`, every build instead, in RS's build_active shape: {op_id, verb,
-    target, agent?, state}. A marker whose child is gone is cleared on the way."""
+    target, agent?, state}; with `backups`, the backup in flight, in the same shape. A marker
+    whose child is gone is cleared on the way."""
     try:
         found = os.listdir(MARKERS)
     except OSError:
@@ -283,7 +303,7 @@ def ops_in_flight(builds=False):
                 told = json.load(fh)
             if not builds and told["project"] is not None:
                 out.append({"op_id": op_id, "project": told["project"], "verb": told["verb"], "state": "running"})
-            elif builds and told["project"] is None:
+            elif (builds or backups) and told["project"] is None and (told["verb"] == "backup") == backups:
                 op = {"op_id": op_id, "verb": told["verb"], "target": told["target"], "state": "running"}
                 if isinstance(told.get("agent"), str):
                     op["agent"] = told["agent"]
@@ -304,7 +324,13 @@ def start_operation(op_id, verb, name, limits, spawn, extra=None):
     Refuse("bad_request") for an op_id already used. `extra` is more of the spec, checked
     values only."""
     extra = dict(extra or {})
-    if verb in BUILD_VERBS:
+    if verb == "backup":
+        try:
+            lane = core.take_backup_lane()
+        except core.CoreError as exc:
+            raise Refuse("busy", str(exc)) from exc
+        handed, told = {"lane_fds": [fh.fileno() for fh in lane]}, {"target": "backup"}
+    elif verb in BUILD_VERBS:
         try:
             lane = core.take_build_lane(extra["software"])
         except core.CoreError as exc:
@@ -351,6 +377,8 @@ def spawn_child(spec, children):
 
 def what_was_done(verb, name, out):
     """The last word of an operation that went well."""
+    if verb == "backup":
+        return out["said"]
     if verb in BUILD_VERBS:
         label = core.SOFTWARE[out.get("software", "")]["label"] if out.get("software") in core.SOFTWARE else "The software"
         label = label[0].upper() + label[1:]
@@ -368,8 +396,11 @@ def run_operation(spec):
     """The child: do the work with the project's lock (or the build lane) already in hand, and
     say how it went."""
     op_id, verb, name = spec["op_id"], spec["verb"], spec["name"]
-    build = verb in BUILD_VERBS
-    if build:
+    build = verb in LANE_VERBS
+    if verb == "backup":
+        core.BACKUP_HELD = True  # handed over by the broker, held through spec["lane_fds"]
+        handed = list(spec.get("lane_fds", []))
+    elif build:
         core.LANE_HELD = spec["software"]  # handed over by the broker, held through spec["lane_fds"]
         handed = list(spec.get("lane_fds", []))
     else:
@@ -386,7 +417,7 @@ def run_operation(spec):
         """The project is free before the last word is written: whoever reads "done" and asks
         for the next thing at once must not be told "busy"."""
         if build:
-            core.LANE_HELD = None
+            core.LANE_HELD, core.BACKUP_HELD = None, False
         else:
             core.HELD.discard(name)
         for fd in handed:
@@ -396,6 +427,8 @@ def run_operation(spec):
         if verb == "create":
             chosen = {key: spec[key] for key in CREATE_SOFTWARE if key in spec}
             out = core.create(name, spec["limits"], say, **chosen)
+        elif verb == "backup":
+            out = core.backup(say)
         elif verb == "agent_pull":
             out = core.agent_pull(spec["agent"], say)
         elif verb == "agent_refresh":
@@ -721,6 +754,16 @@ def dispatch(verb, args, token=None, tokens=None, *, op_id=None, audit=None, spa
             return ok({"ops": ops_in_flight()})
         if verb == "build_active":
             return ok({"ops": ops_in_flight(builds=True)})
+        if verb == "backup_active":
+            return ok({"ops": ops_in_flight(backups=True)})
+
+        # Settings -> Backup: the list, a removal, a backup made readable for one download.
+        if verb == "backup_list":
+            return ok(core.backups_list())
+        if verb == "backup_rm":
+            return answered("ok", ok(core.backup_rm(args.get("backup"))))
+        if verb == "backup_fetch":
+            return answered("ok", ok(core.backup_fetch(args.get("backup"))))
 
         # Settings -> Software: reads, the two that ask upstream answered in the request
         # (bounded by the core), and "Use repo version".

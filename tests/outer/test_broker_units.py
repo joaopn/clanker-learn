@@ -76,7 +76,7 @@ def test_a_verb_that_is_not_in_the_table_is_unknown_and_nothing_passes_through(w
     for verb in ("docker", "exec", "update", "passwd", "", None, 7, "__run-op"):
         assert kind(world.call(verb)) == "unknown_verb"
     assert sorted(broker.FIELDS) == ["agent_pull", "agent_refresh", "agent_refresh_check", "agents_add", "agents_model", "agents_update", "attach",
-                                     "build_active", "build_alive", "create", "destroy", "editor_pull", "editor_refresh", "editor_refresh_check",
+                                     "backup", "backup_active", "backup_fetch", "backup_list", "backup_rm", "build_active", "build_alive", "create", "destroy", "editor_pull", "editor_refresh", "editor_refresh_check",
                                      "first_password", "lifecycle_active", "limits", "list", "models", "op", "pin_reset", "port_add", "port_detect",
                                      "port_list", "port_remove", "recreate", "setup_needed", "software_status", "start", "status", "stop"]
 

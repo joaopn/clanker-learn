@@ -38,6 +38,8 @@ The software projects get (Claude Code, the editor) is fetched once into a distr
     /data/dist/editor.json            the same for the editor, with the extensions' versions
     /data/dist-staging                where a distribution is built before it replaces the old
     /data/versions.local.env          versions raised by Refresh, over /opt/cl/versions.env
+    /data/backups                     the backups (`cl backup`): one archive each, all of /data
+                                      but the distributions; `cl restore` puts one back
 
 Every project gets its own copy, in its home folder, as research-sandbox does it: the image's
 deploy script (/opt/cl/deploy, run as the sandbox user) copies an agent's distribution into
@@ -63,7 +65,8 @@ short is therefore never taken for a creation that was: nothing starts such a pr
 running destroy again finishes it.
 
 This module is also the `cl` command: `cl create <name> [--agent claude] [--editor]
-[--claude-model M] [--claude-effort E]`, `cl list`, `cl agents add|update|model <name>`, and so on.
+[--claude-model M] [--claude-effort E]`, `cl list`, `cl agents add|update|model <name>`,
+`cl backup`, `cl backups`, `cl backup-rm <name>`, `cl restore <file or name>`, and so on.
 """
 import argparse
 import base64
@@ -2399,6 +2402,524 @@ def keep_web(env, status_port, report, sleep=time.sleep, turns=None, now=time.mo
     return 0
 
 
+# --- backups -------------------------------------------------------------------------------
+#
+# A backup is one gzipped tar under /data/backups, written under a temporary name and renamed
+# when whole (gaggiclanker's write_backup). Its first member is manifest.json; then what a
+# restore needs, at the paths it has under /data. The distributions are not in it (they are
+# fetched again), nor is a sandbox's own filesystem (its setup recipe brings that back when its
+# container is made again), nor the backups. The tutor's database is copied through SQLite's
+# own backup call, so that a running tutor service does not tear it; everything else is copied
+# as it stands, running projects included, and the result says so.
+
+BACKUPS = f"{DATA}/backups"
+BACKUP_NAME = re.compile(r"cl-backup-[0-9]{8}T[0-9]{6}Z\.tar\.gz")
+BACKUP_FORMAT, BACKUP_FORMAT_VERSION = "clanker-learn backup", 1
+# What of /data a backup keeps: "broker" is the broker's folder (broker_auth.BROKER_DIR: the
+# password's hash, the audit log).
+BACKUP_TOPS = ("core", "projects", "homes", "tutor", "web", "broker", "versions.local.env")
+BACKUP_LEAVES_OUT = {
+    "dist": "the fetched software (Claude Code, the editor): fetched again at the first start, or with Pull in Settings",
+    "dist-staging": "what a build of the software left half made",
+    "backups": "the backups themselves",
+    "the sandboxes' own filesystems": "what was installed outside /workspace and the home folder: each project's setup recipe "
+                                      "(/workspace/.learn/setup.sh) brings it back when its container is made again",
+}
+TUTOR_DB = f"{DATA}/tutor/tutor.db"
+WEB_DOWNLOADS = f"{DATA}/web/downloads"   # cl-web's /data/downloads: a backup linked there for one download
+DOWNLOAD_LINK = re.compile(r"[0-9a-f]{16}-(cl-backup-[0-9]{8}T[0-9]{6}Z\.tar\.gz)")
+DOWNLOAD_LINK_S = 600          # a link the web server did not take within this is cleared
+BACKUP_GZIP_LEVEL = 1          # most of a home is programs, which compress little: speed over a few per cent
+RESTORE_STAGING = f"{DATA}/.restore-staging"
+RESTORE_OLD = f"{DATA}/.restore-old"
+BACKUP_HELD = False            # this process was handed the backup lane by a parent that took it
+
+
+def take_backup_lane():
+    """The lane of backups and restores, taken without waiting: an open file that holds it."""
+    lane = lane_file("backup.lock")
+    try:
+        fcntl.flock(lane, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lane.close()
+        raise CoreError("A backup or a restore is under way; try again when it is done.") from None
+    return [lane]
+
+
+@contextlib.contextmanager
+def backup_lane():
+    if BACKUP_HELD:
+        yield
+        return
+    held = take_backup_lane()
+    try:
+        yield
+    finally:
+        for fh in held:
+            fh.close()
+
+
+def fsync_folder(path):
+    folder = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(folder)
+    finally:
+        os.close(folder)
+
+
+def human_size(size):
+    for unit in ("bytes", "KB", "MB", "GB"):
+        if size < 1024 or unit == "GB":
+            return f"{size} {unit}" if unit == "bytes" else f"{size:.1f} {unit}"
+        size /= 1024
+    return ""
+
+
+def tutor_db_version_supported():
+    """The newest version of the tutor's database the tutor service of this image opens: read
+    from its code, which is in this image as the build context of its image (an older file it
+    brings up to date itself)."""
+    try:
+        found = re.search(r"^SCHEMA_VERSION = ([0-9]+)$", read_text(f"{TUTOR_DIR}/store.py"), re.MULTILINE)
+    except OSError:
+        found = None
+    if not found:
+        raise CoreError(f"Which version of the tutor's database this clanker-learn knows could not be read from {TUTOR_DIR}/store.py.")
+    return int(found.group(1))
+
+
+def snapshot_tutor_db(dest):
+    """A consistent copy of the tutor's database at `dest`, through SQLite's backup call (a
+    reader: the tutor service goes on writing), as one file. Its version, or None when there
+    is no database yet."""
+    import sqlite3
+    if not os.path.isfile(TUTOR_DB):
+        return None
+    source = sqlite3.connect(TUTOR_DB, timeout=30)
+    try:
+        copy = sqlite3.connect(dest)
+        try:
+            source.backup(copy)
+            copy.execute("PRAGMA journal_mode = DELETE")   # one file, whatever the source's journal is
+            version = copy.execute("PRAGMA user_version").fetchone()[0]
+        finally:
+            copy.close()
+    except sqlite3.Error as exc:
+        raise CoreError(f"The tutor's database could not be copied ({exc}).") from exc
+    finally:
+        source.close()
+    return version
+
+
+class Padded:
+    """A file read for exactly `size` bytes: what tar's header announced. A file that shrank
+    while it was read (a running project writes) is filled with zeros, one that grew is cut;
+    either way the archive stays whole and the file is counted as torn."""
+
+    def __init__(self, fh, size):
+        self.fh, self.left, self.short = fh, size, False
+
+    def read(self, count=-1):
+        count = self.left if count is None or count < 0 else min(count, self.left)
+        data = self.fh.read(count)
+        if len(data) < count:
+            data += b"\0" * (count - len(data))
+            self.short = True
+        self.left -= count
+        return data
+
+
+def add_tree(tar, arc, tally, only_folder=(), leave_out=()):
+    """Add /data/<arc> to the archive, a folder with everything in it, without following a
+    link. Something that vanishes while it is walked (a running project) is counted, not an
+    error. A folder in `only_folder` goes in without its content; `leave_out` is not added."""
+    if arc in leave_out:
+        return
+    path = os.path.join(DATA, arc)
+    try:
+        mode = os.lstat(path).st_mode
+        if stat.S_ISREG(mode):
+            # Opened without blocking, so that a file replaced by a pipe meanwhile does not hang
+            # the backup; described from the open file, so that the header and the data agree.
+            with open(os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK), "rb") as fh:
+                info = tar.gettarinfo(arcname=arc, fileobj=fh)
+                if info is None:
+                    return
+                if info.isreg():
+                    data = Padded(fh, info.size)
+                    tar.addfile(info, data)
+                    if data.short or os.fstat(fh.fileno()).st_size != info.size:
+                        tally["torn"] += 1
+                else:
+                    tar.addfile(info)   # a hard link to a file already in, or what the file became
+            tally["files"] += 1
+            return
+        info = tar.gettarinfo(path, arcname=arc)
+        if info is None or info.ischr() or info.isblk():   # a socket, a device: nothing to keep
+            return
+        tar.addfile(info)
+        if not info.isdir() or arc in only_folder:
+            return
+        names = sorted(os.listdir(path))
+    except (FileNotFoundError, NotADirectoryError):
+        tally["vanished"] += 1
+        return
+    for name in names:
+        add_tree(tar, f"{arc}/{name}", tally, only_folder, leave_out)
+
+
+def add_bytes(tar, arc, data):
+    info = tarfile.TarInfo(arc)
+    info.size, info.mode, info.mtime = len(data), 0o600, int(time.time())
+    tar.addfile(info, io.BytesIO(data))
+
+
+def project_parts(name):
+    """A project's files and folders, as paths under /data."""
+    p = paths(name)
+    return [os.path.relpath(p[key], DATA) for key in ("record", "ports", "host_keys", "provision", "tutor_keys", "workspace", "home")]
+
+
+def sandbox_running(name):
+    """Whether a project's sandbox runs; True when the daemon cannot say (the backup then says
+    its files may be torn rather than nothing)."""
+    try:
+        container = inspect_container(paths(name)["container"])
+    except CoreError:
+        return True
+    return bool(container and container["State"].get("Running"))
+
+
+def image_identity():
+    """What this clanker-learn is, as far as it knows: the tags of the three inner images (a
+    hash of their definitions), the mode it runs in, the newest tutor database it opens."""
+    out = {kind: image_tag(folder, repo) for kind, (folder, repo, _label) in IMAGES.items() if os.path.isdir(folder)}
+    with contextlib.suppress(OSError, ValueError):
+        out["mode"] = json.loads(read_text("/run/cl/state.json")).get("mode")
+    with contextlib.suppress(CoreError):
+        out["tutor_db_version"] = tutor_db_version_supported()
+    return out
+
+
+def backup(say=say_nothing):
+    """`cl backup`: one archive of everything clanker-learn keeps but the distributions."""
+    with backup_lane():
+        return write_backup(say)
+
+
+def write_backup(say=say_nothing, kind="backup"):
+    """The backup itself, with the backup lane in hand. Each project is copied under its lock
+    (waited for: a create, a destroy or a start is not cut through); its sandbox may run and
+    write meanwhile, which the result says."""
+    os.makedirs(BACKUPS, mode=0o700, exist_ok=True)
+    for left in os.listdir(BACKUPS):   # what a backup that was killed left
+        if left.startswith(".cl-backup-"):
+            with contextlib.suppress(OSError):
+                remove_path(os.path.join(BACKUPS, left))
+    began, made_at = time.monotonic(), datetime.datetime.now(datetime.UTC)
+    name = f"cl-backup-{made_at.strftime('%Y%m%dT%H%M%SZ')}.tar.gz"
+    final, temporary, db_copy = f"{BACKUPS}/{name}", f"{BACKUPS}/.{name}.part", f"{BACKUPS}/.{name}.tutor.db"
+    if os.path.exists(final):
+        raise CoreError(f"A backup named {name} is there already; try again in a second.")
+    projects = []
+    for one in recorded_names():
+        with contextlib.suppress(CoreError):
+            record = read_record(one)
+            if record["wanted"] != "destroying":
+                projects.append({"name": one, "agents": record["agents"], "editor": record["editor"], "created": record["created"]})
+    running = [one["name"] for one in projects if sandbox_running(one["name"])]
+    tally = {"files": 0, "torn": 0, "vanished": 0}
+    try:
+        say("copying the tutor's database")
+        db_version = snapshot_tutor_db(db_copy)
+        manifest = {"format": BACKUP_FORMAT, "format_version": BACKUP_FORMAT_VERSION, "kind": kind,
+                    "made_at": made_at.isoformat(timespec="seconds"), "made_by": image_identity(),
+                    "tutor_db_version": db_version, "projects": projects, "running": running,
+                    "inside": [top for top in BACKUP_TOPS if os.path.lexists(f"{DATA}/{top}")], "not_inside": BACKUP_LEAVES_OUT}
+        with open(os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb") as fh:
+            with tarfile.open(fileobj=fh, mode="w:gz", compresslevel=BACKUP_GZIP_LEVEL, format=tarfile.PAX_FORMAT) as tar:
+                add_bytes(tar, "manifest.json", json.dumps(manifest, indent=2).encode())
+                say("copying the settings, the password, the keys and the web server's certificate")
+                # The projects' own parts of core/ and tutor/ are added with each project, under its lock.
+                per_project = ("core/projects", "core/provision", "core/keys", "core/ports", "tutor/keys")
+                for top in BACKUP_TOPS:
+                    if top not in ("projects", "homes") and os.path.lexists(f"{DATA}/{top}"):
+                        add_tree(tar, top, tally, only_folder=per_project,
+                                 leave_out=("tutor/tutor.db", "tutor/tutor.db-wal", "tutor/tutor.db-shm", "web/downloads"))
+                if db_version is not None:
+                    tar.add(db_copy, arcname="tutor/tutor.db")
+                for top in ("projects", "homes"):
+                    if os.path.isdir(f"{DATA}/{top}"):
+                        add_tree(tar, top, tally, only_folder=(top,))
+                for one in projects:
+                    say(f"copying {one['name']}" + (" (it runs: what it writes meanwhile may be torn)" if one["name"] in running else ""))
+                    with locked(one["name"]):
+                        if not os.path.exists(paths(one["name"])["record"]):
+                            say(f"{one['name']} was destroyed meanwhile; it is not in the backup")
+                            continue
+                        for part in project_parts(one["name"]):
+                            if os.path.lexists(f"{DATA}/{part}"):   # a project without ports named by hand has no ports file
+                                add_tree(tar, part, tally)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(temporary, final)
+        fsync_folder(BACKUPS)
+    except BaseException as exc:
+        with contextlib.suppress(OSError):
+            os.remove(temporary)
+        if isinstance(exc, OSError):
+            raise CoreError(f"The backup could not be written ({exc.strerror or exc}); nothing was kept.") from exc
+        raise
+    finally:
+        with contextlib.suppress(OSError):
+            os.remove(db_copy)
+    size, seconds = os.path.getsize(final), round(time.monotonic() - began, 1)
+    said = f"{name}: {human_size(size)}, made in {seconds} s, with {len(projects)} project{'s' * (len(projects) != 1)}."
+    if running:
+        said += (f" Made while {len(running)} project{'s were' if len(running) != 1 else ' was'} running ({', '.join(running)}):"
+                 " files being written at that moment may be torn.")
+    if tally["torn"] or tally["vanished"]:
+        said += f" {tally['torn']} file(s) changed while they were copied and {tally['vanished']} vanished."
+    said += " The fetched software is not in it: it is fetched again."
+    return {"backup": name, "path": final, "size": size, "seconds": seconds, "projects": [one["name"] for one in projects],
+            "running": running, "files": tally["files"], "torn": tally["torn"], "vanished": tally["vanished"], "said": said,
+            "manifest": manifest}
+
+
+def checked_backup_name(name):
+    if not isinstance(name, str) or not BACKUP_NAME.fullmatch(name):
+        raise CoreError("A backup is named as clanker-learn names it: cl-backup-<date>T<time>Z.tar.gz.")
+    return name
+
+
+def read_manifest(path):
+    """The manifest of an archive, checked to be a clanker-learn backup's; it is its first
+    member, so this reads the start of the file only."""
+    try:
+        with tarfile.open(path, "r:*") as tar:
+            first = tar.next()
+            if first is None or first.name != "manifest.json" or not first.isreg() or first.size > 1024 * 1024:
+                raise ValueError("it does not begin with clanker-learn's manifest")
+            manifest = json.loads(tar.extractfile(first).read())
+    except tarfile.ReadError as exc:
+        raise CoreError(f"{os.path.basename(path)} is not a clanker-learn backup (it is not a tar archive).") from exc
+    except (OSError, EOFError, tarfile.TarError, ValueError, UnicodeDecodeError) as exc:
+        raise CoreError(f"{os.path.basename(path)} is not a clanker-learn backup ({exc}).") from exc
+    if not isinstance(manifest, dict) or manifest.get("format") != BACKUP_FORMAT:
+        raise CoreError(f"{os.path.basename(path)} is not a clanker-learn backup (its manifest is another's).")
+    if manifest.get("format_version") != BACKUP_FORMAT_VERSION:
+        raise CoreError(f"{os.path.basename(path)} is a backup of format {manifest.get('format_version')!r}; this clanker-learn reads format "
+                        f"{BACKUP_FORMAT_VERSION} only.")
+    return manifest
+
+
+def backups_list():
+    """`cl backups`: every backup, newest first: its name, when it was made, its size, its
+    projects; one whose manifest cannot be read says why."""
+    try:
+        names = sorted((one for one in os.listdir(BACKUPS) if BACKUP_NAME.fullmatch(one)), reverse=True)
+    except FileNotFoundError:
+        return []
+    out = []
+    for name in names:
+        path = f"{BACKUPS}/{name}"
+        try:
+            row = {"backup": name, "size": os.path.getsize(path)}
+        except OSError:
+            continue   # removed meanwhile
+        try:
+            manifest = read_manifest(path)
+            projects = [one["name"] for one in manifest.get("projects", []) if isinstance(one, dict) and isinstance(one.get("name"), str)]
+            row.update(made_at=str(manifest.get("made_at", "")), kind=str(manifest.get("kind", "")), projects=projects,
+                       running=list(manifest.get("running", [])))
+        except CoreError as exc:
+            row["problem"] = str(exc)
+        out.append(row)
+    return out
+
+
+def backup_rm(name):
+    """`cl backup-rm <name>`."""
+    path = f"{BACKUPS}/{checked_backup_name(name)}"
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        raise CoreError(f"There is no backup named {name}.") from None
+    return {"backup": name, "removed": True}
+
+
+def backup_fetch(name):
+    """One backup made readable to the web server for one download: a hard link to it in the
+    web server's own folder (the same volume: nothing is copied), under a name nobody can
+    guess. The web server opens it and removes the link at once. The backups' folder itself is
+    never mounted into the web server: it would read every backup, each of which holds the
+    password's hash, the tutor's token and every project's keys (research-sandbox keeps its
+    exports out of its web server for the same reason)."""
+    path = f"{BACKUPS}/{checked_backup_name(name)}"
+    if not os.path.isfile(path):
+        raise CoreError(f"There is no backup named {name}.")
+    os.makedirs(WEB_DOWNLOADS, mode=0o700, exist_ok=True)
+    for left in os.listdir(WEB_DOWNLOADS):   # links the web server never took (it died, say): each holds its backup's space
+        with contextlib.suppress(OSError):
+            if time.time() - os.lstat(f"{WEB_DOWNLOADS}/{left}").st_mtime > DOWNLOAD_LINK_S:
+                os.remove(f"{WEB_DOWNLOADS}/{left}")
+    link = f"{secrets.token_hex(8)}-{name}"
+    os.link(path, f"{WEB_DOWNLOADS}/{link}")
+    os.utime(f"{WEB_DOWNLOADS}/{link}", follow_symlinks=False)   # a link shares the file's times: the clearing above goes by when it was made
+    return {"backup": name, "size": os.path.getsize(path), "file": link}
+
+
+def tutor_activity(timeout=5):
+    """The answers being written now, as the tutor service lists them at /activity, or None
+    and why when it cannot be asked (asked as the keeper asks its health, with the secret the
+    web server and the tutor service share)."""
+    try:
+        container = inspect_container(TUTOR_CONTAINER)
+        if container is None or not container["State"].get("Running"):
+            return None, "the tutor service is not running"
+        address = (container["NetworkSettings"]["Networks"].get(FRONT_NET) or {}).get("IPAddress", "")
+        if not address:
+            return None, f"the tutor service has no address on {FRONT_NET}"
+        request = urllib.request.Request(f"http://{address}:{TUTOR_PORT}/activity", headers={"X-CL-Secret": read_text(tutor_secret_path()).strip()})
+        with urllib.request.urlopen(request, timeout=timeout) as answer:
+            running = json.loads(answer.read(1024 * 1024))["result"]["running"]
+        return list(running), ""
+    except (CoreError, OSError, urllib.error.URLError, ValueError, KeyError, TypeError) as exc:
+        return None, f"the tutor service could not be asked ({getattr(exc, 'reason', exc)})"
+
+
+def restore_filter(member, dest):
+    """tar's own filter for where a member lands (inside the staging folder, no absolute
+    path), with the archive's owners and modes kept as they are (a home is the sandbox user's);
+    a hard link must point inside too; a device is not made."""
+    tarfile.tar_filter(member, dest)   # raises for a member that would land outside; its changed copy is not used
+    if member.ischr() or member.isblk():
+        return None
+    if member.islnk():
+        target = os.path.realpath(os.path.join(dest, member.linkname))
+        if os.path.commonpath([target, os.path.realpath(dest)]) != os.path.realpath(dest):
+            raise tarfile.OutsideDestinationError(member, target)
+    return member
+
+
+def restored_members(tar):
+    for member in tar:
+        if member.name == "manifest.json":
+            continue
+        if member.name.split("/", 1)[0] not in BACKUP_TOPS:
+            raise CoreError(f"The backup holds {member.name[:200]!r}, which is not something clanker-learn keeps; nothing was replaced.")
+        yield member
+
+
+def labelled(kind, running_only=False):
+    """The names of the inner daemon's containers (or networks) that belong to a project: what
+    the core labels with cl.project, recorded or not."""
+    if kind == "network":
+        listed = docker("network", "ls", "--filter", "label=cl.project", "--format", "{{.Name}}")
+    else:
+        listed = docker("ps", *(() if running_only else ("-a",)), "--filter", "label=cl.project", "--format", "{{.Names}}")
+    return listed.stdout.split()
+
+
+def restore(source, say=say_nothing):
+    """`cl restore <file or name>`: everything a backup holds put back in place of what is
+    there. Refused while a project runs, an answer is being written, or a backup, a build or
+    an operation is under way. What is there is first kept as a backup of its own. Every
+    project's container is removed (its next start makes it again from its record, and its
+    setup recipe runs), and the web server and the tutor service are removed too: the keeper
+    makes them again within seconds, and they read the restored state."""
+    global BACKUP_HELD
+    path = f"{BACKUPS}/{source}" if BACKUP_NAME.fullmatch(source) else os.path.abspath(source)
+    if not os.path.isfile(path):
+        raise CoreError(f"There is no backup at {path}.")
+    manifest = read_manifest(path)
+    have = tutor_db_version_supported()
+    if isinstance(manifest.get("tutor_db_version"), int) and manifest["tutor_db_version"] > have:
+        raise CoreError(f"This backup was made by a newer clanker-learn: its tutor's database is at version {manifest['tutor_db_version']}, "
+                        f"and this one knows versions up to {have}. Restore it with that version or a newer one; nothing was changed.")
+    held, names, kept = take_backup_lane(), set(), set()
+    try:
+        build = lane_file("dist.lock")
+        held.append(build)
+        try:
+            fcntl.flock(build, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise CoreError("The software is being built now; restore when that is done.") from None
+        names |= set(recorded_names()) | {one["name"] for one in manifest.get("projects", []) if isinstance(one, dict) and NAME.fullmatch(str(one.get("name")))}
+        for name in sorted(names):
+            lock = try_lock(name)
+            if lock is None:
+                raise CoreError(f"Something is being done with {name}; restore when it is over. Nothing was changed.")
+            held.append(lock)
+            HELD.add(name)
+        running = sorted(container.removeprefix("cl-sb-") for container in labelled("container", running_only=True))
+        if running:
+            raise CoreError(f"Stop every project first: {', '.join(running)} {'is' if len(running) == 1 else 'are'} running, and a restore "
+                            "replaces the projects' folders. Nothing was changed.")
+        answers, why_not = tutor_activity()
+        if answers:
+            raise CoreError(f"The tutor is writing {len(answers)} answer(s) now; restore when they are done. Nothing was changed.")
+        notes = [] if answers is not None else [f"Whether an answer was being written could not be asked ({why_not}); with every project stopped none can be."]
+        say("keeping what is there as a backup first")
+        BACKUP_HELD = True
+        try:
+            safety = write_backup(say, kind="what was there before a restore")
+        finally:
+            BACKUP_HELD = False
+        say(f"kept as {safety['backup']}; unpacking {os.path.basename(path)}")
+        remove_path(RESTORE_STAGING)
+        os.makedirs(RESTORE_STAGING, mode=0o700)
+        try:
+            with tarfile.open(path, "r:*") as tar:
+                tar.extractall(RESTORE_STAGING, members=restored_members(tar), numeric_owner=True, filter=restore_filter)
+            if not os.path.isdir(f"{RESTORE_STAGING}/core"):
+                raise CoreError("The backup holds no core folder; nothing was replaced.")
+        except BaseException as exc:
+            remove_path(RESTORE_STAGING)
+            if isinstance(exc, (OSError, EOFError, tarfile.TarError)):
+                raise CoreError(f"The backup could not be unpacked ({exc}); nothing was replaced.") from exc
+            raise
+        say("removing the projects' containers")
+        for container in labelled("container"):
+            docker("rm", "-f", "-v", container, timeout=STOP_GRACE_S + 120)
+        say("putting the backup's folders in place")
+        remove_path(RESTORE_OLD)
+        os.makedirs(RESTORE_OLD, mode=0o700)
+        try:
+            # Renames on one volume: each folder is replaced at once. The web server and the
+            # tutor service keep the folders they have mounted (the old ones, renamed away)
+            # until they are made again, below.
+            for top in BACKUP_TOPS:
+                if os.path.lexists(f"{DATA}/{top}"):
+                    os.rename(f"{DATA}/{top}", f"{RESTORE_OLD}/{top}")
+                if os.path.lexists(f"{RESTORE_STAGING}/{top}"):
+                    os.rename(f"{RESTORE_STAGING}/{top}", f"{DATA}/{top}")
+            fsync_folder(DATA)
+        except OSError as exc:
+            raise CoreError(f"The folders could not all be put in place ({exc}). What was there is in {RESTORE_OLD} and in the backup "
+                            f"{safety['backup']}.") from exc
+        for container in (WEB_CONTAINER, TUTOR_CONTAINER):
+            if there_is("container", container):
+                docker("rm", "-f", "-v", container, timeout=STOP_GRACE_S + 120)
+        kept = {one["name"] for one in manifest.get("projects", []) if isinstance(one, dict) and isinstance(one.get("name"), str)}
+        for network in labelled("network"):
+            if network.removeprefix("cl-net-") not in kept:
+                docker("network", "rm", network, check=False)
+        remove_path(RESTORE_OLD)
+        remove_path(RESTORE_STAGING)
+    finally:
+        HELD.difference_update(names)
+        for fh in held:
+            fh.close()
+    projects = sorted(kept)
+    said = (f"Restored {os.path.basename(path)} (made {manifest.get('made_at', '?')}), with {len(projects)} project(s): {', '.join(projects) or 'none'}. "
+            f"What was there before is kept as {safety['backup']}. The web server and the tutor service are being made again and read the "
+            "restored state in a few seconds; log in again with the backup's password. Start your projects: each one's container is made "
+            "again, and its setup recipe runs once.")
+    return {"restored": os.path.basename(path), "made_at": manifest.get("made_at"), "projects": projects, "safety_backup": safety["backup"],
+            "notes": notes, "said": said}
+
+
 # --- the `cl` command ----------------------------------------------------------------------
 
 def read_new_password(stdin=None):
@@ -2465,6 +2986,11 @@ def main(argv=None):
     one.add_argument("name")
     one.add_argument("--model", help="a tier (opus, sonnet, haiku, fable) or a model id")
     one.add_argument("--effort", help="low, medium, high, xhigh or max")
+    verbs.add_parser("backup", help="one archive of everything clanker-learn keeps but the fetched software, under /data/backups")
+    verbs.add_parser("backups", help="the backups there are")
+    verbs.add_parser("backup-rm", help="remove a backup").add_argument("backup")
+    verbs.add_parser("restore", help="put a backup back in place of everything there is (every project stopped first)").add_argument(
+        "backup", help="a backup's name (cl backups lists them) or the path of an archive")
     for verb in ("status", "create", "start", "stop", "recreate", "destroy", "limits"):
         one = verbs.add_parser(verb)
         one.add_argument("name")
@@ -2507,6 +3033,14 @@ def main(argv=None):
                 out = agents_model(args.name, args.model, args.effort)
         elif args.verb == "start-wanted":
             out = start_wanted(say)
+        elif args.verb == "backup":
+            out = backup(say)
+        elif args.verb == "backups":
+            out = backups_list()
+        elif args.verb == "backup-rm":
+            out = backup_rm(args.backup)
+        elif args.verb == "restore":
+            out = restore(args.backup, say)
         elif args.verb == "status":
             out = status(args.name)
         elif args.verb in ("create", "limits"):

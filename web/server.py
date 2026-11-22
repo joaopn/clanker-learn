@@ -8,8 +8,9 @@ It carries: the login (the proof the browser derives from the password is relaye
 broker, which authenticates; the broker's session token stays here, server-side, under a
 cookie scoped to /broker), the first password (a set-up code from the container's log), the
 project list and status, the project actions (its agents among them), Settings -> Software
-(the builds of the agents and the editor, followed as operations) and the model catalog, the
-progress of an operation, a project's
+(the builds of the agents and the editor, followed as operations) and the model catalog,
+Settings -> Backup (make one, list them, remove one, download one), the progress of an
+operation, a project's
 terminal (a WebSocket relayed to the sandbox's sshd, where it runs tmux), a project's session
 cookie (which its web-app tabs are opened with), a project's tabs (the files server, the web
 apps named by hand or detected, the raw TCP ports named by hand), opening a web app on an
@@ -647,6 +648,97 @@ async def broker_lifecycle_handler(request: web.Request) -> web.Response:
     "starting…" labels from this after a reload."""
     status, body = await _relay(request, "lifecycle_active")
     return web.json_response(body, status=status)
+
+
+# ---- Settings -> Backup ---------------------------------------------------------------
+
+# A backup's name as the core makes it, matched whole: the browser's name reaches no path
+# here; the file opened is the one the broker names, matched against its own rule.
+_BACKUP_NAME_RE = re.compile(r"cl-backup-[0-9]{8}T[0-9]{6}Z\.tar\.gz")
+_DOWNLOAD_LINK_RE = re.compile(r"[0-9a-f]{16}-(cl-backup-[0-9]{8}T[0-9]{6}Z\.tar\.gz)")
+DOWNLOADS_DIR = DATA_DIR / "downloads"   # the broker links a backup here for one download
+DOWNLOAD_CHUNK = 256 * 1024
+
+
+async def broker_backups_handler(request: web.Request) -> web.Response:
+    """GET /broker/backups — every backup, newest first: [{backup, size, made_at, kind,
+    projects, running} or {backup, size, problem}] (gated read)."""
+    status, body = await _relay(request, "backup_list")
+    return web.json_response(body, status=status)
+
+
+async def broker_backup_make_handler(request: web.Request) -> web.Response:
+    """POST /broker/backups — make a backup (gated, origin-checked). An operation that belongs
+    to no project, as a build: {ok, op_id} at once, followed at /broker/op/<id>/log and
+    /broker/op/<id>; its last record's msg is the core's sentence (name, size, time, and
+    whether running projects may have left torn files). Another backup under way: busy."""
+    if not origin_ok(request):
+        return web.Response(status=403, text="origin rejected")
+    return await _lane_relay(request, "backup", {}, "backups")
+
+
+async def broker_backup_active_handler(request: web.Request) -> web.Response:
+    """GET /broker/backups/active — the backup in flight, {ops:[{op_id, verb, target, state}]}
+    (gated), for the page to find it again after a reload."""
+    status, body = await _relay(request, "backup_active")
+    return web.json_response(body, status=status)
+
+
+async def broker_backup_remove_handler(request: web.Request) -> web.Response:
+    """POST /broker/backups/remove {backup, proof} — remove a backup (gated, origin-checked,
+    step-up: the proof of the re-typed password, as destroy has it)."""
+    if not origin_ok(request):
+        return web.Response(status=403, text="origin rejected")
+    body = await _json_body(request)
+    if body is None:
+        return _bad_request() if _broker_session(request) else _unauthorized()
+    args = {"backup": body.get("backup")}
+    if isinstance(body.get("proof"), str):
+        args["proof"] = body["proof"]
+    status, reply = await _relay(request, "backup_rm", args)
+    return web.json_response(reply, status=status)
+
+
+def _open_download(path: Path):
+    """Open the link the broker made and remove it at once: the open file is all that is
+    needed, and no link is left behind by a download that is cut short. Blocking."""
+    fh = open(path, "rb")  # noqa: SIM115 - closed by the handler once it has been sent
+    with contextlib.suppress(OSError):
+        os.remove(path)
+    return fh
+
+
+async def broker_backup_download_handler(request: web.Request) -> web.StreamResponse:
+    """GET /broker/backups/{backup}/download — the archive, as a file to save (gated; a read,
+    so not origin-checked: the SameSite=Strict cookie is its CSRF defense, and what it starts
+    is an audited link). The broker's backup_fetch makes the one file readable here."""
+    name = request.match_info.get("backup", "")
+    if _broker_session(request) is None:
+        return _unauthorized()
+    if not _BACKUP_NAME_RE.fullmatch(name):
+        return _bad_request()
+    status, reply = await _relay(request, "backup_fetch", {"backup": name})
+    if status != 200 or not reply.get("ok"):
+        return web.json_response(reply, status=status if status != 200 else 404)
+    link = str(reply.get("result", {}).get("file", ""))
+    found = _DOWNLOAD_LINK_RE.fullmatch(link)
+    if not found or found.group(1) != name:
+        return web.json_response({"ok": False, "error": {"kind": "failed", "message": "the broker named no file to send"}}, status=500)
+    try:
+        fh = await asyncio.to_thread(_open_download, DOWNLOADS_DIR / link)
+    except OSError as e:
+        return web.json_response({"ok": False, "error": {"kind": "io_error", "message": e.strerror or "open failed"}}, status=500)
+    try:
+        response = web.StreamResponse(headers={
+            "Content-Type": "application/gzip", "Content-Length": str(os.fstat(fh.fileno()).st_size),
+            "Content-Disposition": f'attachment; filename="{name}"', "Cache-Control": "no-store"})
+        await response.prepare(request)
+        while chunk := await asyncio.to_thread(fh.read, DOWNLOAD_CHUNK):
+            await response.write(chunk)
+        await response.write_eof()
+        return response
+    finally:
+        fh.close()
 
 
 def _read_from(path: Path, frm: int) -> tuple[bytes, int]:
@@ -2055,6 +2147,11 @@ def build_app() -> web.Application:
     app.router.add_post("/broker/software/build", broker_build_handler)
     app.router.add_post("/broker/software/refresh-check", broker_refresh_check_handler)
     app.router.add_post("/broker/software/pin-reset", broker_pin_reset_handler)
+    app.router.add_get("/broker/backups", broker_backups_handler)
+    app.router.add_post("/broker/backups", broker_backup_make_handler)
+    app.router.add_get("/broker/backups/active", broker_backup_active_handler)
+    app.router.add_post("/broker/backups/remove", broker_backup_remove_handler)
+    app.router.add_get("/broker/backups/{backup}/download", broker_backup_download_handler)
     app.router.add_post("/broker/project", broker_create_handler)
     app.router.add_get("/broker/project/{name}", broker_project_status_handler)
     app.router.add_get("/broker/project/{name}/terminal", ws_handler)
