@@ -65,8 +65,15 @@ def flatten(content):
 
 
 def one_line(text, limit=LABEL):
-    first = str(text).strip().splitlines()[0] if str(text).strip() else ""
-    return first if len(first) <= limit else first[: limit - 1] + "…"
+    """The first line, cut to `limit`; for text of several lines, followed by how many more
+    there are (`first line  (+3 lines)`), so that a heredoc or a `python3 -c` says it goes on.
+    The whole text stays in the tool line's detail."""
+    lines = str(text).strip().splitlines()
+    first = lines[0].rstrip() if lines else ""
+    more = len(lines) - 1
+    suffix = f"  (+{more} line{'s' if more > 1 else ''})" if more else ""
+    room = limit - len(suffix)
+    return (first if len(first) <= room else first[: room - 1] + "…") + suffix
 
 
 def tool_view(name, arguments):

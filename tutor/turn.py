@@ -60,6 +60,8 @@ IDLE_S = 30 * 60           # no overall limit (installing software takes long), 
 STOP_GRACE_S = 5           # after the interrupt, before the run's processes are ended as root
 END_S = 15                 # after the end of the answer, for the agent to end once its input is closed
 CLEANUP_S = 30
+SHUTDOWN_KILL_S = 3        # at a stop of the service, for the running answers' processes to be ended
+SHUTDOWN_END_S = 2         # then for the turns to be stored as interrupted
 CHECK_S = 30               # an exercise's check command, before it is ended
 CHECK_KEEP = 4000          # of a check's output, the end of it, what is stored
 LINE_LIMIT = 16 * 1024 * 1024   # a whole file read by a tool comes back on one line
@@ -149,7 +151,7 @@ async def kill_tagged(project, run_id, tag=None):
     """End every process in the sandbox that carries this run's CL_RUN_ID (or `tag`, a whole
     NAME=value), and its descendants. Best effort: a sandbox that is gone has nothing left to end."""
     if not os.path.isfile(f"{KEYS}/{project}/id_ed25519"):
-        return
+        return True
     tag = tag or f"CL_RUN_ID={run_id}"
     remote = "sh -c " + " ".join(shlex.quote(part) for part in (KILL_TAGGED, "kill-tagged", FIND_TAGGED, tag))
     proc = None
@@ -159,11 +161,15 @@ async def kill_tagged(project, run_id, tag=None):
         out, err = await asyncio.wait_for(proc.communicate(), CLEANUP_S)
         log.info("%s: ended %s process(es) in %s%s", tag, out.decode(errors="replace").strip() or "no",
                  project, f" ({err.decode(errors='replace').strip()[-200:]})" if proc.returncode else "")
-    except (OSError, TimeoutError) as exc:
+        return proc.returncode == 0
+    except (OSError, TimeoutError, asyncio.CancelledError) as exc:
         log.info("%s: the clean-up in %s did not run (%s)", tag, project, type(exc).__name__)
         if proc is not None and proc.returncode is None:
             with contextlib.suppress(ProcessLookupError):
                 proc.kill()
+        if isinstance(exc, asyncio.CancelledError):
+            raise
+        return False
 
 
 async def write_file_as_learner(project, path, text):
@@ -228,10 +234,16 @@ async def run_check(project, command, run_id=None, check_id=None):
         await proc.wait()
     err = (await proc.stderr.read()).decode(errors="replace").strip()
     if not timed_out and proc.returncode == 255 and not out and err:
-        raise cards.CheckError(START_PROJECT if any(sign in err for sign in UNREACHABLE) else f"The check could not reach the sandbox: {err.splitlines()[-1][:300]}")
+        raise cards.CheckError(START_PROJECT if any(sign in err for sign in UNREACHABLE) else
+                               f"The check could not reach the sandbox ({err.splitlines()[-1][:300]}): stop and start the project from its "
+                               "gear (⚙) in the project list, then press Check again.")
     text = out.decode(errors="replace")
     return {"exit_code": None if timed_out else proc.returncode, "output": text[-CHECK_KEEP:], "cut": total > CHECK_KEEP or len(text) > CHECK_KEEP,
             "timed_out": timed_out, "seconds": round(asyncio.get_running_loop().time() - started, 1)}
+
+
+def new_stretch():
+    return {"text": [], "tools": [], "proposals": [], "cards": [], "stored": None}
 
 
 class Turn:
@@ -254,8 +266,13 @@ class Turn:
         self.proc = None
         self.reader = None          # the reader of the agent's output, while it runs
         self.cancel_requested = False
+        self.shutdown = False       # the service is stopping: the turn ends as interrupted
+        self.cleaned = False        # its processes in the sandbox were ended by the stop
+        self.usage = None           # its usage, when the stop ended it
         self.done = asyncio.Event()
-        self.stretch = {"text": [], "tools": [], "proposals": [], "cards": []}   # the assistant's message being written
+        # The assistant's message being written; `stored` is its row once a tool line made it
+        # stored (so that a restart keeps the line), updated until the stretch ends.
+        self.stretch = new_stretch()
         self.tools = {}                            # call id: (its dict, the stored message's id or None)
 
 
@@ -315,8 +332,14 @@ class Runner:
         outcomes = store.untold_outcomes(db, lesson["id"])
         globals_ = knowledge.untold_global(db, lesson["id"])
         acted = store.untold_cards(db, lesson["id"])
-        turn.notes = ([plans.outcome_note(row) for row in outcomes] + [knowledge.global_outcome_note(row) for row in globals_]
-                      + [cards.note(row) for row in acted])
+        # What changed in the plan since this conversation's last turn (in another one, or by
+        # hand); its own proposal's change is its outcome, taken as seen when it was approved.
+        now = plans.plan_snapshot(db, lesson["project"], lesson["created"])
+        seen = store.plan_seen(db, lesson["id"])
+        plan_note = plans.plan_note(seen, now, lesson["id"]) if seen is not None else None
+        store.set_plan_seen(db, lesson["id"], now)
+        turn.notes = ([plans.outcome_note(row) for row in outcomes] + ([plan_note] if plan_note else [])
+                      + [knowledge.global_outcome_note(row) for row in globals_] + [cards.note(row) for row in acted])
         store.mark_told(db, [row["id"] for row in outcomes])
         knowledge.mark_global_told(db, [row["id"] for row in globals_])
         store.mark_cards_told(db, [row["id"] for row in acted])
@@ -418,6 +441,50 @@ class Runner:
         row = store.run(self.db, run_id)
         return store.run_out(row) if row else None
 
+    def refresh_plan_seen(self, turn):
+        """What the conversation saw of its own lesson, brought up to date at the end of its
+        turn: its tutor closed it, or knows of it."""
+        seen = store.plan_seen(self.db, turn.lesson_id)
+        if seen is None:
+            return
+        now = plans.plan_snapshot(self.db, turn.project, turn.created)
+        key = str(turn.lesson_id)
+        if key in now["lessons"]:
+            seen["lessons"][key] = now["lessons"][key]
+            store.set_plan_seen(self.db, turn.lesson_id, seen)
+
+    async def shutdown(self):
+        """The service is stopping (listening has stopped): every running turn ended, its
+        processes in the sandbox (the agent, its commands, a check) ended as root by their tag,
+        within SHUTDOWN_KILL_S, its SSH child ended, and the turn marked interrupted. A turn
+        whose processes could not be ended in time stays `running`, for the clean-up at the
+        next start."""
+        turns = list(self.by_run.values())
+        if not turns:
+            return
+        log.info("stopping: ending %d running answer(s)", len(turns))
+        for t in turns:
+            t.shutdown = True
+            if t.reader is not None:
+                t.reader.cancel()
+
+        async def end(t):
+            kills = [kill_tagged(t.project, t.run_id)]
+            kills += [kill_tagged(project, t.run_id, f"CL_CHECK_ID={check_id}") for check_id, project in self.checks.get(t.run_id, {}).items()]
+            t.cleaned = all(await asyncio.gather(*kills))
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(asyncio.gather(*(end(t) for t in turns)), SHUTDOWN_KILL_S)
+        for t in turns:
+            if t.proc is not None and t.proc.returncode is None:
+                with contextlib.suppress(ProcessLookupError):
+                    t.proc.kill()
+        await asyncio.wait([asyncio.ensure_future(t.done.wait()) for t in turns], timeout=SHUTDOWN_END_S)
+        for t in turns:
+            if t.cleaned and t.done.is_set():
+                store.finish_run(self.db, t.run_id, "interrupted", store.STOPPED, t.usage)
+        log.info("stopping: %s", ", ".join(f"run {t.run_id} {'ended' if t.done.is_set() else 'still ending'}"
+                                           f"{'' if t.cleaned else ' (its processes are left to the clean-up at the next start)'}" for t in turns))
+
     async def cleanup_at_start(self, found):
         """What the runs found running at start left in their sandboxes, ended (best effort)."""
         for run_id, project in found:
@@ -440,7 +507,15 @@ class Runner:
         elif kind == "tool_call":
             tool = {"id": data["id"], "kind": data["kind"], "label": data["label"], "detail": data["detail"], "ok": None, "output": ""}
             stretch["tools"].append(tool)
-            turn.tools[data["id"]] = (tool, None)
+            # Stored now, not at the end of the stretch: a tool line running when the service
+            # stops or restarts stays in the conversation. The page hears of the message at the
+            # end of the stretch, as before.
+            text = "".join(stretch["text"])
+            if stretch["stored"] is None:
+                stretch["stored"] = store.add_message(self.db, turn.lesson_id, turn.run_id, "assistant", text, stretch["tools"])
+            else:
+                store.set_message(self.db, stretch["stored"], text, stretch["tools"])
+            turn.tools[data["id"]] = (tool, stretch["stored"])
         elif kind == "tool_result" and data["id"] in turn.tools:
             tool, stored = turn.tools[data["id"]]
             tool.update(ok=data["ok"], output=data["output"])
@@ -453,15 +528,21 @@ class Runner:
     def flush(self, turn):
         stretch = turn.stretch
         text = "".join(stretch["text"])
-        if text or stretch["tools"] or stretch["proposals"] or stretch["cards"]:
+        if stretch["stored"] is not None:
+            message_id = stretch["stored"]
+            store.set_message(self.db, message_id, text, stretch["tools"])
+        elif text or stretch["tools"] or stretch["proposals"] or stretch["cards"]:
             message_id = store.add_message(self.db, turn.lesson_id, turn.run_id, "assistant", text, stretch["tools"])
+        else:
+            message_id = None
+        if message_id is not None:
             store.link_proposals(self.db, stretch["proposals"], message_id)
             store.link_cards(self.db, stretch["cards"], message_id)
             message = store.message(self.db, message_id)
             for tool in stretch["tools"]:
                 turn.tools[tool["id"]] = (tool, message["id"])
             self.emit(turn, "message", {"message": message})
-        turn.stretch = {"text": [], "tools": [], "proposals": [], "cards": []}
+        turn.stretch = new_stretch()
 
     async def _write(self, turn, obj):
         proc = turn.proc
@@ -508,6 +589,8 @@ class Runner:
                 outcome, error, usage, seen = await self._attempt(turn, sent, session_id, resume)
                 if seen:
                     store.set_session(self.db, turn.lesson_id, turn.agent, session_id, True, store.text_hash(turn.text), turn.message_id)
+                if turn.shutdown:
+                    break
                 if outcome == "session gone":      # its session is gone: a fresh session, taken up from the files
                     session_id, resume = str(uuid.uuid4()), False
                     store.set_session(self.db, turn.lesson_id, turn.agent, session_id, False)
@@ -525,32 +608,52 @@ class Runner:
                 break
             else:
                 status, error = "failed", "The tutor's session for this lesson could not be started."
+        except asyncio.CancelledError:
+            turn.shutdown = True
+            raise
         except Exception as exc:
             log.exception("run %s failed", turn.run_id)
-            status, error = "failed", f"The tutor service failed during this turn ({type(exc).__name__})."
+            status, error = "failed", (f"The tutor service failed during this answer ({type(exc).__name__}; its log says more): "
+                                       "send your message again.")
         finally:
+            if turn.shutdown:
+                status, error = "interrupted", store.STOPPED
             try:
+                # A tool line still without a result when the answer ended never gets one.
+                for tool, _stored in turn.tools.values():
+                    if tool["ok"] is None:
+                        tool.update(unfinished=True, output=tool["output"] or store.UNFINISHED)
+                        self.emit(turn, "tool_result", {"id": tool["id"], "ok": None, "output": tool["output"], "unfinished": True})
                 self.flush(turn)
+                store.mark_unfinished(self.db, turn.run_id)
+                self.refresh_plan_seen(turn)
                 if status == "ok":
                     self.emit(turn, "completed", {"usage": usage, "agent": turn.agent})
                 elif status == "cancelled":
                     self.emit(turn, "cancelled", {"agent": turn.agent})
                 else:
                     self.emit(turn, "error", {"message": error, "agent": turn.agent})
-                store.finish_run(self.db, turn.run_id, status, error if status == "failed" else "", usage)
+                # At a stop of the service the run is marked interrupted by `shutdown`, once its
+                # processes in the sandbox are known to be ended; else it stays `running`, and the
+                # next start marks it and ends them (store.reconcile_running).
+                if status == "interrupted":
+                    turn.usage = usage
+                else:
+                    store.finish_run(self.db, turn.run_id, status, error if status == "failed" else "", usage)
                 store.touch_lesson(self.db, turn.lesson_id)
             finally:
                 self.by_lesson.pop(turn.lesson_id, None)
                 self.by_run.pop(turn.run_id, None)
                 self.tokens.pop(mcp.token_key(turn.token), None)
                 turn.done.set()
-                self.tasks.spawn(f"transcript-{turn.run_id}", self.write_transcript(turn.lesson_id))
+                if not turn.shutdown:
+                    self.tasks.spawn(f"transcript-{turn.run_id}", self.write_transcript(turn.lesson_id))
 
     async def _attempt(self, turn, text, session_id, resume):
         """One launch of the agent. Returns (outcome, error, usage, whether its session
         started): outcome is "ok", "cancelled", "failed", or "session gone" / "session exists"
         for the caller to try again."""
-        if turn.cancel_requested:
+        if turn.cancel_requested or turn.shutdown:
             return "cancelled", "", None, False
         if not os.path.isfile(f"{KEYS}/{turn.project}/id_ed25519"):
             return "failed", START_PROJECT, None, False

@@ -1,5 +1,5 @@
--- The tutor service's database: one file, /data/tutor/tutor.db, at user_version 4. A file at
--- version 1, 2 or 3 is brought to 4 in place at start (store.MIGRATIONS); any other version is
+-- The tutor service's database: one file, /data/tutor/tutor.db, at user_version 5. A file at
+-- version 1 to 4 is brought to 5 in place at start (store.MIGRATIONS); any other version is
 -- refused.
 
 -- A lesson belongs to a project as the pair (name, created): a new project with an old name
@@ -9,7 +9,9 @@
 -- summary and one line); dropped when a change of plan took it out after it was started.
 -- `slug` is fixed at creation: it names the lesson's folder in the workspace, which a rename
 -- must not move. `agent` is the agent that teaches it (claude or pi), NULL for the default one
--- (the setting `default_agent`); its sessions are in `sessions`, one per agent.
+-- (the setting `default_agent`) until its first answer, then the one that answered it last; its
+-- sessions are in `sessions`, one per agent. `plan_seen` is what the conversation last saw of
+-- its project's plan (JSON, plans.plan_snapshot; empty before its first turn).
 CREATE TABLE lessons (
     id              INTEGER PRIMARY KEY,
     project         TEXT NOT NULL,
@@ -26,6 +28,7 @@ CREATE TABLE lessons (
     slug            TEXT NOT NULL DEFAULT '',
     project_removed INTEGER NOT NULL DEFAULT 0,
     agent           TEXT,
+    plan_seen       TEXT NOT NULL DEFAULT '',
     created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
@@ -245,4 +248,4 @@ CREATE TABLE settings (
     value TEXT NOT NULL
 );
 
-PRAGMA user_version = 4;
+PRAGMA user_version = 5;

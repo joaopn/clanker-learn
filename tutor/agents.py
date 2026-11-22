@@ -28,7 +28,7 @@ MCP_HEADERS = {"Authorization": "Bearer ${CL_RUN_TOKEN}"}
 MCP_CONFIG = json.dumps({"mcpServers": {"learn": {"type": "http", "url": MCP_URL, "headers": MCP_HEADERS}}})
 PI_MCP_ENTRY = {"url": MCP_URL, "headers": MCP_HEADERS, "exposure": "direct"}
 
-START_PROJECT = "Start the project first."
+START_PROJECT = "The project is not running: start it from its gear (⚙) beside its name in the project list."
 UNREACHABLE = ("Could not resolve hostname", "Name or service not known", "Temporary failure in name resolution", "Connection refused",
                "No route to host", "timed out", "Connection closed by", "Connection reset")
 
@@ -38,14 +38,15 @@ def ssh_failure(code, stderr):
     if code == 255 and any(sign in stderr for sign in UNREACHABLE):
         return START_PROJECT
     if code == 255:
-        return "The tutor could not log in to the project's sandbox: " + (stderr.splitlines()[-1][:300] if stderr else "ssh failed")
+        return ("The tutor could not log in to the project's sandbox (" + (stderr.splitlines()[-1][:300] if stderr else "ssh failed")
+                + "): stop and start the project from its gear (⚙) in the project list, then send your message again.")
     return None
 
 
 class Claude:
     name = "claude"
     label = "Claude Code"
-    NO_AGENT = "This project has no Claude Code: add it in the project's gear, under Agents."
+    NO_AGENT = "This project has no Claude Code: add it from the project's gear (⚙) in the project list, under Agents."
     NOT_LOGGED_IN = ("Claude Code is not logged in in this project: run claude in its Shell and log in there, or set a token under "
                      "Settings → Tutor.")
     LOGIN_SIGNS = ("/login", "not logged in", "invalid api key", "oauth token", "authentication_error", "invalid bearer token",
@@ -77,7 +78,7 @@ class Claude:
         if cancelled:
             return "cancelled", ""
         if idle:
-            return "failed", "The tutor's Claude Code wrote nothing for 30 minutes, so the turn was ended."
+            return "failed", "The tutor's Claude Code wrote nothing for 30 minutes, so the answer was ended: send your message again to go on."
         result = reader.result
         said = " ".join(str(part) for part in ((result or {}).get("result"), *((result or {}).get("errors") or []), stderr) if part)
         lowered = said.lower()
@@ -90,13 +91,15 @@ class Claude:
         if any(sign in lowered for sign in self.LOGIN_SIGNS) or (result or {}).get("api_error_status") in (401, 403):
             return "failed", self.NOT_LOGGED_IN
         if result is not None:
-            return "failed", "Claude Code reported an error: " + (said[:300] or str(result.get("subtype") or "with no reason"))
+            return "failed", ("Claude Code reported an error (" + (said[:300] or str(result.get("subtype") or "with no reason"))
+                              + "): send your message again; if it comes back, run claude in the project's Shell to see why.")
         if code == 127 and "no claude code" in lowered:
             return "failed", self.NO_AGENT
         if ssh_failure(code, stderr):
             return "failed", ssh_failure(code, stderr)
         last = stderr.splitlines()[-1][:300] if stderr else "it said nothing"
-        return "failed", f"Claude Code ended without an answer (exit {code}): {last}"
+        return "failed", (f"Claude Code ended without an answer (exit {code}: {last}): send your message again; if it comes back, "
+                          "run claude in the project's Shell to see why.")
 
 
 class ClaudeReader(StreamReader):
@@ -161,7 +164,7 @@ NO_PI_SAID = "clanker-learn: no pi in this project"
 class Pi:
     name = "pi"
     label = "pi"
-    NO_AGENT = "This project has no pi: add it in the project's gear, under Agents."
+    NO_AGENT = "This project has no pi: add it from the project's gear (⚙) in the project list, under Agents."
     NOT_LOGGED_IN = "pi is not logged in in this project: run pi in its Shell and log in there."
     # What pi says when it has no credential for its model, or the provider refuses the one it has.
     LOGIN_SIGNS = ("no api key", "/login", "no model", "not logged in", "authentication_error", "invalid x-api-key", "invalid api key",
@@ -187,23 +190,25 @@ class Pi:
         if cancelled:
             return "cancelled", ""
         if idle:
-            return "failed", "The tutor's pi wrote nothing for 30 minutes, so the turn was ended."
+            return "failed", "The tutor's pi wrote nothing for 30 minutes, so the answer was ended: send your message again to go on."
         if reader.gone:
             return "session gone", ""
-        if code == 127 and NO_PI_SAID in stderr:
+        if code == 127 and (NO_PI_SAID in stderr or "has no pi" in stderr):   # the sandbox's stub `pi` says it too
             return "failed", self.NO_AGENT
         if ssh_failure(code, stderr):
             return "failed", ssh_failure(code, stderr)
         if reader.error is not None:
             if any(sign in reader.error.lower() for sign in self.LOGIN_SIGNS):
                 return "failed", self.NOT_LOGGED_IN
-            return "failed", "pi reported an error: " + reader.error[:300]
+            return "failed", ("pi reported an error (" + reader.error[:300] + "): send your message again; if it comes back, run pi in "
+                              "the project's Shell to see why.")
         if reader.finished and reader.aborted:
             return "cancelled", ""
         if reader.finished:
             return "ok", ""
         last = stderr.splitlines()[-1][:300] if stderr else "it said nothing"
-        return "failed", f"pi ended without an answer (exit {code}): {last}"
+        return "failed", (f"pi ended without an answer (exit {code}: {last}): send your message again; if it comes back, run pi in "
+                          "the project's Shell to see why.")
 
 
 ADAPTERS = {"claude": Claude(), "pi": Pi()}

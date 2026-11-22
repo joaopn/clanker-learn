@@ -20,7 +20,7 @@ import sqlite3
 import unicodedata
 import uuid
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 SCHEMA_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "schema.sql")
 NOW = "strftime('%Y-%m-%dT%H:%M:%fZ','now')"
 LESSONS_DIR = "/workspace/.learn/lessons"
@@ -172,7 +172,15 @@ CREATE TABLE settings (name TEXT PRIMARY KEY, value TEXT NOT NULL);
 PRAGMA user_version = 4;
 COMMIT;
 """
-MIGRATIONS = {1: MIGRATE_1_TO_2, 2: MIGRATE_2_TO_3, 3: MIGRATE_3_TO_4}
+# Version 4 (step 6) to 5 (the polish pass): what each conversation last saw of its project's
+# plan, so that its tutor is told at its next message what changed since (plans.plan_note).
+MIGRATE_4_TO_5 = """
+BEGIN;
+ALTER TABLE lessons ADD COLUMN plan_seen TEXT NOT NULL DEFAULT '';
+PRAGMA user_version = 5;
+COMMIT;
+"""
+MIGRATIONS = {1: MIGRATE_1_TO_2, 2: MIGRATE_2_TO_3, 3: MIGRATE_3_TO_4, 4: MIGRATE_4_TO_5}
 AGENTS = ("claude", "pi")
 AGENT_NAMES = {"claude": "Claude Code", "pi": "pi"}
 DEFAULT_AGENT = "claude"
@@ -349,6 +357,10 @@ def has_messages(db, lesson_id):
 
 
 def set_lesson_agent(db, lesson_id, agent):
+    """The lesson's own agent; None for the default one. A lesson under way that is set back to
+    the default is given the default agent in force by name, since it no longer follows it."""
+    if agent is None and answered_by(db, lesson_id) not in (None, default_agent(db)):
+        agent = default_agent(db)
     db.execute(f"UPDATE lessons SET agent = ?, updated_at = {NOW} WHERE id = ?", (agent, lesson_id))
     return lesson(db, lesson_id)
 
@@ -398,9 +410,27 @@ def default_agent(db):
     return agent if agent in AGENTS else DEFAULT_AGENT
 
 
+def answered_by(db, lesson_id):
+    """The agent that answered the lesson last (a run that ended well, or wrote something), or
+    None before its first answer."""
+    row = db.one("SELECT agent FROM runs WHERE lesson_id = ? AND (status = 'ok' OR EXISTS "
+                 "(SELECT 1 FROM messages WHERE messages.run_id = runs.id AND messages.role = 'assistant')) ORDER BY id DESC LIMIT 1",
+                 (lesson_id,))
+    return row["agent"] if row and row["agent"] in AGENTS else None
+
+
+def agent_choice(db, row):
+    """(the agent that teaches a lesson, why): its own choice ("lesson"); else, once it has
+    been answered, the agent that answered it last ("begun": a change of the default agent does
+    not move a lesson under way); else the default one ("default")."""
+    if row["agent"] in AGENTS:
+        return row["agent"], "lesson"
+    begun = answered_by(db, row["id"])
+    return (begun, "begun") if begun else (default_agent(db), "default")
+
+
 def agent_of(db, row):
-    """The agent that teaches a lesson: its own choice, else the default one."""
-    return row["agent"] if row["agent"] in AGENTS else default_agent(db)
+    return agent_choice(db, row)[0]
 
 
 def done_lessons(db, project, created):
@@ -583,6 +613,32 @@ def mark_cards_told(db, card_ids):
         db.execute("UPDATE cards SET told = 1 WHERE id = ?", (card_id,))
 
 
+def set_message(db, message_id, text, tools):
+    db.execute("UPDATE messages SET text = ?, tools_json = ? WHERE id = ?", (text, json.dumps(list(tools)), message_id))
+
+
+UNFINISHED = "(not finished: the answer ended while this was running)"
+
+
+def mark_unfinished(db, run_id):
+    """The tool lines of a run that never got a result, marked `unfinished`: the run ended (it
+    was stopped, failed, or the service stopped) while they ran."""
+    for row in db.all("SELECT id, tools_json FROM messages WHERE run_id = ? AND role = 'assistant'", (run_id,)):
+        tools = json.loads(row["tools_json"] or "[]")
+        if any(t.get("ok") is None and not t.get("unfinished") for t in tools):
+            tools = [dict(t, unfinished=True, output=t.get("output") or UNFINISHED) if t.get("ok") is None else t for t in tools]
+            db.execute("UPDATE messages SET tools_json = ? WHERE id = ?", (json.dumps(tools), row["id"]))
+
+
+def plan_seen(db, lesson_id):
+    row = db.one("SELECT plan_seen FROM lessons WHERE id = ?", (lesson_id,))
+    return json.loads(row["plan_seen"]) if row and row["plan_seen"] else None
+
+
+def set_plan_seen(db, lesson_id, snapshot):
+    db.execute("UPDATE lessons SET plan_seen = ? WHERE id = ?", (json.dumps(snapshot, ensure_ascii=False), lesson_id))
+
+
 def set_context(db, message_id, context):
     db.execute("UPDATE messages SET context = ? WHERE id = ?", (context, message_id))
 
@@ -623,7 +679,8 @@ def ended_runs(db, lesson_id):
     return [{"id": row["id"], "agent": row["agent"], "status": row["status"], "error": row["error"]} for row in rows]
 
 
-INTERRUPTED = "The tutor service restarted while this answer was being written."
+INTERRUPTED = "The tutor service restarted while this answer was being written: send your message again to go on."
+STOPPED = "The tutor service stopped while this answer was being written: send your message again to go on."
 
 
 def reconcile_running(db):
@@ -635,6 +692,7 @@ def reconcile_running(db):
     for row in found:
         append_event(db, row["id"], next_seq(db, row["id"]), "error", {"message": INTERRUPTED})
         db.execute(f"UPDATE runs SET status = 'interrupted', error = ?, finished_at = {NOW} WHERE id = ?", (INTERRUPTED, row["id"]))
+        mark_unfinished(db, row["id"])
     return [(row["id"], row["project"]) for row in found]
 
 

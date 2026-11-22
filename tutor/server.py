@@ -144,7 +144,11 @@ def lesson_or_404(request):
 
 
 def lesson_view(request, row):
-    return dict(store.lesson_out(row, request.app["runner"].running_run(row["id"])), agent_in_effect=store.agent_of(request.app["db"], row))
+    """A lesson with the agent in effect, and why (`agent_source`: "lesson", its own choice;
+    "begun", the agent that answered it last, which it keeps when the default agent changes;
+    "default", before its first answer)."""
+    agent, source = store.agent_choice(request.app["db"], row)
+    return dict(store.lesson_out(row, request.app["runner"].running_run(row["id"])), agent_in_effect=agent, agent_source=source)
 
 
 def agent_in(body, key):
@@ -272,6 +276,7 @@ async def approve_proposal(request):
     project, created = home["project"], home["created"]
     proposed = json.loads(row["proposed_json"])
     raw = body.get("modules", proposed["modules"])
+    before = plans.plan_snapshot(db, project, created)
     try:
         if row["kind"] == "plan":
             modules = plans.clean_plan(raw)
@@ -279,11 +284,16 @@ async def approve_proposal(request):
             plans.apply_plan(db, project, created, modules)
         else:
             modules, _dropped = plans.clean_change(db, project, created, raw)
-            changes = plans.describe_changes(proposed["modules"], modules)
+            changes = plans.describe_changes(proposed["modules"], modules, proposed.get("dropped", ()))
             plans.apply_change(db, project, created, modules)
     except plans.PlanError as exc:
         raise Refusal("validation", str(exc)) from None
     decided = store.decide_proposal(db, row["id"], "approved", {"modules": modules}, changes)
+    # The conversation the proposal came from is told of it as its outcome: not again among the
+    # plan's changes since its last turn.
+    seen = store.plan_seen(db, row["lesson_id"])
+    if seen is not None:
+        store.set_plan_seen(db, row["lesson_id"], plans.fold_seen(seen, before, plans.plan_snapshot(db, project, created)))
     return ok({"proposal": store.proposal_out(decided), "plan": store.plan_out(db, project, created, lambda r: lesson_view(request, r))})
 
 
@@ -622,12 +632,15 @@ def build_app(db, secret):
     ])
 
     async def on_shutdown(app):
-        await app["tasks"].cancel_all()
+        # Listening has stopped: the running answers are ended (their processes in the
+        # sandboxes too) and marked interrupted, which ends their streams; then the rest.
+        await app["runner"].shutdown()
+        await app["tasks"].cancel_all(timeout=2)
     app.on_shutdown.append(on_shutdown)
 
     # The tool server: its own application on its own port, started and stopped with this one.
     async def tool_server(app):
-        runner = web.AppRunner(mcp.build_tool_app(db, app["runner"]), access_log=None)
+        runner = web.AppRunner(mcp.build_tool_app(db, app["runner"]), access_log=None, shutdown_timeout=1)
         await runner.setup()
         await web.TCPSite(runner, "0.0.0.0", mcp.PORT).start()
         log.info("the learn tool server listens on every address, port %d", mcp.PORT)
@@ -670,7 +683,7 @@ def main():
     app.on_startup.append(clean_up)
     log.info("listening on %s:%d", host, PORT)
     try:
-        web.run_app(app, host=host, port=PORT, print=None, handle_signals=True, shutdown_timeout=5)
+        web.run_app(app, host=host, port=PORT, print=None, handle_signals=True, shutdown_timeout=2)
     finally:
         db.close()
 

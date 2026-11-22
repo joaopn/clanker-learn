@@ -135,10 +135,13 @@ def apply_change(db, project, created, modules):
         position += 1
 
 
-def describe_changes(proposed, approved):
+def describe_changes(proposed, approved, dropped=()):
     """How the learner's approved version differs from what was proposed, as sentences for the
     tutor. Lessons are matched by id, else by title, else by objective; one whose title and
-    objective both changed reads as removed and added."""
+    objective both changed reads as removed and added. `dropped` is what a change proposed to
+    drop: a lesson of it the learner placed is kept, and an existing lesson the proposal placed
+    that the learner left out is dropped."""
+    to_drop = {item.get("id") for item in dropped if item.get("id")}
     def flat(modules):
         return [dict(item, module=index, module_title=module["title"]) for index, module in enumerate(modules) for item in module["lessons"]]
     before, after = flat(proposed), flat(approved)
@@ -154,7 +157,10 @@ def describe_changes(proposed, approved):
             if match is not None:
                 break
         if match is None:
-            sentences.append(f"added the lesson “{item['title']}” (objective: {item['objective']})")
+            if item.get("id") in to_drop:
+                sentences.append(f"kept the lesson “{item['title']}”, which you proposed to drop, in the module “{item['module_title']}”")
+            else:
+                sentences.append(f"added the lesson “{item['title']}” (objective: {item['objective']})")
             continue
         used.add(match)
         old = before[match]
@@ -168,7 +174,8 @@ def describe_changes(proposed, approved):
             sentences.append(f"moved “{item['title']}” to the module “{item['module_title']}”")
     for i, old in enumerate(before):
         if i not in used:
-            sentences.append(f"removed the lesson “{old['title']}”")
+            sentences.append(f"dropped the lesson “{old['title']}”, which you proposed to keep" if old.get("id")
+                             else f"removed the lesson “{old['title']}”")
     if same_shape:
         for old, new in zip(proposed, approved, strict=True):
             if old["title"] != new["title"]:
@@ -192,6 +199,93 @@ def outcome_note(row):
         return f"[clanker-learn: the learner approved your proposed {what} (proposal {row['id']}) as you proposed it; plan_get shows the plan now.]"
     return (f"[clanker-learn: the learner approved your proposed {what} (proposal {row['id']}) with these changes: "
             + "; ".join(changes) + ". plan_get shows the plan now.]")
+
+
+# --- what changed in the plan since a conversation's last turn ----------------------------------
+
+PLAN_NOTE_ITEMS = 8
+PLAN_NOTE_TITLE = 80
+
+
+def plan_snapshot(db, project, created):
+    """What a tutor knows of its project's plan, to compare with later: each lesson's title,
+    objective, state and module (by title: modules are made anew at every change), the modules
+    and the order of the lessons."""
+    lessons, order = {}, []
+    titles = {m["id"]: m["title"] for m in store.modules(db, project, created)}
+    for row in store.lessons(db, project, created):
+        if row["kind"] != "lesson":
+            continue
+        lessons[str(row["id"])] = {"t": row["title"], "o": row["objective"], "s": row["state"], "m": titles.get(row["module_id"])}
+        if row["state"] != "dropped":
+            order.append(str(row["id"]))
+    return {"lessons": lessons, "modules": list(titles.values()), "order": order}
+
+
+def fold_seen(seen, before, after):
+    """`seen` with what changed from `before` to `after` taken as seen: the change a
+    conversation's own proposal made, which its tutor is told as the proposal's outcome."""
+    if seen is None:
+        return None
+    lessons = dict(seen["lessons"])
+    for key in set(before["lessons"]) | set(after["lessons"]):
+        if before["lessons"].get(key) != after["lessons"].get(key):
+            if key in after["lessons"]:
+                lessons[key] = after["lessons"][key]
+            else:
+                lessons.pop(key, None)
+    return {"lessons": lessons, "modules": after["modules"] if before["modules"] != after["modules"] else seen["modules"],
+            "order": after["order"] if before["order"] != after["order"] else seen["order"]}
+
+
+def plan_changes(seen, now, this_id=None):
+    """The changes from `seen` to `now`, as short phrases."""
+    def name(key, entry):
+        title = entry["t"] if len(entry["t"]) <= PLAN_NOTE_TITLE else entry["t"][: PLAN_NOTE_TITLE - 1] + "…"
+        return f"“{title}”" + (" (this lesson)" if key == str(this_id) else "")
+    out = []
+    modules_changed = seen["modules"] != now["modules"]
+    for key, new in now["lessons"].items():
+        old = seen["lessons"].get(key)
+        if old is None:
+            if new["s"] != "dropped":
+                out.append(f"added {name(key, new)}" + (f" to the module “{new['m']}”" if new["m"] else " outside the plan"))
+            continue
+        if old["t"] != new["t"]:
+            out.append(f"renamed {name(key, old)} to “{new['t']}”")
+        if old["s"] != "dropped" and new["s"] == "dropped":
+            out.append(f"dropped {name(key, new)}")
+            continue
+        if old["s"] == "dropped" and new["s"] != "dropped":
+            out.append(f"brought back {name(key, new)}")
+        if new["s"] == "done" and old["s"] != "done":
+            out.append(f"closed {name(key, new)} (done)")
+        if old["o"] != new["o"]:
+            out.append(f"changed the objective of {name(key, new)}")
+        if not modules_changed and old["m"] != new["m"] and new["s"] != "dropped" and old["s"] != "dropped":
+            out.append(f"moved {name(key, new)} to " + (f"the module “{new['m']}”" if new["m"] else "outside the plan"))
+    for key, old in seen["lessons"].items():
+        if key not in now["lessons"] and old["s"] != "dropped":
+            out.append(f"removed {name(key, old)}")
+    if modules_changed:
+        out.append("arranged the modules as: " + ", ".join(f"“{m}”" for m in now["modules"]) if now["modules"] else "removed every module")
+    common = [k for k in seen["order"] if k in now["order"]]
+    if common != [k for k in now["order"] if k in seen["order"]]:
+        out.append("changed the order of the lessons")
+    return out
+
+
+def plan_note(seen, now, this_id=None):
+    """Before the learner's text: what changed in the plan since this conversation's last turn
+    (from any conversation, or by hand), capped; None when nothing did."""
+    changes = plan_changes(seen, now, this_id)
+    if not changes:
+        return None
+    shown = changes[:PLAN_NOTE_ITEMS]
+    more = len(changes) - len(shown)
+    return ("[clanker-learn: since your last turn here, the project's study plan was changed outside this conversation (from another "
+            "conversation, or by the learner in the list): " + "; ".join(shown)
+            + (f"; and {more} more change(s)" if more else "") + ". plan_get shows the plan now.]")
 
 
 # --- a lesson's opening context ----------------------------------------------------------------
@@ -321,7 +415,7 @@ def transcript(db, row):
         if m["text"].strip():
             lines += [m["text"].strip(), ""]
         for tool in m.get("tools", []):
-            ok = {True: "ok", False: "failed", None: "no result"}[tool["ok"]]
+            ok = "not finished" if tool.get("unfinished") else {True: "ok", False: "failed", None: "no result"}[tool["ok"]]
             lines.append(f"- {tool['kind']}: `{tool['label']}` ({ok})")
             if tool["kind"] == "shell" and tool["detail"] != tool["label"]:
                 lines += ["  ```", *("  " + line for line in tool["detail"].splitlines()), "  ```"]
