@@ -1,0 +1,60 @@
+# clanker-learn: one container, with a Docker daemon of its own for the sandboxes.
+# The defaults are here; your settings go in .env (./setup creates it from .env.example).
+# Start: docker compose up (-d for the background). INSTALL.md says the rest.
+
+# One install per machine (the container's name is fixed), whatever the folder is called.
+name: clanker-learn
+
+services:
+  clanker-learn:
+    # Sysbox (the default) or privileged, from modes/<CL_MODE>.yaml: the runtime or the
+    # privilege, and CL_MODE for the start to check against what it was given.
+    extends:
+      file: modes/${CL_MODE:-sysbox}.yaml
+      service: mode
+    build:
+      context: .
+      dockerfile: outer/Dockerfile
+      # Without it every build gets a new image id even when fully cached, so every `up`
+      # would recreate the container and stop the sandboxes.
+      provenance: false
+    image: clanker-learn
+    # Built at every `up`: after a code change the container is made again; with nothing
+    # changed the build is cached and the running container is left alone.
+    pull_policy: build
+    # The name every `docker exec clanker-learn cl ...` in the documents uses.
+    container_name: clanker-learn
+    # The inner daemon manages control groups of its own: never the machine's.
+    cgroup: private
+    # Time to stop the sandboxes cleanly.
+    stop_grace_period: 60s
+    restart: unless-stopped
+    # No init:, pid:, network_mode: or entrypoint: the start refuses a container that does
+    # not have its own processes, network and init.
+    environment:
+      CL_WEB: ${CL_WEB:-on}
+      CL_WEB_PORT: ${CL_WEB_PORT:-7788}
+      CL_ORIGIN_PORTS: ${CL_ORIGIN_PORTS:-11100-11164}
+      CL_PASSTHROUGH_PORTS: ${CL_PASSTHROUGH_PORTS:-11200-11299}
+      CL_STATUS_PORT: ${CL_STATUS_PORT:-8080}
+    ports:
+      # Each port on the same number outside and inside, from the same setting: the page
+      # builds the tabs' addresses from these numbers.
+      - "${CL_BIND:-127.0.0.1}:${CL_WEB_PORT:-7788}:${CL_WEB_PORT:-7788}"
+      - "${CL_BIND:-127.0.0.1}:${CL_STATUS_PORT:-8080}:${CL_STATUS_PORT:-8080}"
+      - "${CL_BIND:-127.0.0.1}:${CL_ORIGIN_PORTS:-11100-11164}:${CL_ORIGIN_PORTS:-11100-11164}"
+      # Raw TCP to the ports named by hand in a project: no login in front of them.
+      - "${CL_BIND:-127.0.0.1}:${CL_PASSTHROUGH_PORTS:-11200-11299}:${CL_PASSTHROUGH_PORTS:-11200-11299}"
+    volumes:
+      - docker:/var/lib/docker
+      - data:/data
+
+volumes:
+  # Literal names (no project prefix): the names an install made with `docker run` used, so
+  # it keeps its data.
+  # The inner Docker's images and the sandboxes' containers.
+  docker:
+    name: ${CL_DOCKER_VOLUME:-clanker-learn-docker}
+  # Everything that is yours: projects, conversations, the password, settings, backups.
+  data:
+    name: ${CL_DATA_VOLUME:-clanker-learn-data}

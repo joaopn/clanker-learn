@@ -1,0 +1,7 @@
+# CL_MODE=privileged: for a machine without sysbox. The container is root-equivalent on the
+# machine; INSTALL.md says what that gives up.
+services:
+  mode:
+    privileged: true
+    environment:
+      CL_MODE: privileged

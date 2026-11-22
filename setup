@@ -1,0 +1,35 @@
+#!/bin/sh
+# Creates .env from .env.example, with CL_MODE set to sysbox when Docker has sysbox's runtime
+# and to privileged when it does not. An existing .env is never overwritten.
+set -eu
+cd "$(dirname "$0")"
+
+if ! runtimes=$(docker info --format '{{json .Runtimes}}' 2>/dev/null); then
+    echo "Docker could not be asked which runtimes it has (docker info failed). Is Docker running, and may you use it?" >&2
+    exit 1
+fi
+case $runtimes in
+    *'"sysbox-runc"'*) sysbox=yes ;;
+    *) sysbox=no ;;
+esac
+
+if [ -e .env ]; then
+    mode=$(sed -n 's/^[[:space:]]*CL_MODE=\([^[:space:]#]*\).*/\1/p' .env | tail -n 1)
+    echo ".env exists and is kept; it says CL_MODE=${mode:-<not set: sysbox>}."
+    if [ "${mode:-sysbox}" = sysbox ] && [ "$sysbox" = no ]; then
+        echo "Warning: Docker has no sysbox-runc runtime, so this mode will not start; set CL_MODE=privileged in .env, or install sysbox."
+    fi
+    exit 0
+fi
+
+if [ "$sysbox" = yes ]; then
+    mode=sysbox
+    echo "Docker has sysbox's runtime (sysbox-runc): CL_MODE=sysbox."
+else
+    mode=privileged
+    echo "Docker has no sysbox runtime (sysbox-runc), so CL_MODE=privileged: the container will be root-equivalent on this machine."
+    echo "To run on sysbox instead, install sysbox and set CL_MODE=sysbox in .env (INSTALL.md says what each gives)."
+fi
+sed "s/^CL_MODE=.*/CL_MODE=$mode/" .env.example > .env.tmp
+mv .env.tmp .env
+echo "Wrote .env. Next: docker compose up"

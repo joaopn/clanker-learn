@@ -2,3 +2,6 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .venv/
+
+# This machine's settings; ./setup creates it from .env.example when it is missing.
+.env

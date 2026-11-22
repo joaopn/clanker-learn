@@ -1,0 +1,7 @@
+# CL_MODE=sysbox (the default): the container runs in a user namespace of its own, so root
+# inside it is not root on the machine. Needs sysbox installed on the machine.
+services:
+  mode:
+    runtime: sysbox-runc
+    environment:
+      CL_MODE: sysbox
