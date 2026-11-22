@@ -1428,15 +1428,41 @@ function toggleLessons(name) {
     renderRail();
 }
 
+// A project's lessons are read as its plan (GET .../plan): Goals, the modules with their
+// lessons, the lessons added by hand, the dropped ones. `list` is all of them in that order.
+const isLesson = (l) => l && typeof l === "object" && typeof l.id === "string";
+function setPlan(name, plan) {
+    const modules = (Array.isArray(plan.modules) ? plan.modules : []).filter((m) => m && typeof m === "object")
+        .map((m) => ({ id: String(m.id), title: String(m.title || ""), lessons: (Array.isArray(m.lessons) ? m.lessons : []).filter(isLesson) }));
+    const other = (Array.isArray(plan.other) ? plan.other : []).filter(isLesson);
+    const dropped = (Array.isArray(plan.dropped) ? plan.dropped : []).filter(isLesson);
+    const goals = isLesson(plan.goals) ? plan.goals : null;
+    const list = [goals, ...modules.flatMap((m) => m.lessons), ...other, ...dropped].filter(Boolean);
+    S.lessons[name] = { list, goals, modules, other, dropped, error: null };
+    // A project shown for the first time opens on Goals.
+    if (goals && !S.lessonOf[name]) S.lessonOf[name] = goals.id;
+    for (const l of list) {
+        const pane = S.panes[paneKey(name, lessonTab(l.id))];
+        if (pane && pane.setLesson) pane.setLesson(l);
+    }
+}
+
 async function refreshLessons(name) {
     if (!S.loggedIn) return;
-    const r = await tutorApi("GET", `/project/${enc(name)}/lessons`);
+    const r = await tutorApi("GET", `/project/${enc(name)}/plan`);
     if (!S.loggedIn) return;
     const res = r.body.ok && r.body.result;
-    if (res && Array.isArray(res.lessons)) S.lessons[name] = { list: res.lessons.filter((l) => l && typeof l.id === "string"), error: null };
-    else S.lessons[name] = { list: (S.lessons[name] && S.lessons[name].list) || [], error: errText(r.body) };
+    if (res && typeof res === "object" && Array.isArray(res.modules)) setPlan(name, res);
+    else S.lessons[name] = { ...(S.lessons[name] || { list: [], modules: [], other: [], dropped: [], goals: null }), error: errText(r.body) };
     renderRail();
     renderTabbar();
+}
+
+// Goals of a project, once its lessons are read: the lesson a new project opens on.
+async function openGoals(name) {
+    await refreshLessons(name);
+    const L = S.lessons[name];
+    if (L && L.goals) { S.expanded.add(name); openLesson(name, L.goals.id); }
 }
 
 // With the page's other polls: who is working, and the lessons of the projects shown open.
@@ -1462,19 +1488,38 @@ async function refreshTutor() {
     renderRail();
 }
 
+// A lesson's state: its mark in the list (the mock's), and in words.
+const LESSON_MARKS = { not_started: "○", in_progress: "▸", done: "✓", dropped: "×" };
+const LESSON_STATES = { not_started: "not started", in_progress: "in progress", done: "done", dropped: "dropped" };
+const lessonState = (l) => (l && LESSON_STATES[l.state] ? l.state : "not_started");
+const lessonTip = (l) => [String(l.title || ""), l.kind === "goals" ? GOALS_LINE : l.objective ? String(l.objective) : null,
+    LESSON_STATES[lessonState(l)]].filter(Boolean).join("\n");
+const GOALS_LINE = "What you want to learn, and the study plan";
+
 function lessonRows(name) {
     const L = S.lessons[name];
     if (!L) return h("div", { class: "lessons" }, h("div", { class: "lnote" }, "Asking for the lessons…"));
-    if (L.error) return h("div", { class: "lessons" }, h("div", { class: "lnote bad", title: L.error }, L.error));
     const shown = S.current === name && !S.page ? lessonTabId(tabOf(name)) : null;
-    const rows = L.list.map((l) => {
+    const row = (l) => {
         const working = lessonWorking(name, l);
-        return h("div", { class: "lesson-row" + (l.id === shown ? " sel" : ""), onclick: () => openLesson(name, l.id) },
-            working ? h("span", { class: "pulse", title: "The tutor is working" }) : h("span", { class: "lwait", title: "Waiting for you" }, "○"),
-            h("span", { class: "ltitle", title: String(l.title || "") }, String(l.title || "Lesson")),
-            h("button", { class: "gear lgear", title: "Rename or delete",
-                          onclick: (ev) => { ev.stopPropagation(); lessonDialog(name, l); } }, "⋯"));
-    });
+        const st = lessonState(l);
+        return h("div", { class: `lesson-row st-${st}` + (l.id === shown ? " sel" : ""), title: lessonTip(l), onclick: () => openLesson(name, l.id) },
+            working ? h("span", { class: "pulse", title: "The tutor is working" }) : h("span", { class: `lst ${st}` }, LESSON_MARKS[st]),
+            h("span", { class: "ltitle" }, String(l.title || "Lesson")),
+            // Goals keeps its name and its place: no ⋯ for it.
+            l.kind === "goals" ? null : h("button", { class: "gear lgear", title: "Rename, change the objective, or delete",
+                                                      onclick: (ev) => { ev.stopPropagation(); lessonDialog(name, l); } }, "⋯"));
+    };
+    const rows = [];
+    if (L.error) rows.push(h("div", { class: "lnote bad", title: L.error }, L.error));
+    if (L.goals) rows.push(row(L.goals));
+    for (const m of L.modules || []) {
+        rows.push(h("div", { class: "lmod", title: m.title }, m.title));
+        rows.push(...m.lessons.map(row));
+    }
+    if ((L.other || []).length && (L.modules || []).length) rows.push(h("div", { class: "lmod" }, "Other lessons"));
+    rows.push(...(L.other || []).map(row));
+    rows.push(...(L.dropped || []).map(row));
     rows.push(h("div", { class: "lesson-row lnew", onclick: () => newLessonDialog(name) }, "+ New lesson"));
     return h("div", { class: "lessons" }, rows);
 }
@@ -1503,22 +1548,26 @@ function lessonGone(name, id) {
 
 function newLessonDialog(name) {
     const title = h("input", { type: "text", maxlength: 200, autocomplete: "off", placeholder: "Ownership and borrowing" });
+    const objective = h("input", { type: "text", maxlength: 1000, autocomplete: "off", placeholder: "Explain who frees a value, and when" });
     const said = h("p", { class: "bad" });
     const go = h("button", { class: "primary", type: "submit" }, "Create");
     const form = h("form", { method: "post", action: "#", onsubmit: async (ev) => {
         ev.preventDefault();
         if (!title.value.trim()) { said.textContent = "Give the lesson a title."; return; }
         go.disabled = true;
-        const r = await tutorApi("POST", `/project/${enc(name)}/lessons`, { title: title.value.trim() });
+        const body = { title: title.value.trim() };
+        if (objective.value.trim()) body.objective = objective.value.trim();
+        const r = await tutorApi("POST", `/project/${enc(name)}/lessons`, body);
         go.disabled = false;
         if (!r.body.ok || !r.body.result || typeof r.body.result.id !== "string") { said.textContent = errText(r.body); return; }
         closeModal();
-        const L = S.lessons[name] || (S.lessons[name] = { list: [], error: null });
-        if (!L.list.some((l) => l.id === r.body.result.id)) L.list.push(r.body.result);
+        const L = S.lessons[name] || (S.lessons[name] = { list: [], modules: [], other: [], dropped: [], goals: null, error: null });
+        if (!L.list.some((l) => l.id === r.body.result.id)) { L.list.push(r.body.result); (L.other || (L.other = [])).push(r.body.result); }
         S.expanded.add(name);
         openLesson(name, r.body.result.id);
         refreshLessons(name);
-    } }, h("p", { class: "muted" }, `A new conversation with the tutor in ${name}.`), formRow("Title", title), said,
+    } }, h("p", { class: "muted" }, `A new conversation with the tutor in ${name}, outside the study plan.`), formRow("Title", title),
+        formRow("Objective", objective, "optional: what you can do once it is done"), said,
         h("div", { class: "btns" }, h("button", { type: "button", onclick: closeModal }, "Cancel"), go));
     openModal("New lesson", form, []);
     title.focus();
@@ -1527,23 +1576,27 @@ function newLessonDialog(name) {
 function lessonDialog(name, lesson) {
     const title = h("input", { type: "text", maxlength: 200, autocomplete: "off" });
     title.value = String(lesson.title || "");
+    const objective = h("input", { type: "text", maxlength: 1000, autocomplete: "off" });
+    objective.value = String(lesson.objective || "");
     const said = h("p", { class: "bad" });
-    const save = h("button", { class: "primary", type: "submit" }, "Rename");
+    const save = h("button", { class: "primary", type: "submit" }, "Save");
     const form = h("form", { method: "post", action: "#", onsubmit: async (ev) => {
         ev.preventDefault();
         if (!title.value.trim()) { said.textContent = "Give the lesson a title."; return; }
+        const body = { title: title.value.trim() };
+        if (objective.value.trim() && objective.value.trim() !== String(lesson.objective || "")) body.objective = objective.value.trim();
         save.disabled = true;
-        const r = await tutorApi("PATCH", `/lessons/${enc(lesson.id)}`, { title: title.value.trim() });
+        const r = await tutorApi("PATCH", `/lessons/${enc(lesson.id)}`, body);
         save.disabled = false;
         if (!r.body.ok) { said.textContent = errText(r.body); return; }
         closeModal();
         const row = lessonRow(name, lesson.id);
-        if (row && r.body.result && typeof r.body.result.title === "string") row.title = r.body.result.title;
+        if (row && r.body.result && typeof r.body.result.title === "string") Object.assign(row, r.body.result);
         const pane = S.panes[paneKey(name, lessonTab(lesson.id))];
-        if (pane && row) pane.setTitle(row.title);
+        if (pane && row) pane.setLesson(row);
         render();
         refreshLessons(name);
-    } }, formRow("Title", title), h("div", { class: "btns" }, save));
+    } }, formRow("Title", title), formRow("Objective", objective), h("div", { class: "btns" }, save));
     const del = h("button", { class: "danger" }, "Delete the lesson");
     const zone = h("div", {}, h("p", { class: "note" }, "The lesson and its conversation go, for good. The files the tutor made in the sandbox stay."), h("div", { class: "btns" }, del));
     del.addEventListener("click", () => {
@@ -2190,27 +2243,258 @@ const TOOL_WORDS = { shell: "ran", read: "read", write: "wrote", edit: "edited",
 
 // A tool the tutor used, as the mock's trace line: a tick or a cross (… while it works), the
 // label, and what it gave when opened.
+// The tutor's own tools (kind "learn"), in plain words.
+const LEARN_WORDS = { plan_get: "looked at the plan", lesson_get: "looked at the lesson", lesson_history: "read the lessons done so far",
+                      lesson_close: "closed the lesson", plan_propose: "proposed a study plan", plan_change_propose: "proposed a change to the plan" };
+
+// What was sent to a "learn" tool, readable: its JSON arguments indented, or as they came.
+function learnDetail(detail) {
+    if (typeof detail !== "string" || !detail || detail === "{}") return "";
+    try { return JSON.stringify(JSON.parse(detail), null, 2); } catch (_) { return detail; }
+}
+
 function toolLine(tool) {
     const mark = h("span", {});
     const pre = h("pre", {});
-    const el = h("details", { class: "trace" },
+    const learn = tool.kind === "learn";
+    const label = String(tool.label || tool.kind || "tool");
+    const el = h("details", { class: "trace" + (learn ? " learn" : "") },
         h("summary", {}, mark, " ", TOOL_WORDS[tool.kind] ? h("span", { class: "tkind" }, TOOL_WORDS[tool.kind] + " ") : null,
-            h("span", { class: "tlabel" }, String(tool.label || tool.kind || "tool"))),
+            learn ? h("span", { class: "tlearn" }, LEARN_WORDS[label] || `used its tool ${label}`) : h("span", { class: "tlabel" }, label)),
         pre);
     const set = (ok, output) => {
         mark.className = ok === true ? "okc" : ok === false ? "badc" : "pendc";
         mark.textContent = ok === true ? "✓" : ok === false ? "✗" : "…";
-        const detail = typeof tool.detail === "string" && tool.detail && tool.detail !== tool.label ? tool.detail : "";
+        const detail = learn ? learnDetail(tool.detail) : typeof tool.detail === "string" && tool.detail && tool.detail !== tool.label ? tool.detail : "";
         const out = typeof output === "string" ? output : "";
+        if (learn) {
+            pre.textContent = [`Sent: ${detail || "nothing"}`, out ? `Answer: ${out}` : ok === null || ok === undefined ? "Still working…" : null]
+                .filter(Boolean).join("\n\n");
+            return;
+        }
         pre.textContent = [detail, out].filter(Boolean).join("\n\n") || (ok === null || ok === undefined ? "Still working…" : "(no output)");
     };
     set(tool.ok, tool.output);
     return { el, set };
 }
 
+// ---- a proposal: the plan card and the change card (after the mock's planHtml) --------------
+//
+// A plan is modules of lessons, each a title and an objective. While the card is open the
+// learner edits it in place (titles, objectives, lessons removed, added, moved; modules renamed,
+// removed, added); Approve sends their version ({} when nothing was changed), Dismiss sends
+// nothing. A change names the project's existing lessons by id and new ones by title and
+// objective; an existing lesson it leaves out is dropped. Once decided the card is read-only and
+// says what happened. The card keeps its edits across the redraws of its conversation: there is
+// one card per proposal id, made once and moved into each new drawing of its message.
+
+const cleanText = (s) => String(s || "").trim();
+const copyModules = (modules) => (Array.isArray(modules) ? modules : []).filter((m) => m && typeof m === "object").map((m) => ({
+    title: String(m.title || ""),
+    lessons: (Array.isArray(m.lessons) ? m.lessons : []).filter((l) => l && typeof l === "object").map((l) => ({
+        id: l.id === undefined || l.id === null ? null : String(l.id), title: String(l.title || ""), objective: String(l.objective || ""),
+        state: typeof l.state === "string" ? l.state : null })) }));
+// What is sent for a plan's or a change's modules: an existing lesson by its id.
+const wireModules = (modules) => modules.map((m) => ({ title: cleanText(m.title), lessons: m.lessons.map((l) => l.id
+    ? { id: Number(l.id), title: cleanText(l.title), objective: cleanText(l.objective) }
+    : { title: cleanText(l.title), objective: cleanText(l.objective) }) }));
+
+function proposalCard(name, p) {
+    const card = { p: null, draft: null, said: "", busy: false, sure: false };
+    const el = h("div", { class: "blk plan" });
+    card.el = el;
+    const isChange = () => card.p.kind === "change";
+    const open = () => card.p.state === "open";
+
+    // The project's lessons a change knows of: those it places and those it drops.
+    const known = () => {
+        const all = new Map();
+        for (const m of copyModules(card.p.proposed && card.p.proposed.modules)) for (const l of m.lessons) if (l.id) all.set(l.id, l);
+        for (const d of (card.p.proposed && Array.isArray(card.p.proposed.dropped) ? card.p.proposed.dropped : [])) {
+            if (d && d.id !== undefined) all.set(String(d.id), { id: String(d.id), title: String(d.title || ""), objective: "", state: d.state });
+        }
+        return all;
+    };
+    const droppedOf = (modules) => {
+        const placed = new Set(modules.flatMap((m) => m.lessons.map((l) => l.id)).filter(Boolean));
+        return [...known().values()].filter((l) => !placed.has(l.id));
+    };
+
+    // An objective's box grows with its text (field-sizing does it where the browser has it).
+    const autosize = (ta) => {
+        if (!ta.isConnected || CSS.supports("field-sizing", "content")) return;
+        ta.style.height = "auto";
+        if (ta.scrollHeight) ta.style.height = `${ta.scrollHeight + 2}px`;
+    };
+    // A title is one line that wraps (Enter does not break it); an objective may have several.
+    const edit = (cls, value, placeholder, onInput, multi) => {
+        const area = cls !== "pm";
+        const input = area ? h("textarea", { class: cls, rows: 1, placeholder, maxlength: multi ? 1000 : 200, "aria-label": placeholder })
+                           : h("input", { type: "text", class: cls, placeholder, maxlength: 200, "aria-label": placeholder });
+        if (area && !multi) input.addEventListener("keydown", (ev) => { if (ev.key === "Enter") ev.preventDefault(); });
+        input.value = value;
+        input.addEventListener("input", () => { onInput(input.value); if (area) autosize(input); });
+        if (area) { requestAnimationFrame(() => autosize(input)); input.addEventListener("focus", () => autosize(input)); }
+        return input;
+    };
+    const small = (text, title, onclick, disabled) => h("button", { type: "button", class: "mini", title, "aria-label": title, disabled: !!disabled, onclick }, text);
+    let focusNext = null;   // a selector inside the card to focus after the next drawing
+    const redraw = (focus) => { focusNext = focus || null; draw(); };
+
+    function moveLesson(mi, li, dir) {
+        const mods = card.draft;
+        const [l] = mods[mi].lessons.splice(li, 1);
+        if (dir < 0) {
+            if (li > 0) mods[mi].lessons.splice(li - 1, 0, l);
+            else mods[mi - 1].lessons.push(l);           // up from a module's first place: to the end of the module above
+        } else if (li < mods[mi].lessons.length) mods[mi].lessons.splice(li + 1, 0, l);
+        else mods[mi + 1].lessons.unshift(l);            // down from its last place: to the start of the module below
+        redraw();
+    }
+
+    function lessonEl(l, mi, li, editing) {
+        const mods = editing ? card.draft : null;
+        const num = h("span", { class: "pnum" }, `${mi + 1}.${li + 1}`);
+        const isNew = isChange() && !l.id;
+        const mark = isChange() ? (isNew ? h("span", { class: "pnew", title: "A new lesson" }, "new")
+            : h("span", { class: `lst ${lessonState(l)}`, title: LESSON_STATES[lessonState(l)] }, LESSON_MARKS[lessonState(l)])) : null;
+        if (!editing) {
+            return h("div", { class: "plan-les" + (isNew ? " is-new" : "") }, num,
+                h("span", { class: "ptitle" }, mark, mark ? " " : null, l.title),
+                h("span", { class: "pobj" }, l.objective || ""));
+        }
+        const first = mi === 0 && li === 0;
+        const last = mi === mods.length - 1 && li === mods[mi].lessons.length - 1;
+        return h("div", { class: "plan-les editing" + (isNew ? " is-new" : ""), "data-at": `${mi}.${li}` }, num,
+            h("span", { class: "ptitle" }, mark, edit("pt", l.title, "the lesson's title", (v) => { l.title = v; })),
+            h("span", { class: "pobj" }, edit("po", l.objective, "its objective: what you can do once it is done", (v) => { l.objective = v; }, true)),
+            h("span", { class: "pact" },
+                small("↑", "Move up", () => moveLesson(mi, li, -1), first),
+                small("↓", "Move down", () => moveLesson(mi, li, 1), last),
+                small("✕", "Remove this lesson", () => { mods[mi].lessons.splice(li, 1); redraw(); })));
+    }
+
+    function modulesEl(modules, editing) {
+        return modules.map((m, mi) => h("div", { class: "plan-modblock" },
+            editing
+                ? h("div", { class: "plan-mod editing", "data-mod": String(mi) },
+                    edit("pm", m.title, "the module's title", (v) => { m.title = v; }),
+                    small("✕", "Remove this module and its lessons", () => { card.draft.splice(mi, 1); redraw(); }))
+                : h("div", { class: "plan-mod" }, m.title),
+            m.lessons.map((l, li) => lessonEl(l, mi, li, editing)),
+            editing ? h("div", { class: "plan-add" }, h("button", { type: "button", class: "link", onclick: () => {
+                m.lessons.push({ id: null, title: "", objective: "", state: null });
+                redraw(`[data-at="${mi}.${m.lessons.length - 1}"] .pt`);
+            } }, "+ Add a lesson")) : null,
+            editing && !m.lessons.length ? h("div", { class: "plan-warn" }, "This module has no lesson: add one or remove the module.") : null));
+    }
+
+    function droppedEl(modules, editing) {
+        if (!isChange()) return null;
+        const gone = droppedOf(modules);
+        if (!gone.length) return null;
+        return h("div", { class: "plan-dropped" },
+            h("div", { class: "plan-mod" }, open() ? "Would be dropped" : "Dropped"),
+            gone.map((l) => h("div", { class: "plan-les dropped" + (editing ? " editing" : "") }, h("span", { class: "pnum" }, ""),
+                h("span", { class: "ptitle" }, h("s", {}, l.title)),
+                h("span", { class: "pobj" }, l.state && l.state !== "not_started"
+                    ? `${LESSON_STATES[lessonState(l)]}: kept in the list, marked dropped` : "never started: removed"),
+                editing ? h("span", { class: "pact" }, h("button", { type: "button", class: "mini wide", title: "Keep this lesson in the plan", onclick: () => {
+                    if (!card.draft.length) card.draft.push({ title: "", lessons: [] });
+                    // A dropped lesson comes with no objective: the project's own row has it.
+                    const row = lessonRow(name, l.id);
+                    card.draft[card.draft.length - 1].lessons.push({ ...l, objective: l.objective || (row && row.objective ? String(row.objective) : "") });
+                    redraw();
+                } }, "Keep it")) : null)));
+    }
+
+    const changed = () => JSON.stringify(wireModules(card.draft)) !== JSON.stringify(wireModules(copyModules(card.p.proposed && card.p.proposed.modules)));
+
+    async function decide(verb) {
+        if (card.busy) return;
+        let body = {};
+        if (verb === "approve" && changed()) {
+            const empty = card.draft.find((m) => !m.lessons.length);
+            if (empty) { card.said = `The module “${cleanText(empty.title) || "without a title"}” has no lesson: add one or remove the module.`; draw(); return; }
+            body = { modules: wireModules(card.draft) };
+        }
+        card.busy = true;
+        card.said = "";
+        draw();
+        const r = await tutorApi("POST", `/proposals/${enc(card.p.id)}/${verb}`, body);
+        card.busy = false;
+        const res = r.body.ok && r.body.result;
+        if (!res || !res.proposal) {
+            card.said = errText(r.body);
+            // Decided elsewhere (another browser tab): show it as it is now.
+            const again = await tutorApi("GET", `/proposals/${enc(card.p.id)}`);
+            if (again.body.ok && again.body.result && again.body.result.proposal) card.update(again.body.result.proposal);
+            draw();
+            return;
+        }
+        card.update(res.proposal);
+        if (res.plan && typeof res.plan === "object") { setPlan(name, res.plan); renderRail(); renderTabbar(); }
+        else refreshLessons(name);
+    }
+
+    function draw() {
+        const p = card.p;
+        const editing = open();
+        const decided = p.state === "approved" ? "approved" : p.state === "dismissed" ? "dismissed" : null;
+        const what = isChange() ? (decided === "approved" ? "Change to the plan" : "Proposed change to the plan")
+                                : (decided === "approved" ? "Study plan" : "Proposed study plan");
+        const modules = editing ? card.draft : copyModules(decided === "approved" && p.approved ? p.approved.modules : p.proposed && p.proposed.modules);
+        const why = p.proposed && typeof (isChange() ? p.proposed.reason : p.proposed.note) === "string" ? (isChange() ? p.proposed.reason : p.proposed.note) : "";
+        const count = modules.reduce((n, m) => n + m.lessons.length, 0);
+        let foot;
+        if (editing) {
+            foot = [h("span", { class: "grow" }, `${count} lesson${count === 1 ? "" : "s"} in ${modules.length} module${modules.length === 1 ? "" : "s"}`,
+                        h("button", { type: "button", class: "link addmod", onclick: () => {
+                            card.draft.push({ title: "", lessons: [{ id: null, title: "", objective: "", state: null }] });
+                            redraw(`[data-mod="${card.draft.length - 1}"] .pm`);
+                        } }, "+ Add a module")),
+                    h("button", { type: "button", disabled: card.busy, onclick: () => decide("dismiss") }, "Dismiss"),
+                    h("button", { type: "button", class: "primary", disabled: card.busy, onclick: () => decide("approve") }, card.busy ? "Sending…" : "Approve")];
+        } else if (decided === "approved") {
+            const changes = (Array.isArray(p.changes) ? p.changes : []).filter((c) => typeof c === "string" && c);
+            foot = [h("div", { class: "grow" },
+                h("div", { class: "okc" }, changes.length ? "Approved, with your changes:" : "Approved as proposed."),
+                changes.length ? h("ul", { class: "plan-changes" }, changes.map((c) => h("li", {}, `You ${c}${/[.!?]$/.test(c) ? "" : "."}`))) : null)];
+        } else {
+            foot = [h("span", { class: "grow" }, "Dismissed. Nothing was changed.")];
+        }
+        fill(el,
+            h("div", { class: "blk-head" }, h("span", {}, what),
+                h("span", { class: "grow" + (decided === "approved" ? " okc" : "") },
+                    decided === "approved" ? "✓ approved" : decided === "dismissed" ? "dismissed" : "waiting for you")),
+            why ? h("div", { class: "plan-note" }, why) : null,
+            editing ? h("div", { class: "plan-hint" }, "Change anything below before you approve it: the tutor is told what you changed.") : null,
+            modulesEl(modules, editing),
+            droppedEl(modules, editing),
+            card.said ? h("div", { class: "plan-said bad" }, card.said) : null,
+            h("div", { class: "blk-foot" }, foot),
+            decided ? h("div", { class: "plan-told" }, "The tutor is told with your next message in this conversation.") : null);
+        if (focusNext) { const f = el.querySelector(focusNext); if (f) f.focus(); focusNext = null; }
+    }
+
+    // A newer state of the proposal: an open card keeps the learner's edits.
+    card.update = (np) => {
+        if (!np || typeof np !== "object") return;
+        const was = card.p;
+        card.p = np;
+        if (np.state === "open" && (!was || !card.draft)) card.draft = copyModules(np.proposed && np.proposed.modules);
+        if (!was || was.state !== np.state) draw();
+    };
+    card.update(p);
+    return card;
+}
+
 function makeLessonPane(name, id) {
     const titleEl = h("span", { class: "lt" }, lessonTitle(name, id));
-    const stateEl = h("span", { class: "lo" });
+    const objEl = h("span", { class: "lo" });
+    const markEl = h("span", { class: "lstate" });
+    const summaryBtn = h("button", { class: "mini wide", hidden: true, title: "What the tutor wrote when it closed the lesson" }, "Summary");
+    const stateEl = h("span", { class: "lw" });
     const inner = h("div", { class: "conv-inner" });
     const conv = h("div", { class: "conv" }, inner);
     const ctx = h("div", { class: "ctxline", hidden: true });
@@ -2218,11 +2502,41 @@ function makeLessonPane(name, id) {
     const ta = h("textarea", { rows: 2, placeholder: "Write to the tutor…", "aria-label": "Your message to the tutor" });
     const btn = h("button", { class: "primary" }, "Send");
     const el = h("div", { class: "pane lesson-pane" },
-        h("div", { class: "lhead" }, h("div", { class: "lh-main" }, titleEl, stateEl)),
+        h("div", { class: "lhead" }, h("div", { class: "lh-main" }, titleEl, objEl), stateEl, markEl, summaryBtn),
         conv, ctx,
         h("div", { class: "composer" }, said, h("div", { class: "composer-inner" }, ta, btn)));
-    const pane = { kind: "lesson", lessonId: id, el, title: null, turn: null, stale: true, loading: false, sending: false };
+    const pane = { kind: "lesson", lessonId: id, el, title: null, lesson: null, turn: null, stale: true, loading: false, sending: false };
     const tools = new Map();   // tool id -> its line, so a result fills the line its call made
+    const cards = new Map();   // proposal id -> its card, kept across redraws (with the learner's edits)
+    const cardOf = (p) => {
+        if (!p || typeof p !== "object" || typeof p.id !== "string") return null;
+        let c = cards.get(p.id);
+        if (c) c.update(p); else { c = proposalCard(name, p); cards.set(p.id, c); }
+        return c;
+    };
+    summaryBtn.addEventListener("click", () => {
+        const l = pane.lesson;
+        if (!l) return;
+        openModal(`Summary: ${l.title}`, [
+            l.one_line ? h("p", { class: "sum-line" }, String(l.one_line)) : null,
+            h("div", { class: "sum-text" }, String(l.summary || "The tutor wrote no summary.")),
+            l.closed_at ? h("p", { class: "note" }, `Closed by the tutor ${fmtWhen(l.closed_at)}. The line above is what later lessons' tutors are given.`) : null,
+        ], [h("button", { onclick: closeModal }, "Close")]);
+    });
+    // The lesson as last read: its title, objective, state and summary in the header.
+    pane.setLesson = (l) => {
+        if (!isLesson(l)) return;
+        pane.lesson = l;
+        if (typeof l.title === "string" && l.title) pane.setTitle(l.title);
+        const goals = l.kind === "goals";
+        objEl.textContent = goals ? GOALS_LINE : String(l.objective || "");
+        objEl.title = objEl.textContent;
+        const st = lessonState(l);
+        markEl.className = `lstate ${st}`;
+        markEl.textContent = (st === "done" ? "✓ " : "") + LESSON_STATES[st];
+        summaryBtn.hidden = !(st === "done" && (l.summary || l.one_line));
+        ta.placeholder = goals ? "Tell the tutor what you want to learn…" : "Write to the tutor…";
+    };
     let follow = true;         // the conversation follows the newest text unless scrolled up
 
     // Scrolled up is above where the page last put it: text that grew or reflowed under a
@@ -2275,13 +2589,25 @@ function makeLessonPane(name, id) {
             traces.append(line.el);
         }
         traces.hidden = !traces.childElementCount;
+        const cardsEl = h("div", { class: "cards" });
+        for (const p of (Array.isArray(m.proposals) ? m.proposals : [])) {
+            const c = cardOf(p);
+            if (c) cardsEl.append(c.el);
+        }
+        cardsEl.hidden = !cardsEl.childElementCount;
         if (you) body.textContent = String(m.text || "");
         else body.append(mdRender(String(m.text || ""), { project: name, blocks: blocks || null }));
+        // A stretch of the answer with no text (only tools, or a card) has no empty text box.
+        body.hidden = !you && !String(m.text || "").trim();
+        // What the tutor was told before the learner's words (the lesson's opening, a
+        // proposal's outcome): not theirs, so only behind a quiet line that opens.
+        const told = you && typeof m.context === "string" && m.context.trim()
+            ? h("details", { class: "told" }, h("summary", {}, "what the tutor was told"), h("pre", {}, m.context)) : null;
         const el = h("div", { class: `msg ${you ? "you" : "tutor"}`, "data-run": m.run_id === undefined || m.run_id === null ? null : String(m.run_id) },
             h("div", { class: "av" }, you ? "Y" : "T"),
-            // The tools a stretch of the answer used come after its text, as they were run.
-            h("div", { class: "mc" }, h("div", { class: "who" }, you ? "You" : "Tutor"), body, traces));
-        return { el, body, traces };
+            // The tools a stretch of the answer used come after its text, as they were run; its cards after them.
+            h("div", { class: "mc" }, h("div", { class: "who" }, you ? "You" : "Tutor"), body, told, traces, cardsEl));
+        return { el, body, traces, cards: cardsEl };
     }
 
     // ---- an answer being written
@@ -2306,17 +2632,20 @@ function makeLessonPane(name, id) {
             const d = turn.draft;
             if (!d) return;
             d.body.replaceChildren(mdRender(d.text, { project: name, blocks: d.blocks, draft: true }));
+            d.body.hidden = !d.text.trim();
             toBottom();
         });
     }
-    function endTurn(turn) {
+    // ended: the answer came to its end (not only left): the lesson and the list are read again,
+    // since the tutor may have closed the lesson (no event says so).
+    function endTurn(turn, ended) {
         if (pane.turn !== turn) return;
         turn.close();
         pane.turn = null;
         const d = turn.draft;
         if (d) {
-            if (!d.text && !d.toolIds.length) d.el.remove();
-            else { d.body.replaceChildren(mdRender(d.text, { project: name, blocks: d.blocks })); d.tail.remove(); }
+            if (!d.text && !d.toolIds.length && !d.cards.childElementCount) d.el.remove();
+            else { d.body.replaceChildren(mdRender(d.text, { project: name, blocks: d.blocks })); d.body.hidden = !d.text.trim(); d.tail.remove(); }
         }
         turn.draft = null;
         tell("");
@@ -2325,13 +2654,20 @@ function makeLessonPane(name, id) {
         if (row) row.running = null;
         setComposer();
         renderRail();
+        if (ended) refreshLessons(name);
     }
     function onEvent(turn, ev) {
         if (pane.turn !== turn || !Number.isInteger(ev.seq) || ev.seq <= turn.lastSeq) return;   // seen already
         turn.lastSeq = ev.seq;
         clearTrouble();
-        const d = ev.data && typeof ev.data === "object" ? ev.data : {};
+        const d = ev.data && typeof ev.data === "object" ? idsAsText(ev.data) : {};
         switch (ev.kind) {
+            case "proposal": {
+                // A card arrives while the answer is written; the message that follows holds it.
+                const c = cardOf(d.proposal);
+                if (c) { const draft = draftOf(turn); draft.cards.append(c.el); draft.cards.hidden = false; toBottom(); }
+                break;
+            }
             case "text_delta":
                 if (typeof d.text === "string") { draftOf(turn).text += d.text; paintDraft(turn); }
                 break;
@@ -2355,23 +2691,28 @@ function makeLessonPane(name, id) {
                 const m = d.message;
                 if (!m || typeof m !== "object") break;
                 const draft = turn.draft;
+                // The cards the draft shows that this message does not hold stay in the next draft.
+                const leftCards = draft ? [...draft.cards.children] : [];
                 const stored = messageEl(m, draft && draft.blocks);
                 const have = new Set((Array.isArray(m.tools) ? m.tools : []).map((t) => t && t.id));
                 turn.draft = null;
                 if (draft) draft.el.replaceWith(stored.el); else inner.append(stored.el);
                 const left = draft ? draft.toolIds.filter((t) => !have.has(t)) : [];
-                if (left.length) {
+                const cardsLeft = leftCards.filter((c) => !stored.cards.contains(c));
+                if (left.length || cardsLeft.length) {
                     const next = draftOf(turn);
                     for (const t of left) { next.traces.append(tools.get(t).el); next.toolIds.push(t); }
-                    next.traces.hidden = false;
+                    next.traces.hidden = !left.length;
+                    for (const c of cardsLeft) next.cards.append(c);
+                    next.cards.hidden = !cardsLeft.length;
                 }
                 toBottom();
                 break;
             }
             case "usage": setUsage(d.usage); break;
-            case "completed": setUsage(d.usage); endTurn(turn); break;
-            case "error": endTurn(turn); sysline(typeof d.message === "string" && d.message ? d.message : "The tutor's answer failed.", "bad"); break;
-            case "cancelled": endTurn(turn); sysline("stopped"); break;
+            case "completed": setUsage(d.usage); endTurn(turn, true); break;
+            case "error": endTurn(turn, true); sysline(typeof d.message === "string" && d.message ? d.message : "The tutor's answer failed.", "bad"); break;
+            case "cancelled": endTurn(turn, true); sysline("stopped"); break;
             default: break;
         }
     }
@@ -2420,10 +2761,10 @@ function makeLessonPane(name, id) {
                 h("button", { onclick: () => { pane.stale = true; pane.update(); } }, "Try again")));
             return;
         }
-        if (typeof res.lesson.title === "string") {
-            pane.setTitle(res.lesson.title);
+        if (isLesson(res.lesson)) {
             const row = lessonRow(name, id);
-            if (row) row.title = res.lesson.title;
+            if (row) Object.assign(row, res.lesson);
+            pane.setLesson(res.lesson);
             renderTabbar();
         }
         const run = res.run && res.run.status === "running" ? res.run : null;
@@ -2443,7 +2784,13 @@ function makeLessonPane(name, id) {
             parts[parts.length - 1].after(e.status === "cancelled" ? syslineEl("stopped")
                 : syslineEl(typeof e.error === "string" && e.error ? e.error : "The tutor's answer failed.", "bad"));
         }
-        if (!inner.childElementCount && !run) inner.append(h("div", { class: "empty" }, "Write to the tutor to begin."));
+        if (!inner.childElementCount && !run) {
+            const l = pane.lesson;
+            inner.append(h("div", { class: "empty" }, l && l.kind === "goals"
+                ? [h("p", {}, "Tell the tutor what you want to learn."),
+                   h("p", { class: "note" }, "It asks what you want to be able to do, what you know already and how much time you have, then proposes a study plan.")]
+                : [l && l.objective ? h("p", {}, String(l.objective)) : null, h("p", { class: "note" }, "Write to the tutor to begin.")]));
+        }
         ctx.hidden = true;
         setUsage(res.usage);
         follow = true;
@@ -2505,6 +2852,7 @@ function makeLessonPane(name, id) {
     };
     pane.close = pane.hide;
     setComposer();
+    pane.setLesson(lessonRow(name, id));
     return pane;
 }
 
@@ -2512,6 +2860,7 @@ function makeLessonPane(name, id) {
 
 async function refreshTutorSettings() {
     if (!S.loggedIn) return;
+    refreshInstructions();
     const r = await tutorApi("GET", "/settings");
     if (!S.loggedIn) return;
     if (r.body.ok && r.body.result && typeof r.body.result.claude_token_set === "boolean") { S.tutorSettings = r.body.result; S.tutorSettingsError = null; }
@@ -2557,6 +2906,68 @@ function renderTutorSettings(note) {
     box.replaceChildren(form);
 }
 
+// The tutor's instructions: the text every tutor is given with each message, editable, with
+// clanker-learn's own text to go back to. The box is drawn once per reading; what the learner
+// typed and has not saved is kept when Settings is read again.
+async function refreshInstructions() {
+    if (!S.loggedIn) return;
+    const r = await tutorApi("GET", "/instructions");
+    if (!S.loggedIn || !S.shell) return;
+    const box = S.shell.settings.instr;
+    const res = r.body.ok && r.body.result;
+    if (!res || typeof res.text !== "string") {
+        if (!box.querySelector("textarea")) box.replaceChildren(h("div", { class: "none bad" }, "The tutor's instructions could not be read: " + errText(r.body)));
+        return;
+    }
+    if (box.instr && box.instr.dirty()) return;   // unsaved edits stay
+    renderInstructions(res);
+}
+
+function renderInstructions(st, note) {
+    const box = S.shell.settings.instr;
+    const text = h("textarea", { class: "instr-text", rows: 18, spellcheck: "false", "aria-label": "The tutor's instructions" });
+    text.value = st.text;
+    const said = h("p", { class: note && note.bad ? "bad" : "muted" }, note ? note.text : "");
+    said.hidden = !note;
+    const where = h("p", { class: "tutor-state" }, h("span", { class: `dot inline ${st.edited ? "warn" : "up"}` }), " ",
+        st.edited ? "Changed: this is not the text clanker-learn ships." : "The text clanker-learn ships.");
+    const save = h("button", { class: "primary", type: "button" }, "Save");
+    const back = h("button", { type: "button", disabled: !st.edited }, "Back to the shipped text");
+    const sure = h("div", { class: "btns", hidden: true });
+    const btns = h("div", { class: "btns" }, back, save);
+    const dirty = () => text.value !== st.text;
+    const unsaved = h("span", { class: "note" }, "");
+    text.addEventListener("input", () => { unsaved.textContent = dirty() ? "Not saved yet." : ""; });
+    save.addEventListener("click", async () => {
+        if (!text.value.trim()) { renderInstructions(st, { text: "The instructions cannot be empty.", bad: true }); return; }
+        save.disabled = true;
+        const r = await tutorApi("PUT", "/instructions", { text: text.value });
+        save.disabled = false;
+        const res = r.body.ok && r.body.result;
+        if (!res || typeof res.text !== "string") { said.className = "bad"; said.textContent = errText(r.body); said.hidden = false; return; }
+        renderInstructions(res, { text: "Saved. Each lesson follows it from its next message." });
+    });
+    back.addEventListener("click", () => {
+        btns.hidden = true;
+        sure.hidden = false;
+        fill(sure, h("span", { class: "grow" }, "Put back the text clanker-learn ships? Your version is lost."),
+            h("button", { type: "button", onclick: () => { sure.hidden = true; btns.hidden = false; } }, "Keep mine"),
+            h("button", { type: "button", class: "danger", onclick: async (ev) => {
+                ev.target.disabled = true;
+                const r = await tutorApi("POST", "/instructions/reset");
+                const res = r.body.ok && r.body.result;
+                if (!res || typeof res.text !== "string") { sure.hidden = true; btns.hidden = false; said.className = "bad"; said.textContent = errText(r.body); said.hidden = false; return; }
+                renderInstructions(res, { text: "The shipped text is back. Each lesson follows it from its next message." });
+            } }, "Put it back"));
+    });
+    box.replaceChildren(h("div", { class: "form" },
+        h("h3", {}, "The tutor's instructions"),
+        h("p", { class: "note" }, "What every tutor is given with each of your messages, in every project. " +
+            "A lesson under way follows a new text from its next message, starting again from its files."),
+        where, text, h("div", { class: "instr-foot" }, unsaved), said, btns, sure));
+    box.instr = { dirty };
+}
+
 // ---- Settings -> Software (RS's Sandboxes -> Software: renderSoftwareScreen and its lane) -----
 
 function showSettings() {
@@ -2571,6 +2982,7 @@ function makeSettingsPane() {
     const table = h("div", { class: "sw-table" }, h("div", { class: "none" }, "Asking…"));
     const said = h("p", { class: "muted sw-said" });
     const tutor = h("div", { class: "card-body tutor-set" }, h("div", { class: "none" }, "Asking…"));
+    const instr = h("div", { class: "card-body tutor-instr" }, h("div", { class: "none" }, "Asking…"));
     const el = h("div", { class: "pane page", hidden: true }, h("div", { class: "page-inner" },
         h("h1", {}, "Settings"),
         h("p", { class: "sub" }, "The software clanker-learn deploys into the projects' sandboxes. Each is fetched in a throwaway container and copied into a project from there."),
@@ -2578,8 +2990,8 @@ function makeSettingsPane() {
             h("p", { class: "note sw-hint" }, "Running projects keep the agent versions they have until Update is pressed in their Config box (Agents); new projects get these. " +
                 "A newer editor reaches a project at its next start.")),
         said,
-        h("div", { class: "card" }, h("div", { class: "card-head" }, "Tutor"), tutor)));
-    return { el, table, said, tutor };
+        h("div", { class: "card" }, h("div", { class: "card-head" }, "Tutor"), tutor, instr)));
+    return { el, table, said, tutor, instr };
 }
 
 // The build lane's target for a row (the broker's build_target).
@@ -2954,8 +3366,11 @@ function newProjectDialog() {
         saveLayout();
         render();
         refreshProjects();
-        await followOp(r.body.op_id, `Creating ${project}`);
+        let made = false;
+        await followOp(r.body.op_id, `Creating ${project}`, { onEnd: (ok) => { made = ok; } });
         if (S.creating === project) S.creating = null;
+        // A new project opens on Goals: the conversation that agrees a study plan.
+        if (made && S.loggedIn && projectRow(project) && S.current === project) openGoals(project);
     } }, formRow("Name", name),
     h("details", { class: "more", open: true }, h("summary", {}, "Agents"), agentsBody),
     h("div", { class: "field" }, h("span", {}, "Editor"), editorBody),

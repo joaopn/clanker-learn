@@ -174,7 +174,8 @@ def describe_changes(proposed, approved):
         sentences.append("arranged the modules as: " + ", ".join(f"“{m['title']}”" for m in approved))
     order = [index for index, _item in pairs]
     if order != sorted(order):
-        sentences.append("changed the order of the lessons to: " + ", ".join(f"“{item['title']}”" for _index, item in pairs))
+        # The whole approved order, added lessons among it: a list without them reads as if they were left out.
+        sentences.append("changed the order of the lessons to: " + ", ".join(f"“{item['title']}”" for item in after))
     return sentences
 
 
