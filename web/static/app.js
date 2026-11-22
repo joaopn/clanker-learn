@@ -1,7 +1,9 @@
 // clanker-learn's page: the login, the projects, a Shell, an Editor and the web apps of a
 // project's sandbox. Written new after the accepted mock; two parts are RS's (webui/static/
 // app.js at RS commit 62788a8): the login proof (deriveLoginProof) and the terminal
-// (openTerminal, handleControl). Plain script, no framework, no build step.
+// (openTerminal, handleControl). Settings -> Software, the New project box's Agents and the
+// Config box's Agents are RS's (renderSoftwareScreen, mgmtRefreshDialog, agentsBoxContent,
+// mgmtAgentsUpdateDialog) adapted to this page's helpers. Plain script, no framework, no build step.
 //
 // Every string that comes from the server or a sandbox goes into the page as text: the
 // page is built with h() below, which makes text nodes, and never with innerHTML.
@@ -59,6 +61,8 @@ function h(tag, attrs, ...kids) {
 }
 
 const enc = encodeURIComponent;
+// replaceChildren without the null and false entries (which it would write as text).
+const fill = (el, ...kids) => el.replaceChildren(...kids.flat().filter((k) => k !== null && k !== undefined && k !== false));
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const projectPath = (name, tail) => `/broker/project/${enc(name)}${tail || ""}`;
 
@@ -75,15 +79,16 @@ function loadLayout() {
     try {
         const v = JSON.parse(localStorage.getItem(LAYOUT_KEY) || "{}");
         return { project: typeof v.project === "string" ? v.project : null,
-                 tab: typeof v.tab === "string" ? v.tab : null };
+                 tab: typeof v.tab === "string" ? v.tab : null,
+                 page: v.page === "settings" ? "settings" : null };
     } catch (_) {
-        return { project: null, tab: null };
+        return { project: null, tab: null, page: null };
     }
 }
 
 function saveLayout() {
     try {
-        localStorage.setItem(LAYOUT_KEY, JSON.stringify({ project: S.current, tab: S.current ? tabOf(S.current) : null }));
+        localStorage.setItem(LAYOUT_KEY, JSON.stringify({ project: S.current, tab: S.current ? tabOf(S.current) : null, page: S.page }));
     } catch (_) { /* no storage: the page works without it */ }
 }
 
@@ -129,6 +134,7 @@ function errText(body) {
     }
 }
 
+const NAME_RE = /^[a-z0-9]([a-z0-9-]{0,29}[a-z0-9])?$/;
 const NAME_RULE = "A project name is 1 to 31 lower-case letters, digits or dashes, and starts and ends with a letter or a digit.";
 
 // ---- state ------------------------------------------------------------------------------
@@ -144,6 +150,12 @@ const S = {
     panes: {},             // "project|tab" -> pane record
     timers: [],
     shell: null,           // the app's fixed elements once logged in
+    page: null,            // "settings" while Settings is shown in place of a project
+    software: null,        // Settings -> Software: the broker's rows, as last read
+    softwareError: null,
+    builds: {},            // a build in flight: target ("agent:claude" | "editor") -> {opId, verb}
+    checking: new Set(),   // targets whose Refresh is asking upstream
+    models: null,          // the catalog of Claude's tiers (/broker/models), once read
 };
 
 const tabOf = (project) => S.tabs[project] || "shell";
@@ -290,17 +302,20 @@ function enterApp(projects) {
     const tabbar = h("div", { class: "tabbar" });
     const panes = h("div", { class: "panes" });
     const empty = h("div", { class: "pane page" });
-    panes.append(empty);
+    const settings = makeSettingsPane();
+    panes.append(empty, settings.el);
     document.getElementById("app").replaceChildren(h("div", { class: "shell" },
         h("nav", { class: "rail" },
             h("div", { class: "rail-head" }, h("span", {}, "PROJECTS")),
             rail,
             h("div", { class: "rail-foot" },
                 h("button", { class: "foot", onclick: newProjectDialog }, "+ New project"),
+                h("button", { class: "foot settings-btn", onclick: showSettings }, "⚙ Settings"),
                 h("button", { class: "foot", onclick: logout }, "Log out"))),
         h("div", { class: "main" }, tabbar, panes)));
-    S.shell = { rail, tabbar, panes, empty };
+    S.shell = { rail, tabbar, panes, empty, settings };
     const layout = loadLayout();
+    S.page = layout.page;
     if (layout.project && projectRow(layout.project)) {
         S.current = layout.project;
         if (layout.tab) S.tabs[layout.project] = layout.tab;
@@ -309,9 +324,12 @@ function enterApp(projects) {
     }
     S.timers.push(setInterval(refreshProjects, PROJECTS_EVERY_MS));
     S.timers.push(setInterval(() => { if (S.current) refreshServices(S.current); }, SERVICES_EVERY_MS));
+    S.timers.push(setInterval(() => { if (S.page === "settings") refreshSoftware(); }, SERVICES_EVERY_MS));
     window.addEventListener("resize", refitVisible);
     refreshProjects();
     if (S.current) refreshServices(S.current);
+    if (S.page === "settings") refreshSoftware();
+    seedBuilds();
     render();
 }
 
@@ -322,7 +340,8 @@ function teardownApp() {
     for (const key of Object.keys(S.panes)) dropPane(key);
     closeModal();
     window.removeEventListener("resize", refitVisible);
-    Object.assign(S, { loggedIn: false, projects: [], ops: [], current: null, creating: null, tabs: {}, services: {}, panes: {}, shell: null, listError: null });
+    Object.assign(S, { loggedIn: false, projects: [], ops: [], current: null, creating: null, tabs: {}, services: {}, panes: {}, shell: null, listError: null,
+                       page: null, software: null, softwareError: null, builds: {}, checking: new Set(), models: null });
 }
 
 async function refreshProjects() {
@@ -361,7 +380,8 @@ async function refreshServices(name) {
 }
 
 // What the broker says of a project, in words; and whether its sandbox runs.
-const OP_WORDS = { create: "being made", start: "starting", stop: "stopping", recreate: "being recreated", destroy: "being destroyed" };
+const OP_WORDS = { create: "being made", start: "starting", stop: "stopping", recreate: "being recreated", destroy: "being destroyed",
+                   agents_add: "adding an agent", agents_update: "updating its agents" };
 
 function stateWords(p) {
     const op = opOf(p.name);
@@ -391,7 +411,7 @@ function renderRail() {
     const rows = S.projects.map((p) => {
         const st = stateWords(p);
         const op = opOf(p.name);
-        return h("div", { class: "proj" + (p.name === S.current ? " sel" : "") },
+        return h("div", { class: "proj" + (p.name === S.current && !S.page ? " sel" : "") },
             h("div", { class: "proj-row", onclick: () => selectProject(p.name) },
                 h("span", { class: `dot ${st.cls}` }),
                 h("span", { class: "proj-name" }, p.name,
@@ -404,10 +424,12 @@ function renderRail() {
     if (!rows.length) rows.push(h("div", { class: "none" }, "No project yet."));
     if (S.listError) rows.push(h("div", { class: "none bad" }, S.listError));
     S.shell.rail.replaceChildren(...rows);
+    S.shell.rail.parentNode.querySelector(".settings-btn").classList.toggle("sel", S.page === "settings");
 }
 
 function selectProject(name) {
-    if (S.current === name) return;
+    if (S.current === name && !S.page) return;
+    S.page = null;
     S.current = name;
     saveLayout();
     refreshServices(name);
@@ -440,6 +462,7 @@ function tabsOf(name) {
 function renderTabbar() {
     const bar = S.shell.tabbar;
     const name = S.current;
+    if (S.page === "settings") { bar.replaceChildren(h("div", { class: "tb projchip" }, "Settings")); return; }
     if (!name) { bar.replaceChildren(h("div", { class: "tb projchip" }, "clanker-learn")); return; }
     const { tabs, raw } = tabsOf(name);
     const shown = tabOf(name);
@@ -479,7 +502,9 @@ function showPane() {
     const { panes, empty } = S.shell;
     const name = S.current;
     let visible = empty;
-    if (!name) {
+    if (S.page === "settings") {
+        visible = S.shell.settings.el;
+    } else if (!name) {
         empty.replaceChildren(h("div", { class: "page-inner" }, h("h1", {}, "No project shown"),
             h("p", { class: "sub" }, S.projects.length ? "Pick a project on the left." : "Make one with “+ New project” on the left.")));
     } else {
@@ -824,6 +849,225 @@ async function refreshPorts(name) {
     }));
 }
 
+// ---- Settings -> Software (RS's Sandboxes -> Software: renderSoftwareScreen and its lane) -----
+
+function showSettings() {
+    S.page = "settings";
+    saveLayout();
+    refreshSoftware();
+    render();
+}
+
+function makeSettingsPane() {
+    const table = h("div", { class: "sw-table" }, h("div", { class: "none" }, "Asking…"));
+    const said = h("p", { class: "muted sw-said" });
+    const el = h("div", { class: "pane page", hidden: true }, h("div", { class: "page-inner" },
+        h("h1", {}, "Settings"),
+        h("p", { class: "sub" }, "The software clanker-learn deploys into the projects' sandboxes. Each is fetched in a throwaway container and copied into a project from there."),
+        h("div", { class: "card" }, h("div", { class: "card-head" }, "Software"), table,
+            h("p", { class: "note sw-hint" }, "Running projects keep the agent versions they have until Update is pressed in their Config box (Agents); new projects get these. " +
+                "A newer editor reaches a project at its next start.")),
+        said));
+    return { el, table, said };
+}
+
+// The build lane's target for a row (the broker's build_target).
+const swTarget = (row) => row.kind === "agent" ? `agent:${row.id}` : "editor";
+const swVerb = (row, what) => (row.kind === "agent" ? "agent_" : "editor_") + what;
+
+async function refreshSoftware() {
+    if (!S.loggedIn || refreshSoftware.busy) return;
+    refreshSoftware.busy = true;
+    try {
+        const r = await api("GET", "/broker/software");
+        if (!S.loggedIn) return;
+        if (r.body.ok && Array.isArray(r.body.result)) { S.software = r.body.result; S.softwareError = null; }
+        else S.softwareError = errText(r.body);
+        renderSoftware();
+    } finally {
+        refreshSoftware.busy = false;
+    }
+}
+
+function swTell(text, bad) {
+    if (!S.shell) return;
+    S.shell.settings.said.className = (bad ? "bad" : "muted") + " sw-said";
+    S.shell.settings.said.textContent = text;
+}
+
+function fmtWhen(s) {
+    const d = new Date(s);
+    return s && !isNaN(d) ? d.toLocaleString() : String(s || "");
+}
+
+function renderSoftware() {
+    if (!S.shell) return;
+    const table = S.shell.settings.table;
+    const rows = S.software;
+    if (!rows) { table.replaceChildren(h("div", { class: S.softwareError ? "none bad" : "none" }, S.softwareError || "Asking…")); return; }
+    // One build at a time: while one runs, nothing that would start another is offered.
+    const anyBuild = Object.keys(S.builds).length > 0 || rows.some((r) => r && r.building);
+    const out = [h("div", { class: "sw-row sw-head" },
+        h("span", {}, "Software"), h("span", {}, "Pulled"), h("span", {}, "In effect"), h("span", {}, "Status"), h("span", {}))];
+    for (const row of rows) {
+        if (!row || typeof row !== "object") continue;
+        const target = swTarget(row);
+        const build = S.builds[target];
+        const busy = !!build || !!row.building;
+        const why = busy ? "This is being built right now" : anyBuild ? "Another build is running; try again when it is done" : null;
+        const status = busy
+            ? h("span", { class: "sw-busy" }, build && /_refresh$/.test(build.verb) ? "refreshing…" : "pulling…",
+                build ? " " : null,
+                build ? h("button", { class: "link", onclick: () => followOp(build.opId, swTitle(build.verb, row), { onEnd: (ok) => buildEnded(target, build.opId, ok) }) }, "log") : null)
+            : h("span", { class: row.status === "up to date" ? "good" : row.status === "not pulled" ? "muted" : "warnc" }, String(row.status || "—"));
+        const pulled = row.pulled
+            ? h("span", {}, h("code", {}, String(row.pulled.version)), h("span", { class: "note sw-when" }, fmtWhen(row.pulled.pulled_at)))
+            : h("span", { class: "muted" }, "—");
+        const pull = h("button", { disabled: !!why, title: why, onclick: () => pullDialog(row) }, "Pull");
+        const refresh = h("button", { disabled: !!why || S.checking.has(target), title: why || (S.checking.has(target) ? "Still checking upstream" : null),
+                                      onclick: () => refreshDialog(row) }, "Refresh");
+        const reset = row.overridden ? h("button", { disabled: busy, title: `Put back ${row.repo_version}, the version clanker-learn ships (removes the local override)`,
+                                                     onclick: () => pinReset(row, reset) }, "Use repo version") : null;
+        out.push(h("div", { class: "sw-row" },
+            h("span", { class: "sw-name" }, String(row.row || row.id)),
+            pulled,
+            h("span", {}, row.version ? h("code", {}, String(row.version)) : "—"),
+            status,
+            h("span", { class: "sw-act" }, pull, refresh, reset)));
+        // The agent's editor extension, as RS's continuation sub-row.
+        if (row.kind === "agent" && "ext_version" in row) {
+            const have = row.pulled && row.pulled.ext_version;
+            out.push(h("div", { class: "sw-row sw-sub" },
+                h("span", { class: "sw-subname" }, "└ editor extension"),
+                h("span", {}, have ? h("code", {}, String(have)) : "—"),
+                h("span", {}, row.ext_version ? h("code", {}, String(row.ext_version)) : "—"),
+                h("span", {}), h("span", {})));
+        }
+        if (row.problem) out.push(h("div", { class: "sw-row sw-sub" }, h("span", { class: "bad sw-problem" }, String(row.problem))));
+    }
+    if (S.softwareError) out.push(h("div", { class: "none bad" }, S.softwareError));
+    table.replaceChildren(...out);
+}
+
+function swTitle(verb, row) {
+    return (/_refresh$/.test(verb) ? "Refreshing " : "Pulling ") + (row ? row.row : verb);
+}
+
+// A build the page follows: registered, followed (in a dialog, or not), dropped at its end.
+function followBuild(target, opId, verb, row, background) {
+    S.builds[target] = { opId, verb };
+    renderSoftware();
+    return followOp(opId, swTitle(verb, row), { background, onEnd: (ok) => buildEnded(target, opId, ok) });
+}
+
+function buildEnded(target, opId, ok) {
+    const b = S.builds[target];
+    if (b && b.opId === opId) delete S.builds[target];
+    renderSoftware();
+    refreshSoftware();
+}
+
+// After a reload (or a login): every build in flight is found again and followed quietly;
+// its end is told in a notice.
+async function seedBuilds() {
+    if (!S.software) await refreshSoftware();
+    const r = await api("GET", "/broker/software/active");
+    const ops = r.body.ok && r.body.result && Array.isArray(r.body.result.ops) ? r.body.result.ops : [];
+    for (const op of ops) {
+        if (!op || typeof op.target !== "string" || typeof op.op_id !== "string" || typeof op.verb !== "string") continue;
+        if (S.builds[op.target]) continue;
+        const row = (S.software || []).find((x) => swTarget(x) === op.target) || { row: op.target };
+        followBuild(op.target, op.op_id, op.verb, row, true);
+    }
+}
+
+// Start a build (Pull, or Refresh's "Bump + re-pull") from a dialog; its refusal stays in it.
+async function startBuild(row, what, said, btn) {
+    btn.disabled = true;
+    const verb = swVerb(row, what);
+    const body = row.kind === "agent" ? { verb, agent: row.id } : { verb };
+    const r = await api("POST", "/broker/software/build", body);
+    if (!r.body.ok || !r.body.op_id) {
+        btn.disabled = false;
+        said.textContent = "Failed: " + errText(r.body);
+        return;
+    }
+    followBuild(swTarget(row), r.body.op_id, verb, row, false);
+}
+
+// RS's mgmtBuildDialog: confirm, then the log.
+function pullDialog(row) {
+    const said = h("p", { class: "bad" });
+    const go = h("button", { class: "primary", onclick: () => startBuild(row, "pull", said, go) }, "Pull");
+    openModal(`Pull ${row.row}`, [
+        h("p", {}, `Fetch ${row.label} again at the version in effect, `, h("code", {}, String(row.version || "?")),
+            row.kind === "agent" && row.ext_version ? [" (its editor extension at ", h("code", {}, String(row.ext_version)), ")"] : null,
+            ", in a throwaway container (a few minutes). The log is shown while it runs."),
+        said,
+    ], [h("button", { onclick: closeModal }, "Cancel"), go]);
+}
+
+// RS's mgmtRefreshDialog: ask upstream first; with something newer, offer "Bump + re-pull",
+// else say there is nothing to do. The check can take a while; the dialog can be closed, and
+// the row's Refresh stays off until the answer is in.
+async function refreshDialog(row) {
+    const target = swTarget(row);
+    const bodyEl = h("div", {}, h("p", { class: "muted" }, "Checking upstream…"));
+    const scrim = openModal(`Refresh ${row.row}`, bodyEl, [h("button", { onclick: closeModal }, "Close")]);
+    const btns = scrim.querySelector(".btns");
+    S.checking.add(target);
+    renderSoftware();
+    const body = row.kind === "agent" ? { verb: "agent_refresh_check", agent: row.id } : { verb: "editor_refresh_check" };
+    const r = await api("POST", "/broker/software/refresh-check", body);
+    S.checking.delete(target);
+    renderSoftware();
+    if (!scrim.isConnected) return;
+    if (!r.body.ok || !r.body.result) {
+        bodyEl.replaceChildren(h("p", { class: "bad" }, "Could not resolve upstream: " + errText(r.body)));
+        return;
+    }
+    const res = r.body.result;
+    const mono = (v) => h("code", {}, String(v || "(unset)"));
+    const current = res.current, latest = res.latest;
+    const extLatest = res.ext_latest || "";
+    const cliDown = !!res.downgrade, extDown = !!res.ext_downgrade;
+    const cliMoved = current !== latest && !cliDown;
+    const extMoved = !!extLatest && res.ext_current !== extLatest && !extDown;
+    if (!cliMoved && !extMoved) {
+        const kids = [];
+        if (cliDown) kids.push(h("p", {}, `${row.row}: upstream latest `, mono(latest), " is older than the pin ", mono(current), " — nothing to do."));
+        if (extDown) kids.push(h("p", {}, "editor extension: upstream latest ", mono(extLatest), " is older than the pin ", mono(res.ext_current), " — nothing to do."));
+        if (!kids.length) {
+            kids.push(h("p", {}, `${row.row} is already at the upstream version `, mono(latest),
+                extLatest ? [" (extension ", mono(extLatest), ")"] : null, ". Nothing to do; use Pull to fetch it again if the pulled copy is stale."));
+        }
+        bodyEl.replaceChildren(...kids);
+        return;
+    }
+    const pinLine = (label, cur, up, moved, down) => h("p", {}, down
+        ? [`${label}: pin `, mono(cur), " — kept (upstream ", mono(up), " is older)."]
+        : [`${label}: pin `, mono(cur), moved ? " → upstream " : " — already at upstream ", mono(up), "."]);
+    const said = h("p", { class: "bad" });
+    const go = h("button", { class: "primary", onclick: () => startBuild(row, "refresh", said, go) }, "Bump + re-pull");
+    fill(bodyEl,
+        pinLine(row.row, current, latest, cliMoved, cliDown),
+        extLatest ? pinLine("editor extension", res.ext_current, extLatest, extMoved, extDown) : null,
+        h("p", {}, (extLatest && cliMoved && extMoved ? "Bump both pins to the versions above (at last check)" : "Bump to the version above (at last check)") +
+            " in the local override (versions.local.env on the data volume) and re-pull? A few minutes; the rest of the page stays responsive."),
+        said);
+    btns.replaceChildren(h("button", { onclick: closeModal }, "Cancel"), go);
+}
+
+// "Use repo version": the row's pins out of the local override, then the table read again.
+async function pinReset(row, btn) {
+    btn.disabled = true;
+    const r = await api("POST", "/broker/software/pin-reset", { software: row.id });
+    if (!r.body.ok) { btn.disabled = false; swTell(errText(r.body), true); return; }
+    const v = r.body.result && r.body.result.version;
+    swTell(`${row.row}: back to ${v || row.repo_version}, the version clanker-learn ships. Use repo version changes the pin only: Pull to fetch it.`);
+    refreshSoftware();
+}
+
 // ---- dialogs: a new project, a project's actions, an operation's progress -------------------
 
 let modal = null;
@@ -872,36 +1116,232 @@ function limitsInputs(current) {
     return { rows, values };
 }
 
+// ---- agents and the editor in a project (RS's create dialog and Config box, Agents) ------
+
+const AGENT_LABELS = { claude: "Claude" };
+let modelListSeq = 0;
+
+// The catalog of Claude's tiers, read once a login (null when the broker cannot serve it:
+// the model field then takes free text only).
+async function modelCatalog() {
+    if (S.models) return S.models;
+    const r = await api("GET", "/broker/models");
+    if (r.body.ok && r.body.result && Array.isArray(r.body.result.models)) S.models = r.body.result;
+    return S.models;
+}
+
+// Claude's model and effort on one line (RS's Agents box, Claude's tab): the model is free
+// text with the catalog's tiers offered, the effort a select that follows the chosen tier
+// (RS's modelPicker): a tier that takes no effort gets none, so the broker's refusal of one
+// is not reached from here.
+function claudeModelControls(cat, init, onChange) {
+    const tiers = (cat && Array.isArray(cat.models)) ? cat.models : [];
+    const listId = "claude-models-" + (++modelListSeq);
+    const list = h("datalist", { id: listId }, tiers.map((m) => h("option", { value: m.alias }, m.label || m.alias)));
+    const model = h("input", { type: "text", autocomplete: "off", spellcheck: "false", list: listId, placeholder: "Claude's own default" });
+    model.value = (init && init.model) || "";
+    const effort = h("select", {});
+    const blurb = h("span", { class: "note" });
+    let wanted = (init && init.effort) || "";
+    const sync = () => {
+        const tier = tiers.find((m) => m.alias === model.value.trim());
+        const levels = tier ? (tier.efforts || []) : ((cat && cat.efforts) || []);
+        blurb.textContent = tier && tier.blurb ? String(tier.blurb) : "";
+        if (tier && !levels.length) {
+            effort.replaceChildren(h("option", { value: "" }, "no effort levels"));
+            effort.disabled = true;
+            effort.value = "";
+            return;
+        }
+        effort.replaceChildren(h("option", { value: "" }, "Claude's default"), ...levels.map((lv) => h("option", { value: lv }, lv)));
+        effort.disabled = false;
+        effort.value = levels.includes(wanted) ? wanted : "";
+    };
+    model.addEventListener("input", () => { sync(); if (onChange) onChange(); });
+    effort.addEventListener("change", () => { wanted = effort.value; if (onChange) onChange(); });
+    sync();
+    const node = h("div", { class: "field" }, h("span", {}, "Claude's model and effort"),
+        list,
+        h("div", { class: "model-row" },
+            h("div", { class: "model-cell model-name" }, h("span", { class: "model-cap" }, "model"), model),
+            h("div", { class: "model-cell" }, h("span", { class: "model-cap" }, "effort"), effort)),
+        blurb);
+    return { node, model, effort, value: () => ({ model: model.value.trim(), effort: effort.disabled ? "" : effort.value }) };
+}
+
+// A toggle card (RS's box-opt-card): on, off, or not offered (with why).
+function optCard(label, on, why) {
+    const card = h("button", { type: "button", class: "opt-card" + (on ? " on" : ""), "aria-pressed": on ? "true" : "false",
+                               disabled: !!why, title: why || null }, label);
+    card.addEventListener("click", () => {
+        card.classList.toggle("on");
+        card.setAttribute("aria-pressed", card.classList.contains("on") ? "true" : "false");
+    });
+    return { card, on: () => card.classList.contains("on") && !card.disabled };
+}
+
+const softwareRow = (rows, id) => (rows || []).find((r) => r && r.id === id) || null;
+
 function newProjectDialog() {
     const name = h("input", { type: "text", autocomplete: "off", spellcheck: "false", maxlength: 31, placeholder: "rust-ownership" });
     const limits = limitsInputs(null);
     const said = h("p", { class: "muted" }, NAME_RULE);
-    const go = h("button", { class: "primary", type: "submit" }, "Create");
+    const go = h("button", { class: "primary", type: "submit", disabled: true }, "Create");
+    // The Agents box (RS's: open by default) and the editor's card, filled once the broker
+    // said what is pulled.
+    const agentsBody = h("div", {}, h("p", { class: "note" }, "Asking which software is pulled…"));
+    const editorBody = h("div", {});
+    let chosen = () => ({ agents: [], editor: false, claude_model: "", claude_effort: "" });
+    (async () => {
+        const [sw, cat] = await Promise.all([api("GET", "/broker/software"), modelCatalog()]);
+        const rows = sw.body.ok && Array.isArray(sw.body.result) ? sw.body.result : [];
+        const claude = softwareRow(rows, "claude");
+        const editor = softwareRow(rows, "code-server");
+        const notPulled = "Not pulled yet: pull it under Settings → Software first.";
+        const claudeCard = optCard(AGENT_LABELS.claude, !!(claude && claude.pulled), claude && claude.pulled ? null : notPulled);
+        const controls = claudeModelControls(cat, null);
+        const hint = h("p", { class: "note" });
+        const sync = () => {
+            controls.node.hidden = !claudeCard.on();
+            hint.textContent = !(claude && claude.pulled)
+                ? "No agent is pulled yet — pull Claude Code under Settings → Software. Without one the project starts with none."
+                : claudeCard.on() ? "" : "No agent: the project starts without one.";
+            hint.hidden = !hint.textContent;
+        };
+        claudeCard.card.addEventListener("click", sync);
+        sync();
+        fill(agentsBody,
+            sw.body.ok ? null : h("p", { class: "bad" }, "What is pulled could not be read: " + errText(sw.body)),
+            h("div", { class: "opt-cards" }, claudeCard.card), controls.node, hint);
+        const editorCard = optCard("Editor (code-server)", !!(editor && editor.pulled), editor && editor.pulled ? null : notPulled);
+        fill(editorBody, h("div", { class: "opt-cards" }, editorCard.card),
+            editor && editor.pulled ? null : h("p", { class: "note" }, "The editor is not pulled yet: pull it under Settings → Software."));
+        chosen = () => {
+            const on = claudeCard.on();
+            const mv = on ? controls.value() : { model: "", effort: "" };
+            return { agents: on ? ["claude"] : [], editor: editorCard.on(), claude_model: mv.model, claude_effort: mv.effort };
+        };
+        go.disabled = false;
+    })();
     const form = h("form", { method: "post", action: "#", onsubmit: async (ev) => {
         ev.preventDefault();
         go.disabled = true;
-        const r = await api("POST", "/broker/project", { name: name.value.trim(), ...limits.values() });
+        const r = await api("POST", "/broker/project", { name: name.value.trim(), ...limits.values(), ...chosen() });
         go.disabled = false;
         if (!r.body.ok) {
             said.className = "bad";
             const e = r.body.error || {};
-            // A name the broker refuses is said with the form a name takes.
-            said.textContent = e.kind === "validation" && !String(e.message || "").includes("lower-case")
+            // A name the broker refuses is said with the form a name takes; any other
+            // refusal (an agent not pulled, a tier that takes no effort) as it comes.
+            said.textContent = e.kind === "validation" && !NAME_RE.test(name.value.trim())
                 ? `“${name.value.trim()}” is not a project name. ${NAME_RULE}` : errText(r.body);
             return;
         }
         const project = name.value.trim();
         S.current = S.creating = project;
+        S.page = null;
         saveLayout();
         render();
         refreshProjects();
         await followOp(r.body.op_id, `Creating ${project}`);
         if (S.creating === project) S.creating = null;
-    } }, formRow("Name", name), h("details", { class: "more" }, h("summary", {}, "Limits (optional)"), limits.rows), said,
+    } }, formRow("Name", name),
+    h("details", { class: "more", open: true }, h("summary", {}, "Agents"), agentsBody),
+    h("div", { class: "field" }, h("span", {}, "Editor"), editorBody),
+    h("details", { class: "more" }, h("summary", {}, "Limits (optional)"), limits.rows), said,
     h("div", { class: "btns" }, h("button", { type: "button", onclick: closeModal }, "Cancel"), go));
     openModal("New project", form, []);
     name.focus();
 }
+
+// The Config box's Agents section (RS's appendAgentsBox / agentsBoxContent, cut to what a
+// clanker-learn project has): what the project has, Add for an agent it has not, Claude's
+// model and effort, and Update. Each acts on the running sandbox, live.
+function agentsSection(name, p, box) {
+    const running = p.state === "running" && !opOf(name);
+    const agents = Array.isArray(p.agents) ? p.agents : [];
+    const has = [...agents.map((a) => a === "claude" ? "Claude Code" : a), p.editor ? "the editor (code-server)" : null].filter(Boolean);
+    const said = h("p", { class: "muted" });
+    const tell = (text, bad) => { said.className = bad ? "bad" : "muted"; said.textContent = text; };
+    const body = h("div", {}, h("p", { class: "note" }, "Asking…"));
+    box.append(h("p", {}, has.length ? `This project has ${has.join(" and ")}.` : "This project has no agent and no editor."), body, said);
+    (async () => {
+        const [sw, cat] = await Promise.all([api("GET", "/broker/software"), modelCatalog()]);
+        const rows = sw.body.ok && Array.isArray(sw.body.result) ? sw.body.result : [];
+        const parts = [];
+        // Add, for an agent the project does not have.
+        for (const agent of Object.keys(AGENT_LABELS)) {
+            if (agents.includes(agent)) continue;
+            const row = softwareRow(rows, agent);
+            const why = !running ? "Start the project to add an agent." : !(row && row.pulled) ? "Pull it under Settings → Software first." : null;
+            const add = h("button", { disabled: !!why, title: why, onclick: async () => {
+                add.disabled = true;
+                const r = await api("POST", projectPath(name, "/agents"), { agent });
+                if (!r.body.ok) { add.disabled = false; tell(errText(r.body), true); return; }
+                refreshProjects();
+                followOp(r.body.op_id, `${name}: adding ${row ? row.label : agent}`);
+            } }, `Add ${AGENT_LABELS[agent]}`);
+            parts.push(h("div", { class: "kv" }, h("span", { class: "k" }, AGENT_LABELS[agent]),
+                h("span", { class: "row-btns" }, add, h("span", { class: "note" }, why || "live, nothing restarted"))));
+        }
+        // Claude's model and effort, while the project runs.
+        if (agents.includes("claude")) {
+            const controls = claudeModelControls(cat, { model: p.claude_model || "", effort: p.claude_effort || "" });
+            controls.model.disabled = !running;
+            if (!running) controls.effort.disabled = true;
+            const apply = h("button", { disabled: !running, onclick: async () => {
+                const v = controls.value();
+                apply.disabled = true;
+                const r = await api("POST", projectPath(name, "/model"), v);
+                apply.disabled = false;
+                if (!r.body.ok) { tell(errText(r.body), true); return; }
+                const res = r.body.result || {};
+                const pair = [res.claude_model, res.claude_effort].filter(Boolean).join(", ");
+                tell((pair ? `Claude's model and effort are now ${pair}.` : "Claude's model and effort are back to Claude's own defaults.") +
+                     (res.applied === false ? " Claude Code's settings are not installed yet: they get this when they are." : " Written into Claude Code's settings; a session started from now on uses it."));
+                refreshProjects();
+            } }, "Apply");
+            parts.push(controls.node, h("div", { class: "row-btns" }, apply,
+                running ? null : h("span", { class: "note" }, "Start the project to change Claude's model and effort.")));
+        }
+        // Update: the pulled versions into the running project (RS's mgmtAgentsUpdateDialog).
+        if (agents.length) {
+            const upd = h("button", { disabled: !running, title: running ? "Deploy the pulled agent versions into this project" : "Start the project to update its agents",
+                                      onclick: () => agentsUpdateDialog(name, agents, rows) }, "Update");
+            parts.push(h("div", { class: "row-btns update-row" }, upd,
+                h("span", { class: "note" }, running ? "deploys the pulled versions, live" : "Start the project to update its agents.")));
+        }
+        body.replaceChildren(...parts);
+    })();
+}
+
+function agentsUpdateDialog(name, agents, rows) {
+    const versions = agents.map((a) => {
+        const row = softwareRow(rows, a);
+        if (!row || !row.pulled) return h("li", {}, `${a}: not pulled`);
+        return h("li", {}, `${row.label} ${row.pulled.version}` + (row.pulled.ext_version ? ` (editor extension ${row.pulled.ext_version})` : ""),
+            row.status === "up to date" ? "" : " — the pulled copy is stale; press Pull in Settings → Software first to get the version in effect");
+    });
+    const said = h("p", { class: "bad" });
+    const go = h("button", { class: "primary", onclick: async () => {
+        go.disabled = true;
+        const r = await api("POST", projectPath(name, "/agents_update"));
+        if (!r.body.ok) { go.disabled = false; said.textContent = errText(r.body); return; }
+        refreshProjects();
+        followOp(r.body.op_id, `Updating the agents of ${name}`, { endNote: AGENTS_UPDATE_HINT });
+    } }, "Update");
+    openModal(`Update the agents of ${name}`, [
+        h("p", {}, "Deploys the versions pulled on this machine:"),
+        h("ul", { class: "plain" }, versions),
+        h("p", { class: "note" }, AGENTS_UPDATE_HINT),
+        said,
+    ], [h("button", { onclick: closeModal }, "Cancel"), go]);
+}
+
+// RS's words (agentsUpdateHint, for a project whose own terminal has the agents).
+const AGENTS_UPDATE_HINT = "Applied live — nothing is recreated, and logins, sessions and settings are kept. " +
+    "The project's Shell gets these versions, including over an agent you updated yourself. " +
+    "Restart running agent sessions afterwards to use the new versions.";
 
 function projectDialog(name) {
     const p = projectRow(name);
@@ -938,6 +1378,8 @@ function projectDialog(name) {
     } }, h("p", { class: "note" }, "The sandbox, its workspace and its ports go, for good. Type your password to confirm."),
         formRow("Password", pw), h("div", { class: "btns" }, destroyGo));
     const running = p.state === "running";
+    const agentsBox = h("details", { class: "more agents-box", open: true }, h("summary", {}, "Agents"));
+    agentsSection(name, p, agentsBox);
     openModal(name, [
         h("div", { class: "kv" }, h("span", { class: "k" }, "Sandbox"),
             h("span", {}, h("span", { class: `dot inline ${st.cls}` }), " ", st.text, " ",
@@ -947,6 +1389,7 @@ function projectDialog(name) {
                 action("recreate", "Recreate"))),
         h("p", { class: "note" }, "Recreate makes a new sandbox from the current image, with the same workspace and home folder; its setup recipe runs again."),
         p.problem ? h("p", { class: "bad" }, String(p.problem)) : null,
+        agentsBox,
         h("details", { class: "more" }, h("summary", {}, "Limits"), limitsForm),
         h("details", { class: "more danger-zone" }, h("summary", {}, "Destroy"), destroyForm),
         said,
@@ -964,11 +1407,14 @@ async function runAction(name, verb) {
 }
 
 // Follow an operation: its log as it grows, then its result. The dialog can be closed; the
-// operation goes on in the broker, and the rail says so.
-async function followOp(opId, title) {
+// operation goes on in the broker, and the rail says so. opts.background follows it without
+// a dialog (a build found again after a reload); opts.onEnd(ok) is told when it is over.
+async function followOp(opId, title, opts) {
+    opts = opts || {};
     const state = h("p", { class: "opstate" }, "Running…");
     const log = h("pre", { class: "oplog" });
-    const scrim = openModal(title, [state, log], [h("button", { onclick: closeModal }, "Close")]);
+    const scrim = opts.background ? null
+        : openModal(title, [state, log], [h("button", { onclick: closeModal }, "Close")]);
     const add = (text) => {
         for (const line of text.split("\n")) {
             if (!line.trim()) continue;
@@ -1002,7 +1448,9 @@ async function followOp(opId, title) {
     const msg = typeof result.msg === "string" && result.msg ? `: ${result.msg}` : "";
     state.textContent = (ok ? "Done" : "Failed") + msg;
     state.className = "opstate " + (ok ? "good" : "bad");
-    if (!scrim.isConnected) toast(`${title}: ${ok ? "done" : "failed"}${msg}`, !ok);
+    if (opts.endNote && ok) state.after(h("p", { class: "note" }, opts.endNote));
+    if (!scrim || !scrim.isConnected) toast(`${title}: ${ok ? "done" : "failed"}${msg}`, !ok);
+    if (opts.onEnd) opts.onEnd(ok);
     await refreshProjects();
     if (S.current) refreshServices(S.current);
 }
