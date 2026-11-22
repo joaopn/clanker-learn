@@ -7,5 +7,5 @@ if [ -x "$home/.local/bin/claude" ]; then
     export PATH
     exec "$home/.local/bin/claude" "$@"
 fi
-echo "This project has no Claude Code: it is added in the project's Config box (Agents)." >&2
+echo "This project has no Claude Code: it is added from the project's gear (⚙) in the project list, under Agents." >&2
 exit 127

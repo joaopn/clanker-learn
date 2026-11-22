@@ -83,9 +83,10 @@ copies each project under that project's lock, waiting for an operation on it to
 a create, destroy or start is never cut through; while it copies a project, that project's
 operations are refused as busy. `backup_active` lists the backup in flight. `backup_list` is a
 read; `backup_rm` (step-up: a backup may be the only copy of what was destroyed, as RS rules
-for its exports) and `backup_fetch` are audited and answered at once. `backup_fetch` links one
-backup into the web server's own folder for one download (core.backup_fetch says why not the
-folder of backups). A restore is not a verb: it replaces everything, and is the `cl` command
+for its exports) and `backup_fetch` (step-up too: an archive holds the password's hash, the
+Claude token and every project's keys, so a browser left logged in cannot carry them away) are
+audited and answered at once. `backup_fetch` links one backup into the web server's own folder
+for one download (core.backup_fetch says why not the folder of backups). A restore is not a verb: it replaces everything, and is the `cl` command
 only. `mode` is a read: the mode the init declared (sysbox or privileged), for Settings and
 the line under the project list.
 """
@@ -132,7 +133,7 @@ WRONG_CODES, WRONG_WINDOW_S, SHUT_S = 10, 60, 60
 AUTH_VERBS = ("login", "logout")
 SETUP_VERBS = frozenset({"setup_needed", "first_password"})
 OPEN_VERBS = frozenset({"list", "status", "op"})
-STEP_UP_VERBS = frozenset({"destroy", "backup_rm"})
+STEP_UP_VERBS = frozenset({"destroy", "backup_rm", "backup_fetch"})
 # Operations on a project: a child holds the project's lock (agents_add and agents_update run
 # here as RS runs its `update` and `agents_update`: on its lifecycle lane, with a log).
 OP_VERBS = frozenset({"create", "start", "stop", "recreate", "destroy", "agents_add", "agents_update"})
@@ -388,8 +389,14 @@ def what_was_done(verb, name, out):
             return f"{label} {out.get('version')} is in effect and upstream's newest is {out.get('upstream')}: nothing to do."
         return f"{label} {out.get('version')} is pulled."
     if verb in ("agents_add", "agents_update"):
-        deployed = ", ".join(f"{agent} {version}" for agent, version in (out.get("deployed") or {}).items())
-        return f"Deployed into {name}: {deployed or 'nothing'}."
+        # What the deploy script said it did (for Claude Code: whether its editor extension was
+        # forced into the project's editor, or could not be), else the version deployed.
+        said, parts = out.get("said") or {}, []
+        for agent, version in (out.get("deployed") or {}).items():
+            label = core.SOFTWARE[agent]["label"] if agent in core.SOFTWARE else agent
+            line = str(said.get(agent) or "").removeprefix(f"deploy {agent}: ")
+            parts.append(f"{label}: {line}" if line else f"{label} {version}")
+        return f"Deployed into {name}: {'; '.join(parts) or 'nothing'}."
     notes = " ".join(out.get("notes", []))
     return f"{name} is {out.get('state', 'done')}." + (f" {notes}" if notes else "")
 

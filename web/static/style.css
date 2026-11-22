@@ -134,6 +134,8 @@ a { color: var(--fg-accent); }
 .tabbar .newtab:hover { color: var(--fg-accent); }
 .tabbar .spacer { flex: 1; }
 .tabbar .tb .tl { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.tabbar .tb .tclose { background: none; border: 0; padding: 0 2px; color: var(--fg-faint); font-size: 15px; line-height: 1; cursor: pointer; flex-shrink: 0; }
+.tabbar .tb .tclose:hover { color: var(--fg-base); }
 
 /* ---- tabs side by side (RS's column layout: style.css .column-tab-group, .column-splitter,
    .column-drop-overlay, .tab-drag-ghost, .tab-drop-indicator) ---- */
@@ -314,6 +316,7 @@ a.btnlink:hover { background: var(--btn-secondary-bg-hover); }
 .lwait { width: 9px; text-align: center; flex: none; color: var(--fg-faint); font-size: 10px; }
 /* A lesson's state (the mock's marks); a dropped one struck through, at the end. */
 .lst { width: 14px; text-align: center; flex: none; }
+.lwait { flex: none; color: var(--warn-fg); font-size: 10px; }
 .lst.done { color: var(--status-up); }
 .lst.in_progress { color: var(--tab-type-lesson); }
 .lst.not_started { color: var(--fg-faint); }
@@ -338,7 +341,7 @@ a.btnlink:hover { background: var(--btn-secondary-bg-hover); }
 .lhead .lo { color: var(--fg-muted); white-space: nowrap; font-size: 13px; overflow: hidden; text-overflow: ellipsis; min-width: 0; flex: 1; }
 .lhead .lw { color: var(--fg-muted); white-space: nowrap; font-size: 13px; }
 .lhead .lw:empty { display: none; }
-.lhead select.lagent { flex: none; max-width: 180px; padding: 2px 6px; font-size: 12px; color: var(--fg-muted); }
+.lhead select.lagent { flex: none; max-width: 280px; padding: 2px 6px; font-size: 12px; color: var(--fg-muted); }
 .lhead .lstate { flex: none; font-size: 12px; color: var(--fg-faint); border: 1px solid #3a3a3a; border-radius: 10px; padding: 1px 9px; white-space: nowrap; }
 .lhead .lstate.done { color: var(--status-up); border-color: #355c35; }
 .lhead .lstate.in_progress { color: var(--tab-type-lesson); border-color: #4a3d6b; }

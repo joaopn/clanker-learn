@@ -9,5 +9,5 @@ if [ -x "$home/.local/bin/pi" ]; then
     export PATH
     exec "$home/.local/bin/pi" "$@"
 fi
-echo "This project has no pi: it is added in the project's Config box (Agents)." >&2
+echo "This project has no pi: it is added from the project's gear (⚙) in the project list, under Agents." >&2
 exit 127

@@ -88,7 +88,8 @@ function loadLayout() {
         const v = JSON.parse(localStorage.getItem(LAYOUT_KEY) || "{}");
         const lessons = {};
         if (v.lessons && typeof v.lessons === "object") {
-            for (const [k, id] of Object.entries(v.lessons)) if (typeof id === "string" && LESSON_ID_RE.test(id)) lessons[k] = id;
+            // null: the project's lesson tab was closed (Goals is not opened by itself again).
+            for (const [k, id] of Object.entries(v.lessons)) if (id === null || (typeof id === "string" && LESSON_ID_RE.test(id))) lessons[k] = id;
         }
         // Per project: its columns of tab ids, their widths, the tabs last shown in them and the
         // focused one. Only ids the project has are ever used (reconcileTabLayout).
@@ -189,7 +190,7 @@ const S = {
     models: null,          // the catalog of Claude's tiers (/broker/models), once read
     expanded: new Set(),   // projects shown open into their lessons in the list
     lessons: {},           // project -> {list: [lesson], error: sentence or null}, as last read
-    lessonOf: {},          // project -> the id of its lesson tab (one at a time)
+    lessonOf: {},          // project -> the id of its lesson tab (one at a time), null once closed
     activity: new Set(),   // ids of the lessons whose tutor is working (/broker/tutor/activity)
     tutorError: null,      // why the tutor service could not be asked, or null
     tutorSettings: null,   // Settings -> Tutor: {claude_token_set}, as last read
@@ -205,6 +206,7 @@ const S = {
     backups: null,         // Settings -> Backup: the broker's rows, as last read
     backupsError: null,
     backupOp: null,        // the op_id of the backup being made, or null
+    ctxWindow: {},         // project -> the context window its tutor last reported (the context line)
 };
 
 const tabOf = (project) => S.tabs[project] || "shell";
@@ -411,7 +413,7 @@ function teardownApp() {
                        tutorSettings: null, tutorSettingsError: null, filesOrigins: new Map(), editorFile: {},
                        cols: {}, tabLayout: null, dragging: false, renderPending: false,
                        kb: { view: "brief", raw: false, showRetired: false, q: "", seq: 0, changes: null, next: null, navData: null }, kbOpen: 0,
-                       mode: null, backups: null, backupsError: null, backupOp: null });
+                       mode: null, backups: null, backupsError: null, backupOp: null, ctxWindow: {} });
 }
 
 async function refreshProjects() {
@@ -609,6 +611,8 @@ function makeTab(name, t, col, on) {
                            // consumeTabDragClick swallows the one click the browser makes on the tab after a drag.
                            onclick: () => { if (!consumeTabDragClick()) showTab(name, t.id); } },
         h("span", { class: "tl" }, t.label),
+        t.type === "lesson" ? h("button", { class: "tclose", title: "Close the tab (the lesson stays in the list)", "aria-label": "Close the tab",
+                                           onclick: (ev) => { ev.stopPropagation(); closeLessonTab(name, lessonTabId(t.id)); } }, "×") : null,
         t.type !== "cli" && t.type !== "ports" && t.type !== "kb" && url ? h("a", { class: "newtab", href: url, target: "_blank", rel: "noopener noreferrer",
                                                                   title: "Open in a new browser tab", onclick: (ev) => ev.stopPropagation() }, "↗") : null);
     armTabDrag(tab, name, t.id);
@@ -1471,8 +1475,11 @@ function setPlan(name, plan) {
     const goals = isLesson(plan.goals) ? plan.goals : null;
     const list = [goals, ...modules.flatMap((m) => m.lessons), ...other, ...dropped].filter(Boolean);
     S.lessons[name] = { list, goals, modules, other, dropped, error: null };
-    // A project shown for the first time opens on Goals.
-    if (goals && !S.lessonOf[name]) S.lessonOf[name] = goals.id;
+    // A project shown for the first time opens on Goals (not once its lesson tab was closed).
+    if (goals && !(name in S.lessonOf)) S.lessonOf[name] = goals.id;
+    // The conversations where a card waits for the learner (an open plan or change).
+    S.lessons[name].waiting = new Set((Array.isArray(plan.proposals) ? plan.proposals : [])
+        .map((p) => p && typeof p === "object" && p.state !== "approved" && p.state !== "dismissed" ? p.lesson_id : null).filter((x) => typeof x === "string"));
     for (const l of list) {
         const pane = S.panes[paneKey(name, lessonTab(l.id))];
         if (pane && pane.setLesson) pane.setLesson(l);
@@ -1539,6 +1546,7 @@ function lessonRows(name) {
         return h("div", { class: `lesson-row st-${st}` + (l.id === shown ? " sel" : ""), title: lessonTip(l), onclick: () => openLesson(name, l.id) },
             working ? h("span", { class: "pulse", title: "The tutor is working" }) : h("span", { class: `lst ${st}` }, LESSON_MARKS[st]),
             h("span", { class: "ltitle" }, String(l.title || "Lesson")),
+            L.waiting && L.waiting.has(l.id) ? h("span", { class: "lwait", title: "A card waits for you here: a plan or a change to approve or dismiss" }, "●") : null,
             // Goals keeps its name and its place: no ⋯ for it.
             l.kind === "goals" ? null : h("button", { class: "gear lgear", title: "Rename, change the objective, or delete",
                                                       onclick: (ev) => { ev.stopPropagation(); lessonDialog(name, l); } }, "⋯"));
@@ -1565,6 +1573,18 @@ function openLesson(name, id) {
     S.tabs[name] = lessonTab(id);
     S.page = null;
     if (S.current !== name) { S.current = name; refreshServices(name); }
+    saveLayout();
+    render();
+}
+
+// The lesson tab's close button: the tab goes, the lesson stays in the list (RS's closable
+// tabs). The tab shown next is another of its column's, else the Shell.
+function closeLessonTab(name, id) {
+    const tab = lessonTab(id);
+    const col = (S.tabLayout && S.tabLayout.project === name ? S.tabLayout.columns : (S.cols[name] && S.cols[name].columns) || []).find((c) => c.includes(tab)) || [];
+    dropPane(paneKey(name, tab));
+    S.lessonOf[name] = null;
+    if (tabOf(name) === tab) S.tabs[name] = col.find((t) => t !== tab && !lessonTabId(t)) || "shell";
     saveLayout();
     render();
 }
@@ -2291,7 +2311,7 @@ function learnDetail(detail) {
     try { return JSON.stringify(JSON.parse(detail), null, 2); } catch (_) { return detail; }
 }
 
-function toolLine(tool) {
+function toolLine(tool, ended) {
     const mark = h("span", {});
     const pre = h("pre", {});
     const learn = tool.kind === "learn";
@@ -2300,20 +2320,29 @@ function toolLine(tool) {
         h("summary", {}, mark, " ", TOOL_WORDS[tool.kind] ? h("span", { class: "tkind" }, TOOL_WORDS[tool.kind] + " ") : null,
             learn ? h("span", { class: "tlearn" }, LEARN_WORDS[label] || `used its tool ${label}`) : h("span", { class: "tlabel" }, label)),
         pre);
-    const set = (ok, output) => {
-        mark.className = ok === true ? "okc" : ok === false ? "badc" : "pendc";
-        mark.textContent = ok === true ? "✓" : ok === false ? "✗" : "…";
+    const note = h("span", { class: "tnote" });
+    el.querySelector("summary").append(note);
+    // unfinished: no result will come (the answer ended while it ran: stopped, failed, or the
+    // tutor service restarted); shown as such, not as still running.
+    const set = (ok, output, unfinished) => {
+        const never = (ok === null || ok === undefined) && !!unfinished;
+        line.pending = (ok === null || ok === undefined) && !never;
+        mark.className = ok === true ? "okc" : ok === false ? "badc" : never ? "warnc" : "pendc";
+        mark.textContent = ok === true ? "✓" : ok === false ? "✗" : never ? "–" : "…";
+        note.textContent = never ? " — did not finish" : "";
         const detail = learn ? learnDetail(tool.detail) : typeof tool.detail === "string" && tool.detail && tool.detail !== tool.label ? tool.detail : "";
         const out = typeof output === "string" ? output : "";
         if (learn) {
-            pre.textContent = [`Sent: ${detail || "nothing"}`, out ? `Answer: ${out}` : ok === null || ok === undefined ? "Still working…" : null]
+            pre.textContent = [`Sent: ${detail || "nothing"}`, out ? `Answer: ${out}` : never ? "(not finished: the answer ended while this was running)" : line.pending ? "Still working…" : null]
                 .filter(Boolean).join("\n\n");
             return;
         }
-        pre.textContent = [detail, out].filter(Boolean).join("\n\n") || (ok === null || ok === undefined ? "Still working…" : "(no output)");
+        pre.textContent = [detail, out || (never ? "(not finished: the answer ended while this was running)" : null)].filter(Boolean).join("\n\n")
+            || (line.pending ? "Still working…" : "(no output)");
     };
-    set(tool.ok, tool.output);
-    return { el, set };
+    const line = { el, set, pending: false };
+    set(tool.ok, tool.output, tool.unfinished === true || ended);
+    return line;
 }
 
 // ---- a proposal: the plan card and the change card (after the mock's planHtml) --------------
@@ -2638,6 +2667,8 @@ function makeLessonPane(name, id) {
     const objEl = h("span", { class: "lo" });
     const markEl = h("span", { class: "lstate" });
     const summaryBtn = h("button", { class: "mini wide", hidden: true, title: "What the tutor wrote when it closed the lesson" }, "Summary");
+    // The lesson's folder in the workspace (its transcript, the tutor's notes), in the Editor.
+    const filesBtn = h("button", { class: "mini wide", hidden: true }, "Files");
     const stateEl = h("span", { class: "lw" });
     // The agent that teaches the lesson (the mock's select): the default, or one the project has.
     const agentSel = h("select", { class: "lagent", title: "The agent that teaches this lesson. It can be changed at any time.",
@@ -2649,7 +2680,7 @@ function makeLessonPane(name, id) {
     const ta = h("textarea", { rows: 2, placeholder: "Write to the tutor…", "aria-label": "Your message to the tutor" });
     const btn = h("button", { class: "primary" }, "Send");
     const el = h("div", { class: "pane lesson-pane" },
-        h("div", { class: "lhead" }, h("div", { class: "lh-main" }, titleEl, objEl), stateEl, agentSel, markEl, summaryBtn),
+        h("div", { class: "lhead" }, h("div", { class: "lh-main" }, titleEl, objEl), stateEl, agentSel, markEl, filesBtn, summaryBtn),
         conv, ctx,
         h("div", { class: "composer" }, said, h("div", { class: "composer-inner" }, ta, btn)));
     const pane = { kind: "lesson", lessonId: id, el, title: null, lesson: null, turn: null, stale: true, loading: false, sending: false };
@@ -2683,10 +2714,20 @@ function makeLessonPane(name, id) {
             l.closed_at ? h("p", { class: "note" }, `Closed by the tutor ${fmtWhen(l.closed_at)}. The line above is what later lessons' tutors are given.`) : null,
         ], [h("button", { onclick: closeModal }, "Close")]);
     });
+    // The transcript in the lesson's folder, as a file link opens a workspace file in the Editor.
+    const transcriptOf = (l) => {
+        const folder = l && typeof l.folder === "string" && l.folder.startsWith("/workspace/") ? l.folder.slice("/workspace/".length) : null;
+        return folder ? workspaceTarget(`${folder}/transcript.md`, false) : null;
+    };
+    filesBtn.addEventListener("click", () => { const file = transcriptOf(pane.lesson); if (file) openInEditor(name, file); });
     // The lesson as last read: its title, objective, state and summary in the header.
     pane.setLesson = (l) => {
         if (!isLesson(l)) return;
         pane.lesson = l;
+        const file = transcriptOf(l);
+        const p = projectRow(name);
+        filesBtn.hidden = !(file && p && p.editor);
+        filesBtn.title = file ? `Open /workspace/${file.path} in the Editor: the lesson's folder holds its transcript and the tutor's notes` : "";
         if (typeof l.title === "string" && l.title) pane.setTitle(l.title);
         const goals = l.kind === "goals";
         objEl.textContent = goals ? GOALS_LINE : String(l.objective || "");
@@ -2707,23 +2748,28 @@ function makeLessonPane(name, id) {
         const have = (p && Array.isArray(p.agents) ? p.agents : []).filter((a) => AGENT_NAMES[a]);
         const own = l && AGENT_NAMES[l.agent] ? l.agent : "";
         if (own && !have.includes(own)) have.push(own);
-        const dflt = l && !own && AGENT_NAMES[l.agent_in_effect] ? l.agent_in_effect
-            : S.tutorSettings && AGENT_NAMES[S.tutorSettings.default_agent] ? S.tutorSettings.default_agent : null;
-        const key = [own, dflt, ...have].join("|");
+        // A lesson that has started without choosing stays with the agent that began it
+        // (agent_source "begun"); only one that has not started follows the default.
+        const begun = l && !own && l.agent_source === "begun" && AGENT_NAMES[l.agent_in_effect] ? l.agent_in_effect : null;
+        const settingsDefault = S.tutorSettings && AGENT_NAMES[S.tutorSettings.default_agent] ? S.tutorSettings.default_agent : null;
+        const dflt = begun ? settingsDefault : l && !own && AGENT_NAMES[l.agent_in_effect] ? l.agent_in_effect : settingsDefault;
+        const key = [own, begun, dflt, ...have].join("|");
         if (key === agentKey) return;
         agentKey = key;
-        agentSel.replaceChildren(h("option", { value: "" }, dflt ? `the default (${AGENT_NAMES[dflt]})` : "the default agent"),
+        agentSel.replaceChildren(
+            begun ? h("option", { value: "begun" }, `${AGENT_NAMES[begun]}, which began this lesson`) : null,
+            h("option", { value: "" }, dflt ? `the default (${AGENT_NAMES[dflt]})` : "the default agent"),
             ...have.map((a) => h("option", { value: a }, AGENT_NAMES[a])));
-        agentSel.value = own;
+        agentSel.value = begun ? "begun" : own;
     };
     agentSel.addEventListener("change", async () => {
+        if (agentSel.value === "begun") return;   // what is in effect already
         const want = agentSel.value || null;
-        const was = pane.lesson ? (AGENT_NAMES[pane.lesson.agent] ? pane.lesson.agent : "") : "";
         agentSel.disabled = true;
         const r = await tutorApi("PATCH", `/lessons/${enc(id)}`, { agent: want });
         agentSel.disabled = false;
         const res = r.body.ok && r.body.result;
-        if (!isLesson(res)) { agentSel.value = was; tell(errText(r.body)); return; }
+        if (!isLesson(res)) { agentKey = ""; pane.drawAgent(); tell(errText(r.body)); return; }
         const row = lessonRow(name, id);
         if (row) Object.assign(row, res);
         pane.setLesson(res);
@@ -2748,13 +2794,13 @@ function makeLessonPane(name, id) {
     const tellTrouble = (text) => { tell(text); trouble = true; };
     const clearTrouble = () => { if (trouble) tell(""); };
     pane.setTitle = (t) => { pane.title = t; titleEl.textContent = t; };
-    // The window comes with the turn's last line only: the figures sent while it is written
-    // keep the one known before, so the line does not change its form on the way.
-    let lastWindow = null;
+    // The figures come as each request of an answer ends (`usage`), the window with the turn's
+    // last line only: the figures sent while it is written keep the one known before (this
+    // lesson's, else the project's last known), so the line does not change its form on the way.
     const setUsage = (usage) => {
         if (usage && typeof usage === "object") {
-            if (usageNum(usage.context_window)) lastWindow = usage.context_window;
-            else if (lastWindow) usage = { ...usage, context_window: lastWindow };
+            if (usageNum(usage.context_window)) S.ctxWindow[name] = usage.context_window;
+            else if (S.ctxWindow[name]) usage = { ...usage, context_window: S.ctxWindow[name] };
         }
         const text = contextFooter(usage);
         if (text) { ctx.textContent = text; ctx.hidden = false; }
@@ -2771,13 +2817,14 @@ function makeLessonPane(name, id) {
     const emptyNote = () => inner.querySelector(".empty");
 
     // blocks: the drawn elements of the answer this message was being written as, kept.
-    function messageEl(m, blocks) {
+    // ended: the message's answer is over, so a tool in it without a result never finished.
+    function messageEl(m, blocks, ended) {
         const you = m.role === "user";
         const body = h("div", { class: you ? "body" : "body md" });
         const traces = h("div", { class: "traces" });
         for (const t of (Array.isArray(m.tools) ? m.tools : [])) {
             if (!t || typeof t !== "object") continue;
-            const line = toolLine(t);
+            const line = toolLine(t, !!ended);
             if (typeof t.id === "string") tools.set(t.id, line);
             traces.append(line.el);
         }
@@ -2861,6 +2908,8 @@ function makeLessonPane(name, id) {
             else { d.body.replaceChildren(mdRender(d.text, { project: name, blocks: d.blocks })); d.body.hidden = !d.text.trim(); d.tail.remove(); }
         }
         turn.draft = null;
+        // The answer is over: a tool line still waiting for its result will not get one.
+        if (ended) for (const line of tools.values()) if (line.pending) line.set(null, "", true);
         tell("");
         S.activity.delete(id);
         const row = lessonRow(name, id);
@@ -2909,7 +2958,7 @@ function makeLessonPane(name, id) {
             }
             case "tool_result": {
                 const line = tools.get(d.id);
-                if (line) line.set(d.ok === true ? true : d.ok === false ? false : null, d.output);
+                if (line) line.set(d.ok === true ? true : d.ok === false ? false : null, d.output, d.unfinished === true);
                 break;
             }
             case "message": {
@@ -3002,7 +3051,7 @@ function makeLessonPane(name, id) {
         for (const m of (Array.isArray(res.messages) ? res.messages : [])) {
             if (!m || typeof m !== "object") continue;
             if (run && m.role === "assistant" && m.run_id === run.id) continue;
-            inner.append(messageEl(m).el);
+            inner.append(messageEl(m, null, true).el);
         }
         // An answer that did not end well says so after its last part, as it did while it was written.
         for (const e of (Array.isArray(res.ended) ? res.ended : [])) {
@@ -4076,7 +4125,7 @@ function renderBackups() {
         const what = b.problem ? h("span", { class: "bad" }, String(b.problem))
             : h("span", { class: "muted" }, projects.length ? `${projects.length} project${projects.length === 1 ? "" : "s"}: ${projects.join(", ")}` : "no project",
                 b.kind && b.kind !== "backup" ? ` (${String(b.kind)})` : null);
-        const download = h("a", { class: "btnlink", href: `/broker/backups/${enc(b.backup)}/download`, download: b.backup }, "Download");
+        const download = h("button", { onclick: () => downloadBackupDialog(b.backup) }, "Download");
         const remove = h("button", { onclick: () => removeBackupDialog(b.backup) }, "Remove");
         rows.push(h("div", { class: "bk-row" },
             h("div", { class: "bk-main" },
@@ -4115,6 +4164,36 @@ async function seedBackup() {
     const ops = r.body.ok && r.body.result && Array.isArray(r.body.result.ops) ? r.body.result.ops : [];
     const op = ops.find((o) => o && typeof o.op_id === "string");
     if (op && S.backupOp !== op.op_id) followBackup(op.op_id, true);
+}
+
+// Downloading asks for the password again too: an archive holds the password's hash, the Claude
+// token and every project's keys. The web server answers a right password with a one-time
+// address of this login's, opened as a plain download: the file goes to the browser's
+// downloads as it comes, never through the page (the policy's form-action is 'none' anyway).
+function downloadBackupDialog(name) {
+    const pw = h("input", { type: "password", autocomplete: "current-password" });
+    const said = h("p", { class: "bad" });
+    const go = h("button", { class: "primary", type: "submit" }, "Download");
+    const form = h("form", { method: "post", action: "#", onsubmit: async (ev) => {
+        ev.preventDefault();
+        if (!pw.value) { said.textContent = "Downloading a backup needs your password again."; return; }
+        go.disabled = true;
+        said.textContent = "";
+        const proof = await deriveLoginProof(pw.value);
+        pw.value = "";
+        const r = await api("POST", `/broker/backups/${enc(name)}/download`, { proof });
+        go.disabled = false;
+        if (!r.body.ok || typeof r.body.url !== "string" || !r.body.url.startsWith("/broker/backups/file/")) { said.textContent = errText(r.body); pw.focus(); return; }
+        closeModal();
+        const a = h("a", { href: r.body.url, download: name, hidden: true });
+        document.body.append(a);
+        a.click();
+        a.remove();
+        backupTell(`${name} is being downloaded: your browser's downloads show how far it is.`);
+    } }, h("p", {}, h("code", {}, name), " holds the password's hash, the Claude token and every project's keys. Type your password to download it."),
+        formRow("Password", pw), said, h("div", { class: "btns" }, h("button", { type: "button", onclick: closeModal }, "Cancel"), go));
+    openModal("Download a backup", form, []);
+    pw.focus();
 }
 
 // Removing asks for the password again, as destroying a project does.
@@ -4362,7 +4441,10 @@ function newProjectDialog() {
 // clanker-learn project has): what the project has, Add for an agent it has not, Claude's
 // model and effort, and Update. Each acts on the running sandbox, live.
 function agentsSection(name, p, box) {
-    const running = p.state === "running" && !opOf(name);
+    const op = opOf(name);
+    const running = p.state === "running" && !op;
+    // While an operation on the project runs, it is busy with that, whatever its state was.
+    const notNow = (start) => (op ? `${name} is ${OP_WORDS[op.verb] || "busy with something"} now: wait until that is done.` : start);
     const agents = Array.isArray(p.agents) ? p.agents : [];
     const has = [...agents.map((a) => AGENT_NAMES[a] || a), p.editor ? "the editor (code-server)" : null].filter(Boolean);
     const said = h("p", { class: "muted" });
@@ -4378,7 +4460,7 @@ function agentsSection(name, p, box) {
         for (const agent of Object.keys(AGENT_LABELS)) {
             if (agents.includes(agent)) continue;
             const row = softwareRow(rows, agent);
-            const why = !running ? "Start the project to add an agent." : !(row && row.pulled) ? "Pull it under Settings → Software first." : null;
+            const why = !running ? notNow("Start the project to add an agent.") : !(row && row.pulled) ? "Pull it under Settings → Software first." : null;
             const add = h("button", { disabled: !!why, title: why, onclick: async () => {
                 add.disabled = true;
                 const r = await api("POST", projectPath(name, "/agents"), { agent });
@@ -4407,7 +4489,7 @@ function agentsSection(name, p, box) {
                 refreshProjects();
             } }, "Apply");
             parts.push(controls.node, h("div", { class: "row-btns" }, apply,
-                running ? null : h("span", { class: "note" }, "Start the project to change Claude's model and effort.")));
+                running ? null : h("span", { class: "note" }, notNow("Start the project to change Claude's model and effort."))));
         }
         // pi's model and thinking level, while the project runs.
         if (agents.includes("pi")) {
@@ -4425,14 +4507,14 @@ function agentsSection(name, p, box) {
                 refreshProjects();
             } }, "Apply");
             parts.push(pc.node, h("div", { class: "row-btns" }, apply,
-                running ? null : h("span", { class: "note" }, "Start the project to change pi's model and thinking level.")));
+                running ? null : h("span", { class: "note" }, notNow("Start the project to change pi's model and thinking level."))));
         }
         // Update: the pulled versions into the running project (RS's mgmtAgentsUpdateDialog).
         if (agents.length) {
-            const upd = h("button", { disabled: !running, title: running ? "Deploy the pulled agent versions into this project" : "Start the project to update its agents",
+            const upd = h("button", { disabled: !running, title: running ? "Deploy the pulled agent versions into this project" : notNow("Start the project to update its agents."),
                                       onclick: () => agentsUpdateDialog(name, agents, rows) }, "Update");
             parts.push(h("div", { class: "row-btns update-row" }, upd,
-                h("span", { class: "note" }, running ? "deploys the pulled versions, live" : "Start the project to update its agents.")));
+                h("span", { class: "note" }, running ? "deploys the pulled versions, live" : notNow("Start the project to update its agents."))));
         }
         body.replaceChildren(...parts);
     })();

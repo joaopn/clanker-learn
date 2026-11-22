@@ -1277,6 +1277,17 @@ def first_pull(software, say=say_nothing, build=True):
         return build_dist(software, pin(software), say)
 
 
+def made_sandbox_image(spec):
+    """The sandbox image's tag for a check of upstream, which runs in a throwaway container of
+    it; never made here: a check is answered in the request, and making the image takes minutes
+    (the keeper makes it at the first start anyway)."""
+    tag = image_tag()
+    if not there_is("image", tag):
+        raise CoreError(f"{sentence_start(spec['label'])} cannot be checked yet: the sandbox image is still being made, "
+                        "which takes a few minutes on a new installation. Try again when it is ready.")
+    return tag
+
+
 def upstream_version(software):
     """The newest version upstream, asked from a throwaway container on the build network, as
     RS does (or read from the preload folder, the tests' way in). Checked as a version."""
@@ -1284,7 +1295,7 @@ def upstream_version(software):
     if os.path.isfile(p["upstream"]):
         answer = read_bounded(p["upstream"], 256).strip()
     else:
-        image = ensure_image(kind="sandbox")
+        image = made_sandbox_image(spec)
         if not there_is("network", BUILD_NET):
             docker("network", "create", BUILD_NET)
         how = {"claude": ["--max-filesize", "1024", spec["upstream"]],
@@ -1320,7 +1331,7 @@ def upstream_ext_version(software):
     if os.path.isfile(p["ext_upstream"]):
         answer = read_bounded(p["ext_upstream"], 256).strip()
     else:
-        image = ensure_image(kind="sandbox")
+        image = made_sandbox_image(spec)
         if not there_is("network", BUILD_NET):
             docker("network", "create", BUILD_NET)
         try:
@@ -2073,14 +2084,25 @@ def has_dist_mount(container):
     return any(mount.get("Destination") == DIST_MOUNT for mount in container.get("Mounts") or [])
 
 
-def deployable_sandbox(name):
+def deployable_sandbox(name, stopped="Start the project to update its agents"):
     container = inspect_container(paths(name)["container"])
     if container is None or not container["State"].get("Running"):
-        raise CoreError("Start the project to update its agents")
+        raise CoreError(stopped)
     if not has_dist_mount(container):
         raise CoreError(f"The sandbox of {name} was made before projects had agents: recreate the project first "
                         "(its workspace and home folder are kept).")
     return container
+
+
+# What the deploy script of an older sandbox image says when it is asked for something it does
+# not know (an agent added since, a mode): its usage refusals, exit 2. A sandbox whose image has
+# no deploy script at all fails with timeout's 126 or 127.
+OLDER_DEPLOY = re.compile(r"there is no agent named|the mode is start|usage: deploy")
+
+
+def older_sandbox(name):
+    return CoreError(f"The sandbox of {name} was made before this was possible: recreate the project first "
+                     "(its workspace and home folder are kept).")
 
 
 def tail_of(command, limit, timeout):
@@ -2109,17 +2131,18 @@ def deploy_agents(name, agents):
     """Deploy each of `agents` into the running sandbox of `name`, in the deploy script's update
     mode: the program is overwritten (and its editor extension forced into the project's
     editor, where it has one), settings and logins are left alone. Refused while one of
-    them is being built, or is not pulled. Returns {agent: version deployed}."""
-    p, deployed = paths(name), {}
+    them is being built, or is not pulled. Returns {agent: version deployed} and {agent: the
+    deploy script's last line} (for Claude Code: whether its editor extension was forced)."""
+    p, deployed, said = paths(name), {}, {}
     for agent in agents:
         spec = known_software(known_agent(agent))
         if building_now() == agent:
             raise CoreError(f"{spec['label']} is being built now; try again when that is done.")
         refuse_unpulled([agent], False)
         version = pulled(agent)["version"]
-        run_deploy(p["container"], "update", agent, f"{spec['label']} could not be deployed into {name}")
+        said[agent] = run_deploy(p["container"], "update", agent, f"{spec['label']} could not be deployed into {name}")
         deployed[agent] = version
-    return deployed
+    return deployed, said
 
 
 def run_deploy(container, mode, agent, failed):
@@ -2134,6 +2157,8 @@ def run_deploy(container, mode, agent, failed):
     except OSError as exc:
         raise CoreError("The inner Docker daemon did not answer `docker exec`.") from exc
     last = "".join(c if c.isprintable() else "?" for c in (said.strip().splitlines() or [""])[-1])[-300:]
+    if code in (126, 127) or (code == 2 and OLDER_DEPLOY.search(said)):
+        raise older_sandbox(container.removeprefix("cl-sb-"))
     if code != 0:
         raise CoreError(f"{failed}: " + ("it took too long" if code in (None, 124) else last or f"exit {code}"))
     return last
@@ -2147,13 +2172,13 @@ def agents_add(name, agent="claude"):
     known_agent(agent)
     with locked(name):
         record = not_being_destroyed(read_record(name))
-        deployable_sandbox(name)
-        deployed = deploy_agents(name, [agent])
+        deployable_sandbox(name, "Start the project to add an agent to it: an agent is added to a running project.")
+        deployed, said = deploy_agents(name, [agent])
         if agent not in record["agents"]:
             record["agents"] = [*record["agents"], agent]
             write_record(record)
             write_provisioning(record)
-        return {"project": name, "agents": record["agents"], "deployed": deployed}
+        return {"project": name, "agents": record["agents"], "deployed": deployed, "said": said}
 
 
 def agents_update(name):
@@ -2167,7 +2192,8 @@ def agents_update(name):
         deployable_sandbox(name)
         if not record["agents"]:
             raise CoreError(f"Project {name} has no agents to update.")
-        return {"project": name, "agents": record["agents"], "deployed": deploy_agents(name, record["agents"])}
+        deployed, said = deploy_agents(name, record["agents"])
+        return {"project": name, "agents": record["agents"], "deployed": deployed, "said": said}
 
 
 def agents_model(name, model=None, effort=None, pi_model=None, pi_thinking=None):
@@ -2749,6 +2775,60 @@ def human_size(size):
     return ""
 
 
+def tree_size(path, leave_out=()):
+    """The bytes of the regular files at and under `path`, links not followed: what an archive
+    of it holds before compression. Something that vanishes meanwhile counts nothing."""
+    try:
+        mode = os.lstat(path).st_mode
+    except OSError:
+        return 0
+    if stat.S_ISREG(mode):
+        return os.lstat(path).st_size
+    total, folders = 0, [path] if stat.S_ISDIR(mode) else []
+    while folders:
+        try:
+            with os.scandir(folders.pop()) as entries:
+                for entry in entries:
+                    if entry.path in leave_out:
+                        continue
+                    with contextlib.suppress(OSError):
+                        if entry.is_dir(follow_symlinks=False):
+                            folders.append(entry.path)
+                        elif entry.is_file(follow_symlinks=False):
+                            total += entry.stat(follow_symlinks=False).st_size
+        except OSError:
+            continue
+    return total
+
+
+def backup_need():
+    """What a backup needs on the data volume, at most: the files it holds, uncompressed (as
+    research-sandbox measures the room for a copy), and the copy of the tutor's database made
+    beside the archive while it is written."""
+    need = sum(tree_size(f"{DATA}/{top}", {WEB_DOWNLOADS}) for top in BACKUP_TOPS)
+    with contextlib.suppress(OSError):
+        need += os.path.getsize(TUTOR_DB)
+    return need
+
+
+def free_space():
+    return shutil.disk_usage(DATA).free
+
+
+def unpacked_size(path):
+    """The bytes an archive's files take once unpacked, from its members' headers (the whole
+    archive is read through: a compressed one cannot be skipped)."""
+    total = 0
+    try:
+        with tarfile.open(path, "r:*") as tar:
+            for member in tar:
+                if member.isreg():
+                    total += member.size
+    except (OSError, EOFError, tarfile.TarError) as exc:
+        raise CoreError(f"{os.path.basename(path)} could not be read through ({exc}); nothing was changed.") from exc
+    return total
+
+
 def tutor_db_version_supported():
     """The newest version of the tutor's database the tutor service of this image opens: read
     from its code, which is in this image as the build context of its image (an older file it
@@ -2895,7 +2975,12 @@ def backup(say=say_nothing):
 def write_backup(say=say_nothing, kind="backup"):
     """The backup itself, with the backup lane in hand. Each project is copied under its lock
     (waited for: a create, a destroy or a start is not cut through); its sandbox may run and
-    write meanwhile, which the result says."""
+    write meanwhile, which the result says. Refused, before anything is written, when the data
+    volume has not the room it may need."""
+    need, free = backup_need(), free_space()
+    if free < need:
+        raise CoreError(f"There is not enough room for a backup: {human_size(free)} is free on the data volume, and a backup needs up to "
+                        f"{human_size(need)} (what it holds, before compression). Make room first; nothing was written.")
     os.makedirs(BACKUPS, mode=0o700, exist_ok=True)
     for left in os.listdir(BACKUPS):   # what a backup that was killed left
         if left.startswith(".cl-backup-"):
@@ -3145,6 +3230,12 @@ def restore(source, say=say_nothing):
         if answers:
             raise CoreError(f"The tutor is writing {len(answers)} answer(s) now; restore when they are done. Nothing was changed.")
         notes = [] if answers is not None else [f"Whether an answer was being written could not be asked ({why_not}); with every project stopped none can be."]
+        say("checking there is room for the archive unpacked and for a backup of what is there")
+        unpacked, safety_need, free = unpacked_size(path), backup_need(), free_space()
+        if free < unpacked + safety_need:
+            raise CoreError(f"There is not enough room for the restore: {human_size(free)} is free on the data volume, and it needs about "
+                            f"{human_size(unpacked + safety_need)}: {human_size(unpacked)} for {os.path.basename(path)} unpacked, and up to "
+                            f"{human_size(safety_need)} for the backup of what is there now, made first. Make room first; nothing was changed.")
         say("keeping what is there as a backup first")
         BACKUP_HELD = True
         try:

@@ -1757,6 +1757,7 @@ def dists(monkeypatch, tmp_path):
     builds = Builds()
     monkeypatch.setattr(core, "docker", builds)
     monkeypatch.setattr(core, "ensure_image", lambda say=core.say_nothing, kind="sandbox": "cl-sandbox:abc")
+    monkeypatch.setattr(core, "made_sandbox_image", lambda spec: "cl-sandbox:abc")
     return builds
 
 

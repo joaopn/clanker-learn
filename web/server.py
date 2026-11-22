@@ -9,7 +9,8 @@ broker, which authenticates; the broker's session token stays here, server-side,
 cookie scoped to /broker), the first password (a set-up code from the container's log), the
 project list and status, the project actions (its agents among them), Settings -> Software
 (the builds of the agents and the editor, followed as operations) and the model catalog,
-Settings -> Backup (make one, list them, remove one, download one), the progress of an
+Settings -> Backup (make one, list them, remove one, download one with the password typed
+again), the progress of an
 operation, a project's
 terminal (a WebSocket relayed to the sandbox's sshd, where it runs tmux), a project's session
 cookie (which its web-app tabs are opened with), a project's tabs (the files server, the web
@@ -717,22 +718,57 @@ def _open_download(path: Path):
     return fh
 
 
-async def broker_backup_download_handler(request: web.Request) -> web.StreamResponse:
-    """GET /broker/backups/{backup}/download — the archive, as a file to save (gated; a read,
-    so not origin-checked: the SameSite=Strict cookie is its CSRF defense, and what it starts
-    is an audited link). The broker's backup_fetch makes the one file readable here."""
+# The one-time links handed out after the password was checked again: link -> (the login
+# that asked, when it lapses). A link serves one download, to that login only; the broker
+# clears a link file nobody took after core.DOWNLOAD_LINK_S.
+DOWNLOAD_LINK_S = 600
+_DOWNLOADS: dict[str, tuple[str, float]] = {}
+
+
+async def broker_backup_download_handler(request: web.Request) -> web.Response:
+    """POST /broker/backups/{backup}/download {proof} — ask for a backup's download (gated,
+    origin-checked, step-up: an archive holds the password's hash, the Claude token and every
+    project's keys, so the password is typed again, as for removing one). The broker checks
+    the proof and links the one file here; the answer is {ok, url}: a one-time address of this
+    login's, which the page then opens as a plain download (the page's content-security
+    policy has form-action 'none', and an archive of gigabytes is never held in the page)."""
+    if not origin_ok(request):
+        return web.Response(status=403, text="origin rejected")
     name = request.match_info.get("backup", "")
-    if _broker_session(request) is None:
-        return _unauthorized()
+    body = await _json_body(request)
+    if body is None or _broker_session(request) is None:
+        return _bad_request() if _broker_session(request) else _unauthorized()
     if not _BACKUP_NAME_RE.fullmatch(name):
         return _bad_request()
-    status, reply = await _relay(request, "backup_fetch", {"backup": name})
+    args = {"backup": name}
+    if isinstance(body.get("proof"), str):
+        args["proof"] = body["proof"]
+    status, reply = await _relay(request, "backup_fetch", args)
     if status != 200 or not reply.get("ok"):
-        return web.json_response(reply, status=status if status != 200 else 404)
+        return web.json_response(reply, status=status)
     link = str(reply.get("result", {}).get("file", ""))
     found = _DOWNLOAD_LINK_RE.fullmatch(link)
     if not found or found.group(1) != name:
         return web.json_response({"ok": False, "error": {"kind": "failed", "message": "the broker named no file to send"}}, status=500)
+    now = time.time()
+    for old in [k for k, (_, until) in _DOWNLOADS.items() if until < now]:
+        _DOWNLOADS.pop(old, None)
+    _DOWNLOADS[link] = (request.cookies.get(BROKER_COOKIE, ""), now + DOWNLOAD_LINK_S)
+    return web.json_response({"ok": True, "url": f"/broker/backups/file/{link}", "size": reply["result"].get("size")})
+
+
+async def broker_backup_file_handler(request: web.Request) -> web.StreamResponse:
+    """GET /broker/backups/file/{link} — the archive, as a file to save (gated): the one-time
+    address the POST above gave this login. Its file is opened and its link removed at once,
+    so a second request finds nothing."""
+    link = request.match_info.get("link", "")
+    if _broker_session(request) is None:
+        return _unauthorized()
+    found = _DOWNLOAD_LINK_RE.fullmatch(link)
+    given = _DOWNLOADS.pop(link, None) if found else None
+    if given is None or given[1] < time.time() or not secrets.compare_digest(given[0], request.cookies.get(BROKER_COOKIE, "")):
+        return web.json_response({"ok": False, "error": {"kind": "not_found", "message": "That download link is used or lapsed: ask for the download again."}},
+                                 status=404)
     try:
         fh = await asyncio.to_thread(_open_download, DOWNLOADS_DIR / link)
     except OSError as e:
@@ -740,7 +776,7 @@ async def broker_backup_download_handler(request: web.Request) -> web.StreamResp
     try:
         response = web.StreamResponse(headers={
             "Content-Type": "application/gzip", "Content-Length": str(os.fstat(fh.fileno()).st_size),
-            "Content-Disposition": f'attachment; filename="{name}"', "Cache-Control": "no-store"})
+            "Content-Disposition": f'attachment; filename="{found.group(1)}"', "Cache-Control": "no-store"})
         await response.prepare(request)
         while chunk := await asyncio.to_thread(fh.read, DOWNLOAD_CHUNK):
             await response.write(chunk)
@@ -2161,7 +2197,8 @@ def build_app() -> web.Application:
     app.router.add_post("/broker/backups", broker_backup_make_handler)
     app.router.add_get("/broker/backups/active", broker_backup_active_handler)
     app.router.add_post("/broker/backups/remove", broker_backup_remove_handler)
-    app.router.add_get("/broker/backups/{backup}/download", broker_backup_download_handler)
+    app.router.add_post("/broker/backups/{backup}/download", broker_backup_download_handler)
+    app.router.add_get("/broker/backups/file/{link}", broker_backup_file_handler)
     app.router.add_post("/broker/project", broker_create_handler)
     app.router.add_get("/broker/project/{name}", broker_project_status_handler)
     app.router.add_get("/broker/project/{name}/terminal", ws_handler)

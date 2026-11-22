@@ -173,14 +173,14 @@ A raised version is kept in `/data/versions.local.env`, over the repository's fi
 
 ## Backing up and restoring
 
-A backup is one archive of everything clanker-learn keeps. Make one in the page, in Settings, Backup: **Make a backup** shows its log while it runs, and each backup is listed with its size, when it was made and its projects, with **Download** and **Remove** (which asks for your password again). Or from the machine:
+A backup is one archive of everything clanker-learn keeps. Make one in the page, in Settings, Backup: **Make a backup** shows its log while it runs, and each backup is listed with its size, when it was made and its projects, with **Download** and **Remove** (both ask for your password again). Or from the machine:
 
 ```
 docker exec clanker-learn cl backup
 docker exec clanker-learn cl backups
 ```
 
-`cl backup` writes `/data/backups/cl-backup-<date>T<time>Z.tar.gz` and says its size and how long it took. `cl backups` lists them, newest first. Most of a backup is the copies of Claude Code and the editor in each project's home folder: on a test machine, two new projects made a backup of 1.1 GB in under half a minute. A backup can be made while projects run, but files being written at that moment may be torn: the command, and the backup's row in Settings, say which projects were running. Stop them first for a clean copy.
+`cl backup` writes `/data/backups/cl-backup-<date>T<time>Z.tar.gz` and says its size and how long it took. `cl backups` lists them, newest first. Most of a backup is the copies of Claude Code and the editor in each project's home folder: on a test machine, two new projects made a backup of 1.1 GB in under half a minute. A backup can be made while projects run, but files being written at that moment may be torn: the command, and the backup's row in Settings, say which projects were running. Stop them first for a clean copy. A backup needs room on the data volume: up to the size of what it holds, before compression. Without that much free it is refused, saying how much is free and how much it needs, before anything is written.
 
 What is inside: every project's workspace, home folder, record, keys and ports; the tutor's database (copied so that a running tutor does not tear it), the Claude token and the tutor's keys; the password's hash; the page's certificate; the versions you raised.
 
@@ -188,7 +188,7 @@ What is not inside: the fetched Claude Code, pi and editor (a new installation f
 
 **Keep a backup as you would keep the keys to everything.** It holds the password's hash, the Claude token if you set one, each project's Claude Code and pi logins, and the keys into every sandbox. It is not encrypted.
 
-To keep one off the machine, press **Download** beside it in Settings, Backup, or copy it out:
+To keep one off the machine, press **Download** beside it in Settings, Backup, and type your password again, or copy it out:
 
 ```
 docker cp clanker-learn:/data/backups/cl-backup-<date>T<time>Z.tar.gz .
@@ -206,7 +206,7 @@ To restore one, stop every project first (in the page, or with `cl stop <name>`)
 docker exec clanker-learn cl restore cl-backup-<date>T<time>Z.tar.gz
 ```
 
-A restore **replaces everything** clanker-learn keeps with what the backup holds: projects made since the backup are gone, and the password is the backup's. Before it changes anything it makes a backup of what is there, named in its answer, so a restore can be undone by restoring that one. It refuses while a project runs, while the tutor is writing an answer, and while a backup, a fetch of the software or an operation on a project is under way. It refuses a backup made by a newer clanker-learn. Afterwards, log in again with the backup's password and start your projects: each one's container is made again, and its setup recipe runs once.
+A restore **replaces everything** clanker-learn keeps with what the backup holds: projects made since the backup are gone, and the password is the backup's. Before it changes anything it makes a backup of what is there, named in its answer, so a restore can be undone by restoring that one. It refuses while a project runs, while the tutor is writing an answer, and while a backup, a fetch of the software or an operation on a project is under way. It refuses a backup made by a newer clanker-learn. It needs room on the data volume for the archive unpacked and for the backup of what is there, and without it refuses, saying how much is free and how much it needs, before anything is changed (it reads the archive through once to know its unpacked size). Afterwards, log in again with the backup's password and start your projects: each one's container is made again, and its setup recipe runs once.
 
 To restore onto a new installation, start it and wait for its first start to finish, then copy the backup in and restore it:
 
@@ -230,7 +230,7 @@ docker rm clanker-learn
 
 and run the same `docker run` command as before. Your projects, conversations, password and settings are on the volumes and stay.
 
-At the first start after an update, the images of the web server, the tutor service and the sandboxes are built again if their definition changed, and the web server's and the tutor service's containers are made again. The tutor's database is brought up to date by the tutor service. The fetched Claude Code, pi and editor stay; if the new version of the repository names newer versions, Settings, Software, says so, and Pull fetches them. Existing projects keep their containers until you recreate them: Recreate gives a project a container from the new sandbox image, keeps its workspace and home folder, and runs its setup recipe.
+At the first start after an update, the images of the web server, the tutor service and the sandboxes are built again if their definition changed, and the web server's and the tutor service's containers are made again. The tutor's database is brought up to date by the tutor service. The fetched Claude Code, pi and editor stay; if the new version of the repository names newer versions, Settings, Software, says so, and Pull fetches them. Existing projects keep their containers until you recreate them: Recreate gives a project a container from the new sandbox image, keeps its workspace and home folder, and runs its setup recipe. Something a newer sandbox image makes possible (pi, for a project made before it) is refused in a project made before it, with the sentence that the project must be recreated first.
 
 ## Stopping and uninstalling
 
