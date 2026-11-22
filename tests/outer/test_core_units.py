@@ -792,8 +792,10 @@ def test_the_web_servers_container_is_created_fenced_and_with_its_two_mounts(mon
         "-p", "7788:7788", "-p", "11100-11164:11100-11164", "-p", "11200-11299:11200-11299",
         "--mount", "type=bind,source=/run/cl/broker,target=/run/cl-broker,readonly",
         "--mount", "type=bind,source=/data/web,target=/data",
+        "--mount", "type=bind,source=/data/core/tutor_secret,target=/run/cl-secret/tutor,readonly",
         "-e", "CL_WEB_PORT=7788", "-e", "CL_LISTEN_SUBNET=10.209.0.0/24",
         "-e", "CL_ORIGIN_PORTS=11100-11164", "-e", "CL_PASSTHROUGH_PORTS=11200-11299",
+        "-e", "CL_TUTOR_URL=http://cl-tutor:7801",
     ]
     assert args[-3] == "--label" and args[-2].startswith("cl.made-from=") and len(args[-2]) == len("cl.made-from=") + 16
     assert args[-1] == "cl-web:abc"
@@ -816,7 +818,8 @@ def test_the_image_tag_names_the_repository_asked_for(tmp_path):
 
 def test_the_two_images_are_made_from_their_own_folders():
     assert core.IMAGES == {"sandbox": ("/opt/cl/sandbox", "cl-sandbox", "the sandbox image"),
-                           "web": ("/opt/cl/web", "cl-web", "the web server's image")}
+                           "web": ("/opt/cl/web", "cl-web", "the web server's image"),
+                           "tutor": ("/opt/cl/tutor", "cl-tutor", "the tutor service's image")}
 
 
 # --- a stand-in for the inner daemon --------------------------------------------------------
@@ -1285,6 +1288,7 @@ def keep_web_with(monkeypatch, healths, ups=(), sandbox_image=None, env=None, tu
     monkeypatch.setattr(core, "web_up", web_up)
     monkeypatch.setattr(core, "ensure_image", ensure_image)
     monkeypatch.setattr(core, "keep_software", lambda report, image_ready: software.append(image_ready))
+    monkeypatch.setattr(core, "keep_tutor", lambda kept, report, now: None)
     code = core.keep_web(env or {}, 8080, lambda key, value: reports.append((key, value)), sleep=sleep,
                          turns=len(healths) if turns is None else turns, now=lambda: clock[0])
     return code, reports, sleeps, called, images

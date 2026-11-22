@@ -28,9 +28,10 @@ input; it is kept nowhere else.
 
 The web server's keeper (`core.py web-keep`) is started then too, in a group of its own. It
 brings the web server's container up (or removes it, with CL_WEB=off) and keeps it up, and
-says how it stands, a line of JSON at a time, which the init puts in the state ("web",
-"sandbox_image", then "agents" and "editor": the distributions of Claude Code and of the
-editor, pulled once when they are not there). A wrong web setting is "web: down" with its reason, never a refusal. At a
+says how it stands, a line of JSON at a time, which the init puts in the state ("web", then
+"tutor": the tutor service's container, kept the same way, "sandbox_image", then "agents" and
+"editor": the distributions of Claude Code and of the editor, pulled once when they are not
+there). A wrong web setting is "web: down" with its reason, never a refusal. At a
 stop every broker group and the keeper's are ended, operations included, before the inner
 containers are stopped.
 
@@ -80,7 +81,7 @@ BROKER_HURRY_S = 30
 SETUP_CODE_ALPHABET = "abcdefghijklmnopqrstuvwxyz0123456789"
 SETUP_CODE_LENGTH = 20
 KEEPER_RESTART_S = 5
-KEEPER_KEYS = ("web", "sandbox_image", "agents", "editor")
+KEEPER_KEYS = ("web", "tutor", "sandbox_image", "agents", "editor")
 KEEPER_LINE_MAX = 4096       # a longer line from the keeper is not one of its reports
 KEEPER_VALUE_MAX = 600
 SELFTEST_ROOT = "/opt/cl/selftest"
@@ -883,7 +884,7 @@ def main():
                 keeper.close()
             keepers.clear()  # ended by refuse(); its group number may be someone else's by the stop
             with state_lock:
-                for key in ("sandboxes", "broker", "web", "sandbox_image", "agents", "editor"):
+                for key in ("sandboxes", "broker", "web", "tutor", "sandbox_image", "agents", "editor"):
                     state.pop(key, None)  # nothing is starting, started or kept any more
             refuse(str(exc) if isinstance(exc, Refused) else unforeseen(exc))
     if mine:

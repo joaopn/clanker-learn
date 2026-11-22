@@ -20,6 +20,9 @@ creation was cut short is finished by its next start.
                                       and the Shell password (provisioning gets its hash)
     /data/core/ports/<name>.json      the project's ports named by hand
     /data/tutor/keys/<name>           the key the tutor logs in with, and known_hosts
+    /data/tutor                       the tutor service's own (its database, the Claude token),
+                                      mounted into cl-tutor
+    /data/core/tutor_secret           the secret the web server and the tutor service share
     cl-sb-<name>, cl-net-<name>       the container and its network
 
 The software projects get (Claude Code, the editor) is fetched once into a distribution:
@@ -93,7 +96,10 @@ SANDBOX_DIR = "/opt/cl/sandbox"
 IMAGE_REPO = "cl-sandbox"
 WEB_DIR = "/opt/cl/web"
 WEB_REPO = "cl-web"
-IMAGES = {"sandbox": (SANDBOX_DIR, IMAGE_REPO, "the sandbox image"), "web": (WEB_DIR, WEB_REPO, "the web server's image")}
+TUTOR_DIR = "/opt/cl/tutor"
+TUTOR_REPO = "cl-tutor"
+IMAGES = {"sandbox": (SANDBOX_DIR, IMAGE_REPO, "the sandbox image"), "web": (WEB_DIR, WEB_REPO, "the web server's image"),
+          "tutor": (TUTOR_DIR, TUTOR_REPO, "the tutor service's image")}
 PRELOAD = "/opt/cl/preload"   # <repository>.tar here is loaded where it holds the image wanted; else the image is built
 BUILD_NET = "cl-build"
 VERSIONS_FILE = "/opt/cl/versions.env"   # the repository's pins; /data/versions.local.env overrides them per key
@@ -107,6 +113,11 @@ BROKER_RUN = "/run/cl/broker"
 WEB_PIDS = 512
 WEB_RESTART_S = 5
 WEB_SILENT_S = 30
+TUTOR_CONTAINER = "cl-tutor"
+TUTOR_PORT = 7801
+TUTOR_PIDS = 512
+TUTOR_ANSWER_S = 15   # after a start, how long the keeper waits for its first answer before going on
+TUTOR_SECRET_MOUNT = "/run/cl-secret/tutor"   # in cl-tutor and cl-web: the secret the two share
 WEB_DEFAULTS = {"CL_WEB_PORT": "7788", "CL_ORIGIN_PORTS": "11100-11164", "CL_PASSTHROUGH_PORTS": "11200-11299"}
 BUILD_TIMEOUT_S = 3600
 SANDBOX_UID = 1000
@@ -1375,9 +1386,11 @@ def ensure(record, say=say_nothing):
     os.makedirs(f"{DATA}/dist/agents", mode=0o755, exist_ok=True)
     if not there_is("network", p["network"]):
         docker("network", "create", "--label", f"cl.project={name}", p["network"])
-    # The network first, then the web server onto it: web_up, the other way round, makes its
-    # container first and then lists the networks, so one of the two always connects them.
+    # The network first, then the web server and the tutor service onto it: web_up and
+    # tutor_up, the other way round, make their container first and then list the networks, so
+    # one of the two always connects them.
     connect_web(p["network"], say)
+    connect_web(p["network"], say, TUTOR_CONTAINER, "the tutor service")
     if not there_is("container", p["container"]):
         docker("create", *container_args(record, ensure_image(say)))
 
@@ -2031,8 +2044,8 @@ def web_args(settings, image):
     """What `docker create` is given for the web server's container: no capability and no
     way to gain one, the front network pinned as the one its published ports live on (the
     page's, and the two ranges: web apps' origin ports and raw TCP's pass-through ports), the
-    broker's socket folder read-only, its own folder of the data volume, and nothing of a
-    project. The label is a hash of all of it: a container made from another image or with
+    broker's socket folder read-only, its own folder of the data volume, the secret it shares
+    with the tutor service read-only, and nothing of a project. The label is a hash of all of it: a container made from another image or with
     other settings is told by it and made again."""
     port = settings["port"]
     origin, passthrough = ("{}-{}".format(*settings[key]) for key in ("origin", "passthrough"))
@@ -2044,8 +2057,10 @@ def web_args(settings, image):
         "-p", f"{port}:{port}", "-p", f"{origin}:{origin}", "-p", f"{passthrough}:{passthrough}",
         "--mount", f"type=bind,source={BROKER_RUN},target=/run/cl-broker,readonly",
         "--mount", f"type=bind,source={DATA}/web,target=/data",
+        "--mount", f"type=bind,source={tutor_secret_path()},target={TUTOR_SECRET_MOUNT},readonly",
         "-e", f"CL_WEB_PORT={port}", "-e", f"CL_LISTEN_SUBNET={FRONT_SUBNET}",
         "-e", f"CL_ORIGIN_PORTS={origin}", "-e", f"CL_PASSTHROUGH_PORTS={passthrough}",
+        "-e", f"CL_TUTOR_URL=http://{TUTOR_CONTAINER}:{TUTOR_PORT}",
     ]
     made_from = hashlib.sha256(json.dumps([args, image]).encode()).hexdigest()[:16]
     return [*args, "--label", f"cl.made-from={made_from}", image]
@@ -2081,17 +2096,17 @@ def read_routes():
     return listed.stdout
 
 
-def connect_web(network, say=say_nothing):
-    """Put the web server on a project's network, if there is a web server. Not being able to
-    is a line in the log, never a failed start of a project."""
+def connect_web(network, say=say_nothing, container=WEB_CONTAINER, called="the web server"):
+    """Put the web server (or the tutor service) on a project's network, if it is there. Not
+    being able to is a line in the log, never a failed start of a project."""
     try:
-        if not there_is("container", WEB_CONTAINER):
+        if not there_is("container", container):
             return
-        done = docker("network", "connect", network, WEB_CONTAINER, check=False)
+        done = docker("network", "connect", network, container, check=False)
         if done.returncode != 0 and "already exists" not in done.stderr:
-            say(f"the web server could not be connected to {network}: {done.stderr.strip()[-200:]}")
+            say(f"{called} could not be connected to {network}: {done.stderr.strip()[-200:]}")
     except CoreError as exc:
-        say(f"the web server could not be connected to {network}: {exc}")
+        say(f"{called} could not be connected to {network}: {exc}")
 
 
 def web_up(settings, say=say_nothing):
@@ -2108,6 +2123,7 @@ def web_up(settings, say=say_nothing):
     if front is None:
         docker("network", "create", "--subnet", FRONT_SUBNET, "--label", "cl.role=front", FRONT_NET)
     os.makedirs(f"{DATA}/web", mode=0o700, exist_ok=True)
+    tutor_secret()   # mounted into the container: there before it is made
     args = web_args(settings, image)
     existing = inspect_container(WEB_CONTAINER)
     if existing is not None and existing["Config"]["Labels"].get("cl.made-from") != args[-2].partition("=")[2]:
@@ -2154,10 +2170,145 @@ def web_health(settings, timeout=3):
         return "silent", f"the web server does not answer yet ({getattr(exc, 'reason', exc)})"
 
 
+# --- the tutor service's container ----------------------------------------------------------
+
+def tutor_secret_path():
+    return f"{DATA}/core/tutor_secret"
+
+
+def tutor_secret():
+    """The secret the web server and the tutor service share: 64 hex characters, made once,
+    mode 0600, mounted read-only into both containers. Returns its path."""
+    path = tutor_secret_path()
+    with contextlib.suppress(FileNotFoundError):
+        if re.fullmatch(r"[0-9a-f]{64}", read_text(path).strip()):
+            return path
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    write_file(path, secrets.token_hex(32), 0o600)
+    return path
+
+
+def tutor_args(image):
+    """What `docker create` is given for the tutor service's container: no capability and no
+    way to gain one, the front network without any published port (the web server reaches it
+    there; it listens on that address only), its folder of the data volume (its database, the
+    Claude token, the projects' keys for the tutor), the shared secret read-only. It is put on
+    every project's network to reach the sandboxes' sshd by name. Labelled with a hash of all
+    of it, as the web server's container is."""
+    args = [
+        "--name", TUTOR_CONTAINER, "--hostname", TUTOR_CONTAINER, "--network", f"name={FRONT_NET},gw-priority=1",
+        "--label", "cl.role=tutor",
+        "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--pids-limit", str(TUTOR_PIDS),
+        "--log-opt", "max-size=10m", "--log-opt", "max-file=3",
+        "--mount", f"type=bind,source={DATA}/tutor,target=/data/tutor",
+        "--mount", f"type=bind,source={tutor_secret_path()},target={TUTOR_SECRET_MOUNT},readonly",
+        "-e", f"CL_LISTEN_SUBNET={FRONT_SUBNET}", "-e", f"CL_TUTOR_PORT={TUTOR_PORT}",
+    ]
+    made_from = hashlib.sha256(json.dumps([args, image]).encode()).hexdigest()[:16]
+    return [*args, "--label", f"cl.made-from={made_from}", image]
+
+
+def tutor_up(say=say_nothing):
+    """The tutor service's container, made if it is missing or was made from another image or
+    other settings, connected to every project's network, and started. The front network is
+    the web server's, made by web_up before this runs."""
+    image = ensure_image(say, "tutor")
+    if not there_is("network", FRONT_NET):
+        raise CoreError(f"The front network {FRONT_NET} is not there yet; the web server makes it.")
+    os.makedirs(f"{DATA}/tutor", mode=0o700, exist_ok=True)
+    tutor_secret()
+    args = tutor_args(image)
+    existing = inspect_container(TUTOR_CONTAINER)
+    if existing is not None and existing["Config"]["Labels"].get("cl.made-from") != args[-2].partition("=")[2]:
+        say("the tutor service's container was made from another image or other settings; making it again")
+        docker("rm", "-f", "-v", TUTOR_CONTAINER, timeout=STOP_GRACE_S + 120)
+        existing = None
+    if existing is None:
+        docker("create", *args)
+    for name in recorded_names():
+        network = paths(name)["network"]
+        if there_is("network", network):
+            connect_web(network, say, TUTOR_CONTAINER, "the tutor service")
+    docker("start", TUTOR_CONTAINER)
+
+
+def tutor_health(timeout=3):
+    """How the tutor service stands, as web_health says it of the web server: "up", "absent",
+    "ended", "silent" or "unknown", with a text. Asked at GET /health on its front address."""
+    try:
+        container = inspect_container(TUTOR_CONTAINER)
+        if container is None:
+            return "absent", "there is no tutor service container"
+        if not container["State"].get("Running"):
+            last = docker("logs", "--tail", "1", TUTOR_CONTAINER, check=False)
+            return "ended", ("the tutor service ended: " + (last.stderr.strip() or last.stdout.strip())[-300:]).rstrip(": ")
+    except CoreError as exc:
+        return "unknown", str(exc)
+    address = (container["NetworkSettings"]["Networks"].get(FRONT_NET) or {}).get("IPAddress", "")
+    if not address:
+        return "silent", f"the tutor service does not answer yet (it has no address on {FRONT_NET})"
+    try:
+        with urllib.request.urlopen(f"http://{address}:{TUTOR_PORT}/health", timeout=timeout) as answer:
+            if answer.status == 200:
+                return "up", ""
+            return "silent", f"the tutor service does not answer yet (it answered {answer.status})"
+    except (OSError, urllib.error.URLError, ValueError) as exc:
+        return "silent", f"the tutor service does not answer yet ({getattr(exc, 'reason', exc)})"
+
+
+def keep_tutor(kept, report, now=time.monotonic):
+    """One turn of keeping the tutor service, as keep_web keeps the web server, saying how it
+    stands through `report("tutor", ...)`: "preparing", "up", "down: <why>". `kept` holds what
+    it knows between turns. An image that cannot be had is down for this run; anything else
+    that fails is tried again at the next turn. The first turn builds its image, once."""
+    def tell(state):
+        if state != kept.get("said"):
+            report("tutor", state)
+            kept["said"] = state
+
+    def progress(message):
+        report("tutor", f"preparing: {message}")
+        kept["said"] = f"preparing: {message}"
+    if kept.get("gave_up"):
+        return
+    first = "said" not in kept
+    if first:
+        tell("preparing")
+    kind, text = tutor_health()
+    if kind != "silent":
+        kept["silent_since"] = None
+    if kind == "up":
+        tell("up")
+    elif kind == "silent":
+        kept["silent_since"] = now() if kept.get("silent_since") is None else kept["silent_since"]
+        if now() - kept["silent_since"] > WEB_SILENT_S:
+            tell(f"down: {text}")
+    else:
+        if not (first and kind in ("absent", "ended")) and not kept.get("up_failed"):
+            tell(f"down: {text}")
+        try:
+            tutor_up(progress)
+            kept["up_failed"] = False
+            # Asked again for a few seconds: the keeper's next turn can be minutes away (it
+            # pulls the agent and the editor first), and "preparing" would stand until then.
+            for _ in range(TUTOR_ANSWER_S):
+                time.sleep(1)
+                if tutor_health()[0] == "up":
+                    tell("up")
+                    break
+        except ImageError as exc:
+            tell(f"down: {exc}")
+            kept["gave_up"] = True
+        except (CoreError, OSError) as exc:
+            tell(f"down: {exc}")
+            kept["up_failed"] = True
+
+
 def keep_web(env, status_port, report, sleep=time.sleep, turns=None, now=time.monotonic):
     """Bring the web server up and keep it up, saying how it stands through `report(key,
-    value)`: "preparing", "up", "off", or "down: <why>". Once it is up, the sandbox image is had
-    ("sandbox_image"), then the agent's and the editor's distributions ("agents", "editor":
+    value)`: "preparing", "up", "off", or "down: <why>". Once it is up, the tutor service is
+    brought up and kept up the same way ("tutor", from then on at every turn: keep_tutor), the
+    sandbox image is had ("sandbox_image"), then the agent's and the editor's distributions ("agents", "editor":
     "pulling", then "ready: <version>" or "failed: <why>"). Returns 0 when it is off, 3 when it
     is down for good this run (a wrong setting, an image that cannot be had: the next start of
     clanker-learn tries again). A web server that is missing, ended, or cannot be asked about is
@@ -2170,8 +2321,9 @@ def keep_web(env, status_port, report, sleep=time.sleep, turns=None, now=time.mo
         return 3
     if not wanted:
         try:
-            if there_is("container", WEB_CONTAINER):  # left by an earlier start with CL_WEB=on
-                docker("rm", "-f", "-v", WEB_CONTAINER, timeout=STOP_GRACE_S + 120)
+            for container in (WEB_CONTAINER, TUTOR_CONTAINER):   # left by an earlier start with CL_WEB=on
+                if there_is("container", container):
+                    docker("rm", "-f", "-v", container, timeout=STOP_GRACE_S + 120)
         except CoreError as exc:
             report("web", f"down: {exc}")
             return 3
@@ -2195,6 +2347,7 @@ def keep_web(env, status_port, report, sleep=time.sleep, turns=None, now=time.mo
         said[0] = f"preparing: {message}"
     tell("preparing")
     first, silent_since, sandbox_image_tried, up_failed = True, None, False, False
+    tutor_kept = None   # what keep_tutor knows, once the web server has been up
     while turns is None or turns > 0:
         turns = None if turns is None else turns - 1
         kind, text = web_health(settings)
@@ -2224,6 +2377,11 @@ def keep_web(env, status_port, report, sleep=time.sleep, turns=None, now=time.mo
                 tell(f"down: {exc}")
                 up_failed = True
         first = False
+        if said[0] == "up" and tutor_kept is None:
+            tutor_kept = {}
+        if tutor_kept is not None:
+            # After the web server, every turn; its image build is the one long wait it adds.
+            keep_tutor(tutor_kept, report, now)
         if said[0] == "up" and not sandbox_image_tried:
             # The page is up first; the sandbox's image is its own line, never "web: down".
             sandbox_image_tried = True

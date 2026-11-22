@@ -1,8 +1,9 @@
-# The outer image is built from the repository's root; only outer/, sandbox/, web/ and versions.env go into it.
+# The outer image is built from the repository's root; only outer/, sandbox/, web/, tutor/ and versions.env go into it.
 *
 !outer/
 !sandbox/
 !web/
+!tutor/
 !versions.env
 **/__pycache__/
 **/*.pyc

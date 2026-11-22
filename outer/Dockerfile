@@ -58,6 +58,9 @@ COPY sandbox/ /opt/cl/sandbox/
 # when the container is first ready.
 COPY web/ /opt/cl/web/
 
+# The definition of the tutor service's image, had the same way once the web server is up.
+COPY tutor/ /opt/cl/tutor/
+
 # `cl`: the core as a command, for someone with a shell in this container.
 RUN printf '#!/bin/sh\nexec python3 /opt/cl/core.py "$@"\n' > /usr/local/bin/cl && chmod 0755 /usr/local/bin/cl
 
