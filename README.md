@@ -2,7 +2,7 @@
 
 A self-hosted tutor: you learn a technical subject by doing it in a real environment, with a tutor that knows what you already know. One container, no tool on the host.
 
-It is being built. What exists so far is the outer container and, inside it, projects with their sandboxes, the broker, the web server, and its page: projects, a terminal, the editor and the web apps of a sandbox in the browser. The tutor, its lessons and the knowledge base are not built yet.
+It is being built. What exists so far is the outer container and, inside it, projects with their sandboxes, the broker, the web server, and its page: projects, a terminal, the editor and the web apps of a sandbox in the browser, and Claude Code in the projects that are given it. The tutor, its lessons and the knowledge base are not built yet.
 
 ## The outer container
 
@@ -43,22 +43,32 @@ docker logs clanker-learn
 
 The code is good until the container stops or a password is set. `docker exec -i clanker-learn cl passwd` sets the password without it (see the broker, below).
 
-The first start takes a few minutes longer: the web server's image is built then, once, and needs the internet. `http://127.0.0.1:8080/state.json` says `web: preparing` meanwhile, then `web: up`; once the page answers, the sandbox image is built too (`sandbox_image`), so that the first project starts sooner.
+The first start takes a few minutes longer: the web server's image is built then, once, and needs the internet. `http://127.0.0.1:8080/state.json` says `web: preparing` meanwhile, then `web: up`; once the page answers, the sandbox image is built too (`sandbox_image`), so that the first project starts sooner, and then Claude Code and the editor are fetched, once (`agents` and `editor`: `pulling`, then `ready: <version>`; about two minutes more). A project cannot be given something that is not fetched yet.
 
 ### The page
 
-After the login the projects are listed down the left side. `+ New project` makes one and shows its progress; the gear beside a project starts, stops and recreates it, changes its limits, and destroys it (which asks for the password again).
+After the login the projects are listed down the left side. `+ New project` makes one and shows its progress. Its box asks what the project gets: under Agents, Claude Code (ticked by default, with the model and the effort it starts on), and the editor (ticked by default). The gear beside a project starts, stops and recreates it, changes its limits, and destroys it (which asks for the password again); its Agents section adds Claude Code to a project that has none, updates it to the fetched version, and changes its model and effort, all while the project runs and without a restart.
 
 A project has these tabs:
 
 - **Shell**: a terminal in the sandbox. It keeps its session when the tab or the browser is closed.
-- **Editor**: the code editor (code-server) on the project's workspace, where its files are browsed and edited.
+- **Editor**, in a project that has the editor: the code editor (code-server) on the project's workspace, where its files are browsed and edited. It starts at the first visit, with Python and Jupyter extensions and, in a project with Claude Code, its panel.
 - **One tab per web app** that listens in the sandbox. It appears a few seconds after the app starts listening, and is marked when the app is gone.
 - **Ports**: name a port by hand, as a web app (a tab, behind your login) or as raw TCP (an address, with **no login in front of it**).
 
 Every web tab, the Editor included, is served on a port of its own from the first range below. Some browsers want the certificate accepted once for each such address: if a tab stays empty, use its "open in a new tab" link, accept the certificate there, and reload the tab.
 
 The password never leaves the browser: the page sends a proof derived from it. The browser's storage holds only which project and tab were last shown.
+
+### Software
+
+The gear at the bottom of the project list opens Settings. Its Software table has a row for Claude Code and one for the editor: what is fetched, the version in effect, and whether the two agree.
+
+- **Pull** fetches that software again at the version in effect, and shows the log while it runs.
+- **Refresh** asks its maker for the newest version first, and offers to raise the version and pull it if there is a newer one. A version is never moved down.
+- **Use repo version** goes back to the version clanker-learn came with (`versions.env`).
+
+Each is fetched by its maker's own installer, in a container that is thrown away afterwards, and kept in the `/data` volume; one is fetched at a time. Running projects keep the versions they have until Update is pressed in their gear's Agents section; new projects get the fetched ones. A newer editor reaches a project at its next start.
 
 ### Settings
 
@@ -74,12 +84,12 @@ The page's port and the two ranges are ports from 1024 to 65535, as `7788` or `1
 
 ## Projects and sandboxes
 
-A project is one sandbox: a container of its own inside clanker-learn, on a network of its own, with a workspace (`/workspace`), a home folder, a user (`learner`) who can become root, an SSH server for the tutor to come in by, the editor (code-server) on port 8443, and a small server that shows the workspace's files on port 7070. A sandbox reaches the internet and nothing private: not clanker-learn's container, not another sandbox, not your network. It has no raw sockets: packet capture does not work in it; `ping` still does.
+A project is one sandbox: a container of its own inside clanker-learn, on a network of its own, with a workspace (`/workspace`), a home folder, a user (`learner`) who can become root, an SSH server for the tutor to come in by, the editor (code-server) on port 8443 if the project has it, and a small server that shows the workspace's files on port 7070. A sandbox reaches the internet and nothing private: not clanker-learn's container, not another sandbox, not your network. It has no raw sockets: packet capture does not work in it; `ping` still does.
 
 Projects are driven from the page, or by a command inside the container:
 
 ```
-docker exec clanker-learn cl create kafka --memory 4g --cpus 2
+docker exec clanker-learn cl create kafka --memory 4g --cpus 2 --agent claude --editor
 docker exec clanker-learn cl list
 docker exec clanker-learn cl stop kafka
 docker exec clanker-learn cl start kafka
@@ -94,6 +104,8 @@ docker exec clanker-learn cl destroy kafka
 - `recreate` gives the project a new container from the current sandbox image. The workspace and the home folder stay; what was installed elsewhere in the old container is gone, and the setup recipe (below) brings it back. A stopped project is running afterwards.
 - `destroy` removes the sandbox, its workspace and its home folder. If it is interrupted, run it again: a project being destroyed is never started.
 - Everything of a project but its container is in the `/data` volume: workspaces under `projects/`, home folders under `homes/`.
+- A project has its own copy of Claude Code and of the editor in its home folder, about 400 MB and 350 MB. You log in to Claude Code once per project, in its Shell (`claude`); it may update itself there. `cl create` gives a project neither unless asked (`--agent claude`, `--claude-model`, `--claude-effort`, `--editor`); `cl agents add|update|model <name>` are the gear's Agents section as commands, and `cl software`, `cl agent pull|refresh`, `cl editor pull|refresh` the Software table's.
+- A project made before projects had agents keeps working as it was. To give it Claude Code: recreate it, then add the agent in its gear.
 
 ### What a sandbox brings back by itself
 
