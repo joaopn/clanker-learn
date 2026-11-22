@@ -5,9 +5,9 @@ clanker-learn runs as one Docker container on a Linux machine. Inside it are a D
 What you need:
 
 - A Linux machine with Docker. Only x86-64 has been run so far; arm64 has not.
-- A Claude subscription, for Claude Code.
+- A Claude subscription, for Claude Code; or, for pi, an account with a provider pi supports, logged in inside each project that uses it.
 - The internet, for the first start and while you work.
-- A few gigabytes of disk: each project has its own copy of Claude Code (about 400 MB) and of the editor (about 350 MB), besides what you install in it.
+- A few gigabytes of disk: each project has its own copy of Claude Code (about 400 MB), of pi if you give it pi (about 270 MB), and of the editor (about 350 MB), besides what you install in it.
 
 ## Two ways to run it
 
@@ -75,6 +75,8 @@ The first start builds and fetches what clanker-learn needs, once:
 
 On a test machine with a fast connection all of it took about five minutes; the page answered after half a minute. A project cannot be given Claude Code or the editor before they are fetched.
 
+pi is not fetched at the first start: it is fetched when you ask, with Pull on its row in Settings, Software (or `cl agent pull pi`), and until then the New project box does not offer it.
+
 The status answer shows each step:
 
 ```
@@ -139,20 +141,22 @@ In the two volumes, and nowhere else.
 `clanker-learn-data`, mounted at `/data`:
 
 - `projects/<name>`: each project's workspace (`/workspace` in its sandbox).
-- `homes/<name>`: each project's home folder (`/home/learner`), with its copies of Claude Code and the editor, its Claude Code login and sessions.
+- `homes/<name>`: each project's home folder (`/home/learner`), with its copies of Claude Code, pi and the editor, their logins and sessions.
 - `core/`: each project's record, keys and ports; the secret the web server and the tutor service share.
 - `tutor/`: the tutor service's database (lessons, conversations, plans, what the tutor keeps about you), the Claude token set in Settings, and the keys the tutor logs in to each sandbox with.
 - `broker/`: the password's hash and a log of logins and changes.
 - `web/`: the page's certificate and which tab is on which port.
-- `dist/`: the fetched Claude Code and editor.
+- `dist/`: the fetched Claude Code, pi and editor.
 - `versions.local.env`: the versions you raised in Settings.
 - `backups/`: the backups. It is made at the first start, empty.
 
 `clanker-learn-docker`, mounted at `/var/lib/docker`: the inner Docker's images and each project's container, which holds what was installed in the sandbox outside its workspace and home folder.
 
-## The versions of Claude Code and the editor
+## The versions of Claude Code, pi and the editor
 
-clanker-learn names the versions it fetches in `versions.env` in the repository. At the time of writing: Claude Code 2.1.330 and code-server 4.126.0.
+clanker-learn names the versions it fetches in `versions.env` in the repository. At the time of writing: Claude Code 2.1.330, pi 1.5.0 and code-server 4.126.0.
+
+pi is fetched with four more parts, each pinned there too: a node runtime of its own (`NODE_VERSION`, 24.18.0), the pi-subagents package (`PI_SUBAGENTS_VERSION`, 0.84.0), the rules extension that makes pi read the same instruction files as Claude Code (`RS_PI_RULES_VERSION`, 0.8.0, shipped in the repository, from research-sandbox), and a counter of the folder's layout (`RS_PI_DIST_LAYOUT`). Settings, Software, shows each under pi's row; when one moved since the fetch, the row says the fetched copy is stale and Pull fetches it again. Refresh raises pi's own version only.
 
 To move to newer ones, use Settings, Software, in the page: **Refresh** asks for the newest version and offers to raise it and fetch it. **Pull** fetches again at the version in effect. **Use repo version** goes back to the repository's. A version is never moved down by Refresh. The same from the machine:
 
@@ -160,10 +164,12 @@ To move to newer ones, use Settings, Software, in the page: **Refresh** asks for
 docker exec clanker-learn cl software
 docker exec clanker-learn cl agent refresh --check
 docker exec clanker-learn cl agent refresh
+docker exec clanker-learn cl agent pull pi
+docker exec clanker-learn cl agent refresh pi --check
 docker exec clanker-learn cl editor refresh
 ```
 
-A raised version is kept in `/data/versions.local.env`, over the repository's file. Running projects keep the Claude Code they have until Update is pressed in their gear's Agents section; new projects get the fetched one. A newer editor reaches a project at its next start. Claude Code may also update itself inside a project.
+A raised version is kept in `/data/versions.local.env`, over the repository's file. Running projects keep the agent versions they have until Update is pressed in their gear's Agents section; new projects get the fetched ones. A newer editor reaches a project at its next start. Claude Code may also update itself inside a project.
 
 ## Backing up and restoring
 
@@ -178,9 +184,9 @@ docker exec clanker-learn cl backups
 
 What is inside: every project's workspace, home folder, record, keys and ports; the tutor's database (copied so that a running tutor does not tear it), the Claude token and the tutor's keys; the password's hash; the page's certificate; the versions you raised.
 
-What is not inside: the fetched Claude Code and editor (a new installation fetches them at its first start); what was installed in a sandbox outside its workspace and home folder (each project's setup recipe brings it back); the inner Docker's images (built again); the other backups.
+What is not inside: the fetched Claude Code, pi and editor (a new installation fetches Claude Code and the editor at its first start, and pi when you pull it); what was installed in a sandbox outside its workspace and home folder (each project's setup recipe brings it back); the inner Docker's images (built again); the other backups.
 
-**Keep a backup as you would keep the keys to everything.** It holds the password's hash, the Claude token if you set one, each project's Claude Code login, and the keys into every sandbox. It is not encrypted.
+**Keep a backup as you would keep the keys to everything.** It holds the password's hash, the Claude token if you set one, each project's Claude Code and pi logins, and the keys into every sandbox. It is not encrypted.
 
 To keep one off the machine, press **Download** beside it in Settings, Backup, or copy it out:
 
@@ -224,7 +230,7 @@ docker rm clanker-learn
 
 and run the same `docker run` command as before. Your projects, conversations, password and settings are on the volumes and stay.
 
-At the first start after an update, the images of the web server, the tutor service and the sandboxes are built again if their definition changed, and the web server's and the tutor service's containers are made again. The tutor's database is brought up to date by the tutor service. The fetched Claude Code and editor stay; if the new version of the repository names newer versions, Settings, Software, says so, and Pull fetches them. Existing projects keep their containers until you recreate them: Recreate gives a project a container from the new sandbox image, keeps its workspace and home folder, and runs its setup recipe.
+At the first start after an update, the images of the web server, the tutor service and the sandboxes are built again if their definition changed, and the web server's and the tutor service's containers are made again. The tutor's database is brought up to date by the tutor service. The fetched Claude Code, pi and editor stay; if the new version of the repository names newer versions, Settings, Software, says so, and Pull fetches them. Existing projects keep their containers until you recreate them: Recreate gives a project a container from the new sandbox image, keeps its workspace and home folder, and runs its setup recipe.
 
 ## Stopping and uninstalling
 

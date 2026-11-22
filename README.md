@@ -2,7 +2,7 @@
 
 A tutor you run on your own machine. You learn a technical subject by doing it, in a real Linux environment, with a tutor that works in that environment beside you and remembers what you told it about yourself.
 
-It is for one person who wants to learn something hands-on (a database, a language, a tool, a piece of infrastructure) and would rather keep the whole thing on their own computer. The tutor is Claude Code, driven by your own Claude subscription.
+It is for one person who wants to learn something hands-on (a database, a language, a tool, a piece of infrastructure) and would rather keep the whole thing on their own computer. The tutor is Claude Code, driven by your own Claude subscription, or pi, with a provider of your choice; a lesson can switch from one to the other at any point.
 
 ## What it looks like
 
@@ -14,7 +14,7 @@ It is for one person who wants to learn something hands-on (a database, a langua
 ## What it needs
 
 - A Linux machine with Docker. It runs as one container, which holds a Docker daemon of its own for the sandboxes. Only x86-64 has been run so far.
-- A Claude subscription, for Claude Code. You log in once per project, or set one token for every project in Settings.
+- A Claude subscription, for Claude Code. You log in once per project, or set one token for every project in Settings. For pi instead, or as well: an account with a provider pi supports, logged in once per project, in its Shell.
 - The internet: at the first start clanker-learn builds its images and fetches Claude Code and the editor, and the sandboxes reach the internet while you work.
 
 ## The quickest start
@@ -37,9 +37,9 @@ This runs the container privileged, which makes it root-equivalent on your machi
 
 ## How far it is built
 
-It is a first version. What exists: projects and their sandboxes; the page with the Shell, the Editor, web-app tabs and ports; Claude Code and the editor fetched once and copied into each project, and updated from Settings; Goals and the study plan; lessons as conversations with the tutor, with diagrams, plots, pictures, pages, exercises and quick questions; tabs side by side; the Knowledge page, where you read and change what the tutor keeps about you and approve the insights it proposes for every project; backups, made, downloaded and removed in Settings, and restored with a command.
+It is a first version. What exists: projects and their sandboxes; the page with the Shell, the Editor, web-app tabs and ports; Claude Code, pi and the editor fetched once and copied into each project, and updated from Settings; Goals and the study plan; lessons as conversations with the tutor, with diagrams, plots, pictures, pages, exercises and quick questions; tabs side by side; the Knowledge page, where you read and change what the tutor keeps about you and approve the insights it proposes for every project; backups, made, downloaded and removed in Settings, and restored with a command.
 
-What is left is a second agent: only Claude Code drives the tutor so far, and pi is planned.
+pi is built as a second agent, interchangeable with Claude Code: a project can have either or both, a lesson is taught by the one it chose or by the default set in Settings, and it can switch in the middle, the other agent taking the lesson up from its files. **No real model has answered through pi yet**: it was run against a stand-in that speaks the same API, so the first real pi lesson may surface faults.
 
 ## Documents
 

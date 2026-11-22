@@ -383,7 +383,7 @@ def what_was_done(verb, name, out):
         return out["said"]
     if verb in BUILD_VERBS:
         label = core.SOFTWARE[out.get("software", "")]["label"] if out.get("software") in core.SOFTWARE else "The software"
-        label = label[0].upper() + label[1:]
+        label = core.sentence_start(label)
         if verb.endswith("_refresh") and not out.get("bumped"):
             return f"{label} {out.get('version')} is in effect and upstream's newest is {out.get('upstream')}: nothing to do."
         return f"{label} {out.get('version')} is pulled."

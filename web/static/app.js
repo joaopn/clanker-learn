@@ -393,6 +393,8 @@ function enterApp(projects) {
     seedBuilds();
     seedBackup();
     refreshMode();
+    // The default agent, named in each lesson's choice of agent.
+    if (S.page !== "settings") refreshTutorSettings();
     render();
 }
 
@@ -435,6 +437,8 @@ async function refreshProjects() {
             for (const n of Object.keys(S.cols)) if (!projectRow(n) && n !== S.creating) delete S.cols[n];
         }
         refreshTutor();
+        // A lesson's choice of agent offers what its project has now (pi added from the gear).
+        for (const pane of Object.values(S.panes)) if (pane.kind === "lesson" && pane.drawAgent) pane.drawAgent();
         if (S.current && S.current !== S.creating && !projectRow(S.current) && list.body.ok) {
             S.current = S.projects.length ? S.projects[0].name : null;
             if (S.current) refreshServices(S.current);
@@ -1408,6 +1412,8 @@ async function refreshPorts(name) {
 // ---- the tutor: lessons under a project ---------------------------------------------------
 
 const tutorPath = (tail) => `/broker/tutor${tail}`;
+// The agents a lesson can be taught by, as the conversation names them.
+const AGENT_NAMES = { claude: "Claude Code", pi: "pi" };
 
 // The tutor service numbers its lessons, runs and messages; the page keeps every id as text
 // (a tab's name, the layout in browser storage), so the ids of an answer become text here.
@@ -2633,6 +2639,9 @@ function makeLessonPane(name, id) {
     const markEl = h("span", { class: "lstate" });
     const summaryBtn = h("button", { class: "mini wide", hidden: true, title: "What the tutor wrote when it closed the lesson" }, "Summary");
     const stateEl = h("span", { class: "lw" });
+    // The agent that teaches the lesson (the mock's select): the default, or one the project has.
+    const agentSel = h("select", { class: "lagent", title: "The agent that teaches this lesson. It can be changed at any time.",
+                                   "aria-label": "The agent that teaches this lesson" });
     const inner = h("div", { class: "conv-inner" });
     const conv = h("div", { class: "conv" }, inner);
     const ctx = h("div", { class: "ctxline", hidden: true });
@@ -2640,7 +2649,7 @@ function makeLessonPane(name, id) {
     const ta = h("textarea", { rows: 2, placeholder: "Write to the tutor…", "aria-label": "Your message to the tutor" });
     const btn = h("button", { class: "primary" }, "Send");
     const el = h("div", { class: "pane lesson-pane" },
-        h("div", { class: "lhead" }, h("div", { class: "lh-main" }, titleEl, objEl), stateEl, markEl, summaryBtn),
+        h("div", { class: "lhead" }, h("div", { class: "lh-main" }, titleEl, objEl), stateEl, agentSel, markEl, summaryBtn),
         conv, ctx,
         h("div", { class: "composer" }, said, h("div", { class: "composer-inner" }, ta, btn)));
     const pane = { kind: "lesson", lessonId: id, el, title: null, lesson: null, turn: null, stale: true, loading: false, sending: false };
@@ -2687,7 +2696,40 @@ function makeLessonPane(name, id) {
         markEl.textContent = (st === "done" ? "✓ " : "") + LESSON_STATES[st];
         summaryBtn.hidden = !(st === "done" && (l.summary || l.one_line));
         ta.placeholder = goals ? "Tell the tutor what you want to learn…" : "Write to the tutor…";
+        pane.drawAgent();
     };
+    // The choices: "the default (…)" and the agents the project has (the tutor service does not
+    // know which a project has); a choice the project no longer has stays shown, as it is in effect.
+    let agentKey = "";
+    pane.drawAgent = () => {
+        const l = pane.lesson;
+        const p = projectRow(name);
+        const have = (p && Array.isArray(p.agents) ? p.agents : []).filter((a) => AGENT_NAMES[a]);
+        const own = l && AGENT_NAMES[l.agent] ? l.agent : "";
+        if (own && !have.includes(own)) have.push(own);
+        const dflt = l && !own && AGENT_NAMES[l.agent_in_effect] ? l.agent_in_effect
+            : S.tutorSettings && AGENT_NAMES[S.tutorSettings.default_agent] ? S.tutorSettings.default_agent : null;
+        const key = [own, dflt, ...have].join("|");
+        if (key === agentKey) return;
+        agentKey = key;
+        agentSel.replaceChildren(h("option", { value: "" }, dflt ? `the default (${AGENT_NAMES[dflt]})` : "the default agent"),
+            ...have.map((a) => h("option", { value: a }, AGENT_NAMES[a])));
+        agentSel.value = own;
+    };
+    agentSel.addEventListener("change", async () => {
+        const want = agentSel.value || null;
+        const was = pane.lesson ? (AGENT_NAMES[pane.lesson.agent] ? pane.lesson.agent : "") : "";
+        agentSel.disabled = true;
+        const r = await tutorApi("PATCH", `/lessons/${enc(id)}`, { agent: want });
+        agentSel.disabled = false;
+        const res = r.body.ok && r.body.result;
+        if (!isLesson(res)) { agentSel.value = was; tell(errText(r.body)); return; }
+        const row = lessonRow(name, id);
+        if (row) Object.assign(row, res);
+        pane.setLesson(res);
+        const now = AGENT_NAMES[res.agent_in_effect] || "the default agent";
+        if (inner.querySelector(".msg")) sysline(`From your next message ${now} teaches this lesson, taking it up from where it is.`);
+    });
     let follow = true;         // the conversation follows the newest text unless scrolled up
 
     // Scrolled up is above where the page last put it: text that grew or reflowed under a
@@ -2763,17 +2805,27 @@ function makeLessonPane(name, id) {
         const told = you && typeof m.context === "string" && m.context.trim()
             ? h("details", { class: "told" }, h("summary", {}, "what the tutor was told"), h("pre", {}, m.context)) : null;
         if (composed) body.className = "body composed-line";
-        const el = h("div", { class: `msg ${you ? "you" : "tutor"}${composed ? " composed" : ""}`, "data-run": m.run_id === undefined || m.run_id === null ? null : String(m.run_id) },
+        const el = h("div", { class: `msg ${you ? "you" : "tutor"}${composed ? " composed" : ""}`, "data-run": m.run_id === undefined || m.run_id === null ? null : String(m.run_id),
+                              "data-agent": !you && AGENT_NAMES[m.agent] ? m.agent : null },
             h("div", { class: "av" }, you ? "Y" : "T"),
             // The tools a stretch of the answer used come after its text, as they were run; its cards after them.
             h("div", { class: "mc" }, h("div", { class: "who" }, you ? "You" : "Tutor"), body, told, traces, cardsEl));
         return { el, body, traces, cards: cardsEl };
     }
+    // "Tutor · pi", "Tutor · Claude Code" once more than one agent has answered in the lesson.
+    function markWho() {
+        const msgs = [...inner.querySelectorAll(".msg.tutor[data-agent]")];
+        const several = new Set(msgs.map((e) => e.dataset.agent)).size > 1;
+        for (const e of msgs) {
+            const who = e.querySelector(".who");
+            if (who) who.textContent = several ? `Tutor · ${AGENT_NAMES[e.dataset.agent]}` : "Tutor";
+        }
+    }
 
     // ---- an answer being written
     function draftOf(turn) {
         if (turn.draft) return turn.draft;
-        const d = messageEl({ role: "assistant", text: "" });
+        const d = messageEl({ role: "assistant", text: "", agent: turn.agent });
         d.text = "";
         d.toolIds = [];
         d.blocks = new Map();
@@ -2781,6 +2833,7 @@ function makeLessonPane(name, id) {
         d.tail = h("div", {}, h("span", { class: "pulse typing", title: "The tutor is working" }));
         d.el.querySelector(".mc").append(d.tail);
         inner.append(d.el);
+        markWho();
         turn.draft = d;
         return d;
     }
@@ -2871,6 +2924,7 @@ function makeLessonPane(name, id) {
                 const have = new Set((Array.isArray(m.tools) ? m.tools : []).map((t) => t && t.id));
                 turn.draft = null;
                 if (draft) draft.el.replaceWith(stored.el); else inner.append(stored.el);
+                markWho();
                 const left = draft ? draft.toolIds.filter((t) => !have.has(t)) : [];
                 const cardsLeft = leftCards.filter((c) => !stored.cards.contains(c));
                 if (left.length || cardsLeft.length) {
@@ -2892,8 +2946,8 @@ function makeLessonPane(name, id) {
     }
 
     // Follow an answer from after `after`: replayed first, then as it is written.
-    function join(runId, after) {
-        const turn = { runId, lastSeq: after, draft: null, paintQueued: false, close: () => {} };
+    function join(runId, after, agent) {
+        const turn = { runId, agent, lastSeq: after, draft: null, paintQueued: false, close: () => {} };
         pane.turn = turn;
         setComposer();
         draftOf(turn);
@@ -2968,7 +3022,8 @@ function makeLessonPane(name, id) {
         ctx.hidden = true;
         setUsage(res.usage);
         follow = true;
-        if (run) { S.activity.add(id); join(run.id, 0); } else setComposer();
+        markWho();
+        if (run) { S.activity.add(id); join(run.id, 0, run.agent); } else setComposer();
         renderRail();
         // At once as well: the scroll the emptying above made would otherwise end the following.
         toBottom();
@@ -3003,7 +3058,7 @@ function makeLessonPane(name, id) {
         if (res.message) inner.append(messageEl(res.message).el);
         follow = true;
         S.activity.add(id);
-        join(res.run.id, 0);
+        join(res.run.id, 0, res.run.agent);
         renderRail();
         toBottom();
     }
@@ -3555,6 +3610,38 @@ async function refreshTutorSettings() {
     if (r.body.ok && r.body.result && typeof r.body.result.claude_token_set === "boolean") { S.tutorSettings = r.body.result; S.tutorSettingsError = null; }
     else S.tutorSettingsError = errText(r.body);
     renderTutorSettings();
+    renderDefaultAgent();
+}
+
+// The default agent: what a lesson that has not chosen one is taught by.
+function renderDefaultAgent(note) {
+    if (!S.shell) return;
+    const box = S.shell.settings.agent;
+    const st = S.tutorSettings;
+    for (const pane of Object.values(S.panes)) if (pane.kind === "lesson" && pane.drawAgent) pane.drawAgent();
+    if (!st) { box.replaceChildren(); return; }
+    const sel = h("select", { "aria-label": "The default agent" },
+        Object.entries(AGENT_NAMES).map(([a, words]) => h("option", { value: a }, words)));
+    sel.value = AGENT_NAMES[st.default_agent] ? st.default_agent : "claude";
+    const said = h("p", { class: note && note.bad ? "bad" : "muted" }, note ? note.text : "");
+    said.hidden = !note;
+    sel.addEventListener("change", async () => {
+        sel.disabled = true;
+        const r = await tutorApi("PUT", "/settings", { default_agent: sel.value });
+        sel.disabled = false;
+        if (!r.body.ok || !r.body.result || typeof r.body.result.claude_token_set !== "boolean") { renderDefaultAgent({ text: errText(r.body), bad: true }); return; }
+        S.tutorSettings = r.body.result;
+        renderDefaultAgent({ text: `The default agent is now ${AGENT_NAMES[S.tutorSettings.default_agent] || S.tutorSettings.default_agent}.` });
+        // The lessons that follow the default teach with the new one: read again.
+        for (const n of Object.keys(S.lessons)) refreshLessons(n);
+        for (const pane of Object.values(S.panes)) if (pane.kind === "lesson" && !pane.turn) pane.reload();
+    });
+    box.replaceChildren(h("div", { class: "form" },
+        formRow("Default agent", sel, "Lessons that have not chosen an agent follow this one, also ones already started: " +
+            "the agent then takes the lesson up from its files."),
+        h("p", { class: "note" }, "A project's tutor can only use an agent the project has: pi is added in the project's gear, under Agents, " +
+            "and logged in by running pi in its Shell."),
+        said));
 }
 
 function renderTutorSettings(note) {
@@ -3675,6 +3762,7 @@ function makeSettingsPane() {
     const table = h("div", { class: "sw-table" }, h("div", { class: "none" }, "Asking…"));
     const said = h("p", { class: "muted sw-said" });
     const tutor = h("div", { class: "card-body tutor-set" }, h("div", { class: "none" }, "Asking…"));
+    const agent = h("div", { class: "card-body tutor-agent" });
     const instr = h("div", { class: "card-body tutor-instr" }, h("div", { class: "none" }, "Asking…"));
     const backup = h("div", { class: "card-body backup-set" }, h("div", { class: "none" }, "Asking…"));
     const mode = h("div", { class: "card mode-set" }, h("div", { class: "card-head" }, "How it runs"), h("div", { class: "none" }, "Asking…"));
@@ -3685,10 +3773,10 @@ function makeSettingsPane() {
             h("p", { class: "note sw-hint" }, "Running projects keep the agent versions they have until Update is pressed in their Config box (Agents); new projects get these. " +
                 "A newer editor reaches a project at its next start.")),
         said,
-        h("div", { class: "card" }, h("div", { class: "card-head" }, "Tutor"), tutor, instr),
+        h("div", { class: "card" }, h("div", { class: "card-head" }, "Tutor"), tutor, agent, instr),
         h("div", { class: "card" }, h("div", { class: "card-head" }, "Backup"), backup),
         mode));
-    return { el, table, said, tutor, instr, backup, mode };
+    return { el, table, said, tutor, agent, instr, backup, mode };
 }
 
 // The build lane's target for a row (the broker's build_target).
@@ -3763,11 +3851,23 @@ function renderSoftware() {
                 h("span", {}, row.ext_version ? h("code", {}, String(row.ext_version)) : "—"),
                 h("span", {}), h("span", {})));
         }
+        // The pins a distribution bundles beside its own (pi: its private node, RS's rules
+        // extension, pi-subagents, the tree's layout), RS's sub-rows: one moved reads stale.
+        for (const x of (Array.isArray(row.extra_pins) ? row.extra_pins : [])) {
+            if (!x || typeof x !== "object") continue;
+            out.push(h("div", { class: "sw-row sw-sub" },
+                h("span", { class: "sw-subname", title: String(x.key || "") }, "└ " + (EXTRA_PIN_WORDS[x.id] || String(x.label || x.id))),
+                h("span", {}, x.pulled ? h("code", {}, String(x.pulled)) : "—"),
+                h("span", {}, x.version ? h("code", {}, String(x.version)) : "—"),
+                h("span", {}), h("span", {})));
+        }
         if (row.problem) out.push(h("div", { class: "sw-row sw-sub" }, h("span", { class: "bad sw-problem" }, String(row.problem))));
     }
     if (S.softwareError) out.push(h("div", { class: "none bad" }, S.softwareError));
     table.replaceChildren(...out);
 }
+
+const EXTRA_PIN_WORDS = { node_ver: "node", rules_ver: "rules extension", subagents_ver: "pi-subagents", layout_ver: "layout" };
 
 function swTitle(verb, row) {
     return (/_refresh$/.test(verb) ? "Refreshing " : "Pulling ") + (row ? row.row : verb);
@@ -3822,6 +3922,9 @@ function pullDialog(row) {
     openModal(`Pull ${row.row}`, [
         h("p", {}, `Fetch ${row.label} again at the version in effect, `, h("code", {}, String(row.version || "?")),
             row.kind === "agent" && row.ext_version ? [" (its editor extension at ", h("code", {}, String(row.ext_version)), ")"] : null,
+            Array.isArray(row.extra_pins) && row.extra_pins.length
+                ? [" with ", row.extra_pins.map((x, i) => [i ? ", " : "", `${EXTRA_PIN_WORDS[x.id] || x.label || x.id} `, h("code", {}, String(x.version || "?"))])]
+                : null,
             ", in a throwaway container (a few minutes). The log is shown while it runs."),
         said,
     ], [h("button", { onclick: closeModal }, "Cancel"), go]);
@@ -4087,7 +4190,7 @@ function limitsInputs(current) {
 
 // ---- agents and the editor in a project (RS's create dialog and Config box, Agents) ------
 
-const AGENT_LABELS = { claude: "Claude" };
+const AGENT_LABELS = { claude: "Claude", pi: "pi" };
 let modelListSeq = 0;
 
 // The catalog of Claude's tiers, read once a login (null when the broker cannot serve it:
@@ -4138,6 +4241,25 @@ function claudeModelControls(cat, init, onChange) {
     return { node, model, effort, value: () => ({ model: model.value.trim(), effort: effort.disabled ? "" : effort.value }) };
 }
 
+// pi's model and thinking level (RS's Agents box, pi's tab): no catalog (pi lists its models
+// only once a provider is logged in inside the project), so the model is free provider/model
+// text; the broker checks it and its refusal is shown as it comes.
+function piModelControls(cat, init) {
+    const pi = (cat && cat.pi) || {};
+    const levels = Array.isArray(pi.thinking_levels) ? pi.thinking_levels : ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+    const model = h("input", { type: "text", autocomplete: "off", spellcheck: "false",
+                               placeholder: pi.model_example || "provider/model (empty: pi's own pick)" });
+    model.value = (init && init.model) || "";
+    const thinking = h("select", {}, h("option", { value: "" }, "pi's default"), ...levels.map((lv) => h("option", { value: lv }, lv)));
+    thinking.value = init && levels.includes(init.thinking) ? init.thinking : "";
+    const node = h("div", { class: "field" }, h("span", {}, "pi's model and thinking level"),
+        h("div", { class: "model-row" },
+            h("div", { class: "model-cell model-name" }, h("span", { class: "model-cap" }, "model"), model),
+            h("div", { class: "model-cell" }, h("span", { class: "model-cap" }, "thinking"), thinking)),
+        h("span", { class: "note" }, "provider/model, as pi names it; empty: pi's own pick. Log in to the provider by running pi in the project's Shell."));
+    return { node, model, thinking, value: () => ({ pi_model: model.value.trim(), pi_thinking: thinking.value }) };
+}
+
 // A toggle card (RS's box-opt-card): on, off, or not offered (with why).
 function optCard(label, on, why) {
     const card = h("button", { type: "button", class: "opt-card" + (on ? " on" : ""), "aria-pressed": on ? "true" : "false",
@@ -4165,30 +4287,40 @@ function newProjectDialog() {
         const [sw, cat] = await Promise.all([api("GET", "/broker/software"), modelCatalog()]);
         const rows = sw.body.ok && Array.isArray(sw.body.result) ? sw.body.result : [];
         const claude = softwareRow(rows, "claude");
+        const pi = softwareRow(rows, "pi");
         const editor = softwareRow(rows, "code-server");
         const notPulled = "Not pulled yet: pull it under Settings → Software first.";
         const claudeCard = optCard(AGENT_LABELS.claude, !!(claude && claude.pulled), claude && claude.pulled ? null : notPulled);
+        // pi is never ticked by itself: a second agent is a choice.
+        const piCard = optCard(AGENT_LABELS.pi, false, pi && pi.pulled ? null : notPulled);
         const controls = claudeModelControls(cat, null);
+        const piControls = piModelControls(cat, null);
         const hint = h("p", { class: "note" });
         const sync = () => {
             controls.node.hidden = !claudeCard.on();
-            hint.textContent = !(claude && claude.pulled)
-                ? "No agent is pulled yet — pull Claude Code under Settings → Software. Without one the project starts with none."
-                : claudeCard.on() ? "" : "No agent: the project starts without one.";
+            piControls.node.hidden = !piCard.on();
+            hint.textContent = !(claude && claude.pulled) && !(pi && pi.pulled)
+                ? "No agent is pulled yet — pull Claude Code (or pi) under Settings → Software. Without one the project starts with none."
+                : claudeCard.on() || piCard.on() ? "" : "No agent: the project starts without one.";
             hint.hidden = !hint.textContent;
         };
         claudeCard.card.addEventListener("click", sync);
+        piCard.card.addEventListener("click", sync);
         sync();
         fill(agentsBody,
             sw.body.ok ? null : h("p", { class: "bad" }, "What is pulled could not be read: " + errText(sw.body)),
-            h("div", { class: "opt-cards" }, claudeCard.card), controls.node, hint);
+            h("div", { class: "opt-cards" }, claudeCard.card, piCard.card),
+            pi && !pi.pulled ? h("p", { class: "note" }, "pi is not pulled yet: pull it under Settings → Software to offer it here.") : null,
+            controls.node, piControls.node, hint);
         const editorCard = optCard("Editor (code-server)", !!(editor && editor.pulled), editor && editor.pulled ? null : notPulled);
         fill(editorBody, h("div", { class: "opt-cards" }, editorCard.card),
             editor && editor.pulled ? null : h("p", { class: "note" }, "The editor is not pulled yet: pull it under Settings → Software."));
         chosen = () => {
-            const on = claudeCard.on();
+            const on = claudeCard.on(), piOn = piCard.on();
             const mv = on ? controls.value() : { model: "", effort: "" };
-            return { agents: on ? ["claude"] : [], editor: editorCard.on(), claude_model: mv.model, claude_effort: mv.effort };
+            const out = { agents: [...(on ? ["claude"] : []), ...(piOn ? ["pi"] : [])], editor: editorCard.on(), claude_model: mv.model, claude_effort: mv.effort };
+            if (piOn) Object.assign(out, piControls.value());
+            return out;
         };
         go.disabled = false;
     })();
@@ -4232,11 +4364,12 @@ function newProjectDialog() {
 function agentsSection(name, p, box) {
     const running = p.state === "running" && !opOf(name);
     const agents = Array.isArray(p.agents) ? p.agents : [];
-    const has = [...agents.map((a) => a === "claude" ? "Claude Code" : a), p.editor ? "the editor (code-server)" : null].filter(Boolean);
+    const has = [...agents.map((a) => AGENT_NAMES[a] || a), p.editor ? "the editor (code-server)" : null].filter(Boolean);
     const said = h("p", { class: "muted" });
     const tell = (text, bad) => { said.className = bad ? "bad" : "muted"; said.textContent = text; };
     const body = h("div", {}, h("p", { class: "note" }, "Asking…"));
-    box.append(h("p", {}, has.length ? `This project has ${has.join(" and ")}.` : "This project has no agent and no editor."), body, said);
+    const listed = has.length > 1 ? `${has.slice(0, -1).join(", ")} and ${has[has.length - 1]}` : has[0];
+    box.append(h("p", {}, has.length ? `This project has ${listed}.` : "This project has no agent and no editor."), body, said);
     (async () => {
         const [sw, cat] = await Promise.all([api("GET", "/broker/software"), modelCatalog()]);
         const rows = sw.body.ok && Array.isArray(sw.body.result) ? sw.body.result : [];
@@ -4275,6 +4408,24 @@ function agentsSection(name, p, box) {
             } }, "Apply");
             parts.push(controls.node, h("div", { class: "row-btns" }, apply,
                 running ? null : h("span", { class: "note" }, "Start the project to change Claude's model and effort.")));
+        }
+        // pi's model and thinking level, while the project runs.
+        if (agents.includes("pi")) {
+            const pc = piModelControls(cat, { model: p.pi_model || "", thinking: p.pi_thinking || "" });
+            pc.model.disabled = pc.thinking.disabled = !running;
+            const apply = h("button", { disabled: !running, onclick: async () => {
+                apply.disabled = true;
+                const r = await api("POST", projectPath(name, "/model"), pc.value());
+                apply.disabled = false;
+                if (!r.body.ok) { tell(errText(r.body), true); return; }
+                const res = r.body.result || {};
+                const pair = [res.pi_model, res.pi_thinking && `thinking ${res.pi_thinking}`].filter(Boolean).join(", ");
+                tell((pair ? `pi's model and thinking level are now ${pair}.` : "pi's model and thinking level are back to pi's own pick.") +
+                     (res.pi_applied === false ? " pi's settings are not installed yet: they get this when they are." : " Written into pi's settings; a session started from now on uses it."));
+                refreshProjects();
+            } }, "Apply");
+            parts.push(pc.node, h("div", { class: "row-btns" }, apply,
+                running ? null : h("span", { class: "note" }, "Start the project to change pi's model and thinking level.")));
         }
         // Update: the pulled versions into the running project (RS's mgmtAgentsUpdateDialog).
         if (agents.length) {

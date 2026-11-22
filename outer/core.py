@@ -739,6 +739,11 @@ AGENTS = tuple(one for one, spec in SOFTWARE.items() if spec["kind"] == "agent")
 STALE = "stale — re-pull"
 
 
+def sentence_start(label):
+    """A label at the start of a sentence: capitalised, but a name written small stays so (pi)."""
+    return label if label == "pi" else label[0].upper() + label[1:]
+
+
 def known_software(software):
     if not isinstance(software, str) or software not in SOFTWARE:
         raise CoreError(f"There is no software named {str(software)[:40]!r} to pull (there is {', '.join(SOFTWARE)}).")
@@ -942,14 +947,14 @@ def take_build_lane(software):
         lane.close()
         now = building_now()
         what = SOFTWARE[now]["label"] if now else "Something"
-        raise CoreError(f"{what[0].upper()}{what[1:]} is being built now; try again when that is done.") from None
+        raise CoreError(f"{sentence_start(what)} is being built now; try again when that is done.") from None
     own = lane_file(f"dist-{software}.lock")
     try:
         fcntl.flock(own, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
         own.close()
         lane.close()
-        raise CoreError(f"{spec['label'][0].upper()}{spec['label'][1:]} is in use; try again in a moment.") from None
+        raise CoreError(f"{sentence_start(spec['label'])} is in use; try again in a moment.") from None
     return [lane, own]
 
 
@@ -1220,7 +1225,7 @@ def build_dist(software, version, say=say_nothing, ext_version=None):
         docker("rm", "-f", "-v", p["container"], check=False, timeout=STOP_GRACE_S + 120)
         if os.path.lexists(p["staging"]):
             shutil.rmtree(p["staging"], ignore_errors=True)
-    raise CoreError(f"{spec['label'][0].upper()}{spec['label'][1:]} {version} could not be pulled in {DIST_ATTEMPTS} attempts: {last}")
+    raise CoreError(f"{sentence_start(spec['label'])} {version} could not be pulled in {DIST_ATTEMPTS} attempts: {last}")
 
 
 def take_preloaded(software, say=say_nothing):
@@ -1268,7 +1273,7 @@ def first_pull(software, say=say_nothing, build=True):
         if taken is not None:
             return taken
         if not build:
-            raise CoreError(f"{spec['label'][0].upper()}{spec['label'][1:]} is built in a container of the sandbox image, which could not be had.")
+            raise CoreError(f"{sentence_start(spec['label'])} is built in a container of the sandbox image, which could not be had.")
         return build_dist(software, pin(software), say)
 
 

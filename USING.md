@@ -10,17 +10,20 @@ A project is one subject, and one sandbox: a Linux container of its own with a w
 
 **Making one.** `+ New project` asks for a name (lower-case letters, digits and dashes, up to 31) and what the project gets:
 
-- **Claude Code**, ticked by default, with the model and the effort it starts on (empty means Claude's own defaults). A project needs Claude Code for the tutor.
+- **Claude Code**, ticked by default, with the model and the effort it starts on (empty means Claude's own defaults).
+- **pi**, a second agent, not ticked by default, with the model it starts on, written `provider/model` as pi names it (`openrouter/anthropic/claude-opus-latest`, say), and its thinking level (empty means pi's own pick). It can be ticked once it is pulled in Settings, Software. A model not written `provider/model` is refused, and the box says why.
+
+A project's tutor can only be an agent the project has: give it Claude Code, pi, or both.
 - **The editor**, ticked by default.
 - **Limits**, optional: how many processes, how much memory (as `512m` or `2g`), how many processors (as `0.5` or `2`). With none set, a project may use up to 16384 processes and all the machine's memory and processors.
 
-The box shows the progress. A project cannot be given Claude Code or the editor before the first start has fetched them (Settings, Software, shows it). The first project on a new installation waits for the sandbox image if the first start has not finished building it. Each project gets its own copy of Claude Code and of the editor in its home folder, about 400 MB and 350 MB.
+The box shows the progress. A project cannot be given Claude Code or the editor before the first start has fetched them, nor pi before you pulled it (Settings, Software, shows it). The first project on a new installation waits for the sandbox image if the first start has not finished building it. Each project gets its own copy of each agent and of the editor it is given, in its home folder: about 400 MB for Claude Code, 270 MB for pi, 350 MB for the editor.
 
 **The gear beside a project** opens its box:
 
 - **Start** and **Stop.** What you installed is still there after a stop and a start, and after clanker-learn itself is stopped and started. The projects that were running when clanker-learn stopped are started again when it starts.
 - **Recreate** gives the project a new container from the current sandbox image. The workspace and the home folder stay, with Claude Code's login and sessions; what was installed elsewhere is gone, and the setup recipe (below) brings it back. A stopped project is running afterwards.
-- **Agents**: add Claude Code to a project that has none, **Update** it to the version fetched in Settings, change its model and effort. These work while the project runs, without a restart. A project made before projects had agents is recreated first, then given Claude Code here.
+- **Agents**: what the project has (Claude Code, pi, the editor). **Add** Claude Code or pi to a project that does not have it; change Claude's model and effort, or pi's model and thinking level, with **Apply**; **Update** both agents to the versions fetched in Settings. These work while the project runs, without a restart. A model and level applied are written into the agent's settings in the project's home folder, and a session started from then on uses them. A project made before projects had agents is recreated first, then given its agents here.
 - **Limits**: change them. They apply at once, with two exceptions the box tells you about: a memory limit is removed only when the project is next recreated, and on sysbox a processor limit is removed only at its next start.
 - **Destroy** asks for your password again, then removes the sandbox, its workspace, its home folder and its ports, for good, and its conversations with them: a new project of the same name starts empty. It also asks whether to **forget what you learned there**. Left unticked, the lessons' summaries and the goals and preferences you stated there stay for your other projects' tutors, and the project's insights stay on the Knowledge page for you, told to no tutor; all marked as from a removed project; ticked, they go too. The tutor service is told at the end of the destroy; if it could not be told, the box says so. If a destroy is cut short, run it again: a project being destroyed is never started.
 
@@ -67,6 +70,10 @@ Nothing of it is fetched from outside the project: a picture named by a web addr
 
 A lesson continues through Claude Code's own session in the project's home folder; `claude --resume` in the Shell lists it.
 
+**Signing in to pi.** pi has no token in Settings: its login is the project's own. Open the project's Shell, run `pi`, and log in there to your provider (`/login`), or set its key as pi says; that project's tutor then uses that login. A project whose pi has no login says so in the conversation: "pi is not logged in in this project: run pi in its Shell and log in there."
+
+**A lesson's agent.** The choice in a lesson's header says which agent teaches it: "the default (…)", which follows Settings, Tutor, or one of the agents the project has. It can be changed at any time, also in the middle of a lesson, except while an answer is being written (then the lesson says so: stop it or wait). The other agent takes the lesson up from its files (the conversation and the tutor's notes, below) and is told which answers it did not see; changing back, the first agent goes on with its own session and is told what it missed. When more than one agent has answered in a lesson, each answer says whose it is ("Tutor · pi", "Tutor · Claude Code"). The tools, the cards, the plan, what the tutor knows about you and the context line are the same with either. Choosing pi in a project that has no pi is refused in the conversation: "This project has no pi: add it in the project's gear, under Agents."
+
 **Exercises.** The tutor can set an exercise as a card in its answer: a title, the steps, and the check, a command shown on the card. Do the steps in the Shell or the Editor, then press **Check**: the command runs in your sandbox (up to half a minute) and the card says passed or failed, with the command's output under "Last check". **Check again** runs it again as often as you like. The tutor can run the check too; the card says who ran it last. What a check gives back is kept, and is the kind of evidence an insight about you can rest on.
 
 **Quick questions.** The tutor can ask a multiple-choice question as a card. Pick an option and press **Answer**: the card says right or not, shows the right one and the tutor's explanation, and keeps your answer, right or wrong.
@@ -100,17 +107,18 @@ Drag a tab to the side of the tab area to open a second column, and again for a 
 
 `⚙ Settings`, at the bottom of the project list.
 
-**Software** has a row for Claude Code and one for the editor: the version fetched, the version in effect, and whether the two agree.
+**Software** has a row for Claude Code, one for pi and one for the editor: the version fetched, the version in effect, and whether the two agree. pi's row has a line under it for each part fetched with it (its own node, the rules extension that makes pi read the same instruction files as Claude Code, the pi-subagents package, the layout of its folder): if one of them moved, the row says the fetched copy is stale. pi is not fetched by itself: it reads "not pulled" until you press Pull.
 
 - **Pull** fetches that software again at the version in effect, and shows the log while it runs.
 - **Refresh** asks its maker for the newest version, and offers to raise the version and fetch it if there is a newer one. A version is never moved down.
 - **Use repo version** goes back to the version clanker-learn came with.
 
-Each is fetched by its maker's own installer, in a container that is thrown away afterwards; one is fetched at a time. Running projects keep the Claude Code they have until you press Update in their gear's Agents section; new projects get the fetched one. A newer editor reaches a project at its next start.
+Each is fetched by its maker's own installer, in a container that is thrown away afterwards; one is fetched at a time. Running projects keep the agent versions they have until you press Update in their gear's Agents section; new projects get the fetched ones. A newer editor reaches a project at its next start.
 
-**Tutor** holds two things:
+**Tutor** holds three things:
 
 - **The Claude token**, which every project's tutor uses when it is set (see "Signing in to Claude"). It is not shown again once set; you can replace or remove it.
+- **The default agent**, Claude Code or pi. Lessons that have not chosen an agent follow it, also ones already started, which the agent then takes up from their files.
 - **The tutor's instructions**: the text every tutor is given with each of your messages, in every project. Read it, change it and save it; a lesson under way follows the new text from its next message, starting again from its files. **Back to the shipped text** puts clanker-learn's own text back.
 
 **Backup** makes a backup of everything clanker-learn keeps, and lists the ones there are.
@@ -174,10 +182,10 @@ docker exec clanker-learn cl recreate kafka
 docker exec clanker-learn cl destroy kafka
 ```
 
-- `cl create` gives a project neither Claude Code nor the editor unless asked: `--agent claude`, `--editor`, and `--claude-model` and `--claude-effort` for the model and effort.
+- `cl create` gives a project no agent and no editor unless asked: `--agent claude`, `--agent pi` (both, repeated), `--editor`, `--claude-model` and `--claude-effort` for Claude's model and effort, `--pi-model` and `--pi-thinking` for pi's.
 - `cl status` also says how the setup recipe went (`setup`: none, running, done, failed).
-- `cl agents add <name>`, `cl agents update <name>` and `cl agents model <name> --model … --effort …` are the gear's Agents section.
-- `cl software`, `cl agent pull`, `cl agent refresh`, `cl editor pull` and `cl editor refresh` are Settings, Software (`refresh --check` only asks).
+- `cl agents add <name> [claude|pi]`, `cl agents update <name>` and `cl agents model <name> --model … --effort …` (or `--pi-model … --pi-thinking …`) are the gear's Agents section.
+- `cl software`, `cl agent pull [claude|pi]`, `cl agent refresh [claude|pi]`, `cl editor pull` and `cl editor refresh` are Settings, Software (`refresh --check` only asks).
 - `cl passwd` sets the password ([INSTALL.md](INSTALL.md)).
 - `cl backup`, `cl backups`, `cl backup-rm` and `cl restore` make, list, remove and restore backups ([INSTALL.md](INSTALL.md)).
 
