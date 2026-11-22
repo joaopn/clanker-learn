@@ -2,7 +2,7 @@
 
 A self-hosted tutor: you learn a technical subject by doing it in a real environment, with a tutor that knows what you already know. One container, no tool on the host.
 
-It is being built. What exists so far is the outer container and, inside it, projects with their sandboxes, the broker, the web server, and its page: projects, a terminal, the editor and the web apps of a sandbox in the browser, and Claude Code in the projects that are given it. The tutor, its lessons and the knowledge base are not built yet.
+It is being built. What exists so far is the outer container and, inside it, projects with their sandboxes, the broker, the web server, and its page: projects, a terminal, the editor and the web apps of a sandbox in the browser, Claude Code in the projects that are given it, and the tutor: a conversation per lesson, in which Claude Code works in the project's sandbox. Study plans and the knowledge base are not built yet.
 
 ## The outer container
 
@@ -49,8 +49,9 @@ The first start takes a few minutes longer: the web server's image is built then
 
 After the login the projects are listed down the left side. `+ New project` makes one and shows its progress. Its box asks what the project gets: under Agents, Claude Code (ticked by default, with the model and the effort it starts on), and the editor (ticked by default). The gear beside a project starts, stops and recreates it, changes its limits, and destroys it (which asks for the password again); its Agents section adds Claude Code to a project that has none, updates it to the fetched version, and changes its model and effort, all while the project runs and without a restart.
 
-A project has these tabs:
+A project opens into its lessons in the list; `+ New lesson` adds one. A project has these tabs:
 
+- **The open lesson**: the conversation with the tutor (see The tutor, below).
 - **Shell**: a terminal in the sandbox. It keeps its session when the tab or the browser is closed.
 - **Editor**, in a project that has the editor: the code editor (code-server) on the project's workspace, where its files are browsed and edited. It starts at the first visit, with Python and Jupyter extensions and, in a project with Claude Code, its panel.
 - **One tab per web app** that listens in the sandbox. It appears a few seconds after the app starts listening, and is marked when the app is gone.
@@ -58,7 +59,19 @@ A project has these tabs:
 
 Every web tab, the Editor included, is served on a port of its own from the first range below. Some browsers want the certificate accepted once for each such address: if a tab stays empty, use its "open in a new tab" link, accept the certificate there, and reload the tab.
 
-The password never leaves the browser: the page sends a proof derived from it. The browser's storage holds only which project and tab were last shown.
+The password never leaves the browser: the page sends a proof derived from it. The browser's storage holds only which project, lesson and tab were last shown.
+
+### The tutor
+
+A lesson is a conversation with a tutor, and the tutor is the project's own Claude Code, working in the project's sandbox with the model and effort the project was given. So a lesson needs a project that has Claude Code and is running.
+
+- You write, the tutor answers as it goes: its text appears while it is written, and each thing it does in the sandbox (a command, a file it read or wrote) is a line you can open. What it installs and starts stays in the sandbox, where you work in the Shell and the Editor beside the conversation.
+- **Stop** ends an answer and what it was running. Closing the browser does not: the answer goes on and is there when you come back.
+- Lessons are independent: two can have their tutors working at once, also in one project, where both then work in the same sandbox. A lesson takes one message at a time.
+- Under the conversation a line says how full the tutor's context is.
+- **Signing in.** The tutor uses the project's own Claude Code login (run `claude` in its Shell once). Or set a Claude token in Settings, under Tutor (from `claude setup-token`): the tutor in every project then uses it, and a new project's first lesson works without a login. The token is kept in the `/data` volume and handed to each answer; code the tutor runs in the sandbox can read it, as it can read a project's own login.
+- The tutor runs as a service of its own inside clanker-learn (`state.json`: `tutor`). A sandbox cannot reach it. If it restarts while an answer is being written, that answer is shown as interrupted and the lesson takes the next message.
+- A lesson continues through Claude Code's own session in the project's home folder: `claude --resume` in the Shell lists it. If that session is lost, the conversation stays on the page and the tutor starts again without it, saying so.
 
 ### Software
 
