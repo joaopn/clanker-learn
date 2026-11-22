@@ -28,6 +28,7 @@
     --tab-type-editor: #17a2b8;
     --tab-type-other: #8a8a8a;
     --tab-type-lesson: #a371f7;
+    --tab-type-kb: #d29922;
     --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "DejaVu Sans Mono", "Liberation Mono", monospace;
 }
 * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -122,6 +123,7 @@ a { color: var(--fg-accent); }
 .tabbar .tb.t-cli { border-top-color: var(--tab-type-cli); }
 .tabbar .tb.t-editor { border-top-color: var(--tab-type-editor); }
 .tabbar .tb.t-other { border-top-color: var(--tab-type-other); }
+.tabbar .tb.t-kb { border-top-color: var(--tab-type-kb); }
 .tabbar .tb.t-ports { border-left: 1px solid #333; }
 .tabbar .tb.gone { text-decoration: line-through; color: var(--fg-faint); border-top-color: var(--error-fg); }
 .tabbar .tb.raw { cursor: default; gap: 6px; font-size: 12.5px; }
@@ -495,6 +497,119 @@ button.mini.wide { padding: 2px 10px; }
 .instr-foot { min-height: 18px; }
 .tutor-instr .btns .grow { flex: 1; color: var(--fg-muted); align-self: center; }
 
+/* ---- an exercise and a quick question in the conversation (the mock's .exercise and .quiz) ---- */
+.exercise { border-color: #5b4a86; }
+.exercise .blk-head { background: #2d2640; color: #d6c7ff; }
+.blk-head .bh-title { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.blk-head .bh-state { flex: none; font-weight: 400; color: var(--fg-muted); font-size: 12.5px; white-space: nowrap; }
+.blk-head .bh-state.okc { color: var(--status-up); }
+.blk-head .bh-state.badc { color: var(--error-fg); }
+.ex-steps { margin: 10px 14px 6px 36px; line-height: 1.6; }
+.ex-steps li { margin: 3px 0; }
+.ex-steps li.md > p { margin: 0; }
+.ex-check { padding: 2px 14px 8px; font-size: 12.5px; color: var(--fg-faint); overflow-wrap: anywhere; }
+.ex-check code { font-size: 12px; }
+.ex-result { margin: 0 14px 10px; font-size: 12.5px; color: var(--fg-muted); }
+.ex-result summary { cursor: pointer; }
+.ex-result pre { font-family: var(--mono); font-size: 12px; background: #151515; border: 1px solid #333; border-radius: 4px; padding: 8px; margin-top: 4px;
+                 white-space: pre-wrap; overflow-wrap: anywhere; max-height: 260px; overflow-y: auto; color: var(--fg-base); }
+.blk-foot .grow.okc { color: var(--status-up); }
+.blk-foot .grow.badc { color: var(--error-fg); }
+.card-said { padding: 0 14px 10px; font-size: 12.5px; }
+.blk-foot.qfoot { flex-direction: column; align-items: stretch; gap: 4px; }
+.qexpl { font-size: 13.5px; line-height: 1.5; color: var(--fg-base); }
+.qexpl > p { margin: 0 0 4px; }
+.quiz .qq { padding: 12px 14px 6px; line-height: 1.55; }
+.quiz .qq > p { margin: 0; }
+.qopts { padding-bottom: 6px; }
+button.qopt { display: flex; width: calc(100% - 28px); text-align: left; gap: 10px; align-items: flex-start; margin: 6px 14px; padding: 9px 12px;
+              border: 1px solid var(--border); border-radius: 8px; background: none; line-height: 1.45; }
+button.qopt:hover:not(:disabled) { border-color: var(--border-strong); background: #2c2c2c; }
+button.qopt:disabled { opacity: 1; cursor: default; }
+.qopt .qdot { width: 14px; height: 14px; border-radius: 50%; border: 2px solid var(--fg-faint); flex: none; margin-top: 3px; }
+.qopt .qletter { color: var(--fg-faint); font-weight: 600; flex: none; }
+.qopt .qtext { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.qopt.picked { border-color: var(--tab-type-lesson); } .qopt.picked .qdot { border-color: var(--tab-type-lesson); background: var(--tab-type-lesson); }
+.qopt.right { border-color: var(--status-up); background: rgba(102,204,102,.08); } .qopt.right .qdot { border-color: var(--status-up); background: var(--status-up); }
+.qopt.wrong { border-color: var(--error-fg); background: rgba(238,136,136,.08); } .qopt.wrong .qdot { border-color: var(--error-fg); background: var(--error-fg); }
+/* A message the system wrote for the learner: what happened, quiet, in their place. */
+.msg.you.composed .body.composed-line { background: none; border: 1px dashed #3a3a3a; color: var(--fg-muted); font-size: 13px; font-style: italic; padding: 4px 12px; }
+
+/* ---- the Knowledge page and a project's Insights tab (the mock's .kb, .ins, .hist) ---- */
+.rail-foot .foot.knowledge-btn { display: flex; align-items: center; gap: 8px; }
+.kdot { width: 8px; height: 8px; border-radius: 50%; background: var(--warn-fg); flex: none; display: inline-block; }
+.pane.kb { flex-direction: row; }
+.kb-nav { width: 230px; flex: none; height: 100%; border-right: 1px solid var(--border); padding: 14px 0; background: #222; overflow-y: auto; }
+.kh { padding: 12px 18px 6px; font-size: 11px; letter-spacing: .08em; color: var(--fg-faint); }
+.kn { display: flex; align-items: center; gap: 8px; padding: 8px 18px; cursor: pointer; color: var(--fg-muted); }
+.kn:hover { background: #2a2a2a; }
+.kn.on { background: var(--bg-base); color: var(--fg-base); box-shadow: inset 3px 0 0 var(--warn-fg); }
+.kn span:first-child { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.kn.none-kn { cursor: default; color: var(--fg-faint); }
+.kc { font-size: 12px; color: var(--fg-faint); }
+.pane.kb .kb-page { flex: 1; min-width: 0; height: 100%; }
+.kb-top { display: flex; justify-content: space-between; align-items: flex-start; gap: 20px; }
+.seg-toggle { display: flex; flex: none; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
+.seg-toggle button { border-radius: 0; background: none; color: var(--fg-muted); padding: 5px 12px; font-size: 13px; }
+.seg-toggle button.on { background: var(--btn-secondary-bg); color: var(--fg-base); }
+.rawbrief { font-family: var(--mono); font-size: 12.5px; line-height: 1.6; padding: 14px 18px; white-space: pre-wrap; overflow-wrap: anywhere; color: #cfcfcf; }
+.pad-note { padding: 0 18px 12px; }
+.two { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 18px; }
+.head-note { font-weight: 400; color: var(--fg-muted); font-size: 12.5px; text-align: right; }
+.head-pill { margin-left: 10px; vertical-align: middle; }
+.capbar { margin-bottom: 18px; color: var(--fg-muted); font-size: 13px; }
+.quote { color: var(--fg-faint); font-size: 12.5px; font-style: italic; }
+.small { font-size: 12.5px; }
+.ins { display: flex; gap: 12px; align-items: flex-start; padding: 11px 16px; border-bottom: 1px solid #333; }
+.ins:last-child { border-bottom: 0; }
+.ins.proposed { background: rgba(210,153,34,.07); }
+.ins.retired .ins-text { text-decoration: line-through; color: var(--fg-faint); }
+.ins-main { flex: 1; min-width: 0; }
+.ins-text { line-height: 1.45; overflow-wrap: anywhere; }
+.ins-ev { color: var(--fg-faint); font-size: 12.5px; margin-top: 3px; overflow-wrap: break-word; }
+.ins-act { display: flex; gap: 6px; flex: none; }
+.ins-act button, .hist button, .addrow button, .kb-btns button { padding: 3px 10px; font-size: 12.5px; }
+.kindp { margin-top: 1px; }
+.kindp.k-bad { border-color: #8c4a4a; color: var(--error-fg); }
+.kindp.k-good { border-color: #3d7a55; color: #8fe0b4; }
+.rests { margin-top: 4px; font-size: 12.5px; color: var(--fg-muted); }
+.rests summary { cursor: pointer; color: var(--fg-faint); }
+.rests summary:hover { color: var(--fg-muted); }
+.rests-body { margin: 4px 0 2px 12px; }
+.evrow { padding: 3px 0; line-height: 1.45; overflow-wrap: anywhere; }
+.evrow code { font-size: 12px; }
+.ev-out { font-family: var(--mono); font-size: 12px; background: #151515; border: 1px solid #333; border-radius: 4px; padding: 6px 8px; margin: 4px 0;
+          white-space: pre-wrap; overflow-wrap: anywhere; max-height: 200px; overflow-y: auto; color: var(--fg-base); }
+.kb-edit, .kb-bg { width: 100%; background: var(--bg-input); border: 1px solid var(--border); border-radius: 4px; padding: 6px 8px; line-height: 1.45; resize: vertical; }
+.kb-edit:focus, .kb-bg:focus { outline: none; border-color: var(--fg-accent); }
+.kb-kind { margin-top: 6px; }
+.kb-page .form > .note { margin: 10px 0 6px; }
+.kb-btns { justify-content: flex-end; margin-top: 8px; }
+.addrow { display: flex; gap: 8px; padding: 10px 16px; border-top: 1px solid var(--border); flex-wrap: wrap; }
+.addrow:first-child { border-top: 0; border-bottom: 1px solid var(--border); }
+.addrow input { flex: 1; min-width: 0; }
+.addrow .small { flex-basis: 100%; }
+.prop-what { font-weight: 600; }
+.prop-what .ins-ev { font-weight: 400; }
+.prop-target { margin-top: 4px; font-size: 13px; }
+.similar { margin-top: 6px; padding: 6px 10px; border-left: 2px solid #5a4a1e; }
+.simrow { display: flex; gap: 8px; align-items: baseline; padding: 2px 0; font-size: 13px; overflow-wrap: anywhere; }
+.sumrow { cursor: pointer; align-items: baseline; }
+.sumrow:hover { background: #2f2f2f; }
+.hist { display: grid; grid-template-columns: 130px 120px minmax(0, 1fr) 64px; gap: 10px; padding: 8px 16px; border-bottom: 1px solid #333; align-items: start; }
+.hist:last-child { border-bottom: 0; }
+.hist .who { color: var(--fg-muted); font-size: 12.5px; overflow-wrap: anywhere; }
+.hist .what { overflow-wrap: anywhere; }
+.hist.undone .what > div:first-child { text-decoration: line-through; color: var(--fg-faint); }
+.hist .ba { margin: 3px 0; }
+.switch { font-weight: 400; font-size: 12.5px; color: var(--fg-muted); cursor: pointer; white-space: nowrap; }
+.checkrow { display: block; margin: 10px 0 2px; cursor: pointer; }
+.insights-pane { container-type: inline-size; }
+@container (max-width: 560px) {
+    .ins { flex-wrap: wrap; padding: 10px 12px; }
+    .ins-act { width: 100%; justify-content: flex-end; }
+}
+
 /* ---- a conversation in a narrow column ---- */
 @container (max-width: 560px) {
     .conv { padding: 14px 10px 6px; }
@@ -523,6 +638,17 @@ button.mini.wide { padding: 2px 10px; }
     .sw-head { display: none; }
     .sw-act { justify-self: start; }
     .shell { flex-direction: column; }
+    .pane.kb { flex-direction: column; }
+    .kb-nav { width: auto; height: auto; max-height: 30%; padding: 4px 0; border-right: 0; border-bottom: 1px solid var(--border); display: flex; flex-wrap: wrap; }
+    .kb-nav .kh { display: none; }
+    .kn { padding: 6px 12px; }
+    .pane.kb .kb-page { height: auto; flex: 1; min-height: 0; }
+    .two { grid-template-columns: minmax(0, 1fr); gap: 0; }
+    .kb-top { flex-direction: column; gap: 8px; margin-bottom: 14px; }
+    .ins { flex-wrap: wrap; padding: 10px 12px; }
+    .ins-act { width: 100%; justify-content: flex-end; }
+    .hist { grid-template-columns: minmax(0, 1fr) auto; }
+    .hist .when, .hist .who { grid-column: 1 / -1; }
     .rail { width: auto; max-height: 34%; border-right: 0; border-bottom: 1px solid var(--border); }
     .page { padding: 18px 16px 40px; }
 }

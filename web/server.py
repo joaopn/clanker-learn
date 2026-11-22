@@ -438,7 +438,7 @@ def _mint_op_id(name: str, action: str) -> str:
 
 
 async def _lane_relay(request: web.Request, verb: str, args: dict,
-                      seed: str) -> web.Response:
+                      seed: str, started=None) -> web.Response:
     """Kick a broker verb that runs as an operation in a child and answers at once:
     mint an op_id, one synchronous broker call carrying it, return {ok, op_id}
     or the broker's refusal. The operation then lives in the broker's progress
@@ -469,6 +469,8 @@ async def _lane_relay(request: web.Request, verb: str, args: dict,
         return _unauthorized()
     if not reply.get("ok"):
         return web.json_response(reply, status=200)   # busy / validation / step-up → app error
+    if started is not None:
+        started(op_id, s["broker_token"])
     return web.json_response({"ok": True, "op_id": op_id})
 
 
@@ -511,12 +513,25 @@ async def broker_project_action_handler(request: web.Request) -> web.Response:
     if action not in PROJECT_ACTIONS:
         return _bad_request() if _broker_session(request) else _unauthorized()
     args = {"name": name}
-    if action == "destroy":
-        body = await _json_body(request)
-        proof = body.get("proof") if body else None
-        if isinstance(proof, str):
-            args["proof"] = proof
-    return await _lane_relay(request, action, args, name)
+    if action != "destroy":
+        return await _lane_relay(request, action, args, name)
+    body = await _json_body(request)
+    proof = body.get("proof") if body else None
+    if isinstance(proof, str):
+        args["proof"] = proof
+    forget = bool(body.get("forget") is True) if body else False
+    # The project's creation time, read before it goes: the tutor service names a project by
+    # its name and that time. Without it (no such project) nothing is told after the destroy.
+    status, reply = await _relay(request, "status", {"name": name})
+    if status == 401:
+        return _unauthorized()
+    result = (reply.get("result") or {}) if status == 200 and reply.get("ok") else {}
+    created = result.get("created") if result.get("name") == name else None
+
+    def started(op_id: str, broker_token: str) -> None:
+        if isinstance(created, str):
+            _watch_destroy(op_id, broker_token, name, created, forget)
+    return await _lane_relay(request, action, args, name, started)
 
 
 async def broker_project_agents_handler(request: web.Request) -> web.Response:
@@ -679,6 +694,11 @@ async def broker_op_status_handler(request: web.Request) -> web.Response:
     if not _OP_ID_RE.fullmatch(op_id):
         return _bad_request() if _broker_session(request) else _unauthorized()
     status, body = await _relay(request, "op", {"op_id": op_id})
+    result = body.get("result") if status == 200 and body.get("ok") else None
+    if isinstance(result, dict) and result.get("state") == "done" and op_id in _DESTROYS:
+        told = await _destroy_told(op_id)
+        if told is not None:
+            body = {**body, "result": {**result, "knowledge": told}}
     return web.json_response(body, status=status)
 
 
@@ -1325,9 +1345,18 @@ async def _tutor_gate(request: web.Request) -> web.Response | None:
 async def _tutor_call(method: str, path: str, *, query=None, body: dict | None = None) -> web.Response:
     """One call to the tutor service, its answer passed back with its status and JSON body.
     The service down, absent, or refusing the secret is the contract's 502."""
+    got = await _tutor_fetch(method, path, query=query, body=body)
+    if got is None:
+        return _tutor_unavailable()
+    return web.json_response(got[1], status=got[0])
+
+
+async def _tutor_fetch(method: str, path: str, *, query=None, body: dict | None = None) -> tuple[int, dict] | None:
+    """One call to the tutor service: (status, its JSON answer), or None when it is down,
+    absent, or refuses the secret."""
     secret = _tutor_secret()
     if secret is None:
-        return _tutor_unavailable()
+        return None
     url = TUTOR_URL.with_path(path).with_query(query or {})
     timeout = ClientTimeout(total=TUTOR_CALL_TIMEOUT_S, sock_connect=PASSTHROUGH_CONNECT_TIMEOUT_S)
     try:
@@ -1338,17 +1367,17 @@ async def _tutor_call(method: str, path: str, *, query=None, body: dict | None =
             text = await upstream.text()
     except Exception as e:  # noqa: BLE001 - whatever went wrong on the way, the service is not there
         log.info(f"tutor service: {method} {path} failed: {type(e).__name__}")
-        return _tutor_unavailable()
+        return None
     if status == 401:
         # The service does not take this server's secret: nothing the browser can mend, and
         # not the login's 401 either.
         log.warning("tutor service: the shared secret was refused")
-        return _tutor_unavailable()
+        return None
     try:
         answer = json.loads(text)
     except ValueError:
-        return _tutor_unavailable()
-    return web.json_response(answer, status=status)
+        return None
+    return (status, answer) if isinstance(answer, dict) else None
 
 
 async def _tutor_body(request: web.Request) -> dict | None | web.Response:
@@ -1362,7 +1391,8 @@ async def _tutor_body(request: web.Request) -> dict | None | web.Response:
 
 async def tutor_project_lessons_handler(request: web.Request) -> web.Response:
     """GET|POST /broker/tutor/project/{name}/lessons — a project's lessons, and a new one
-    ({title, objective}); GET /broker/tutor/project/{name}/plan — its plan. The project is
+    ({title, objective}); GET /broker/tutor/project/{name}/plan — its plan; GET
+    /broker/tutor/project/{name}/insights[?all=1] — its insights. The project is
     named upstream by the name and the creation time of the broker's `status`, never by what
     the browser sends; an unknown project is the broker's refusal, answered as the project
     routes answer it."""
@@ -1381,6 +1411,12 @@ async def tutor_project_lessons_handler(request: web.Request) -> web.Response:
     project, created = result.get("name"), result.get("created")
     if not isinstance(project, str) or not isinstance(created, str):
         return web.json_response({"ok": False, "error": {"kind": "failed"}}, status=500)
+    if request.method == "GET" and request.path.endswith("/insights"):
+        # The project's insights (with `all=1`, the retired ones too).
+        query = {"kind": "insight", "project": project, "created": created}
+        if request.rel_url.query.get("all") == "1":
+            query["all"] = "1"
+        return await _tutor_call("GET", "/knowledge/records", query=query)
     if request.method == "GET":
         what = "/plan" if request.path.endswith("/plan") else "/lessons"
         return await _tutor_call("GET", what, query={"project": project, "created": created})
@@ -1388,9 +1424,15 @@ async def tutor_project_lessons_handler(request: web.Request) -> web.Response:
                                                         "project": project, "created": created})
 
 
+# A project is named upstream only by the routes under /broker/tutor/project/{name}/, from the
+# broker's status: these keys are taken out of what the other routes forward.
+_TUTOR_PROJECT_KEYS = ("project", "created")
+
+
 def _tutor_route(template: str):
     """A handler forwarding a route of the contract as it is: `template` is the upstream path,
-    with `{id}` filled from the request's path after the id is checked."""
+    with `{id}` filled from the request's path after the id is checked. A project named in the
+    query or the body is left out (_TUTOR_PROJECT_KEYS)."""
     async def handler(request: web.Request) -> web.Response:
         refused = await _tutor_gate(request)
         if refused is not None:
@@ -1400,13 +1442,16 @@ def _tutor_route(template: str):
             ident = request.match_info.get("id", "")
             if not _TUTOR_ID_RE.fullmatch(ident):
                 return web.json_response(
-                    {"ok": False, "error": {"kind": "not_found", "message": "There is no such lesson or run."}},
+                    {"ok": False, "error": {"kind": "not_found", "message": "There is nothing with that id."}},
                     status=404)
             path = template.replace("{id}", ident)
         body = await _tutor_body(request)
         if isinstance(body, web.Response):
             return body
-        return await _tutor_call(request.method, path, query=request.rel_url.query, body=body)
+        if body is not None:
+            body = {k: v for k, v in body.items() if k not in _TUTOR_PROJECT_KEYS}
+        query = {k: v for k, v in request.rel_url.query.items() if k not in _TUTOR_PROJECT_KEYS}
+        return await _tutor_call(request.method, path, query=query, body=body)
     return handler
 
 
@@ -1471,6 +1516,76 @@ async def tutor_stream_handler(request: web.Request) -> web.StreamResponse:
         finally:
             upstream.close()   # the connection, not returned to the pool: upstream sees the close
             await req_ctx.__aexit__(None, None, None)
+
+
+# ---- a destroyed project, told to the tutor service ------------------------------------
+#
+# The broker runs a destroy as an operation in a child and answers at once. Once that
+# operation is done (the broker's `op`, asked with the login's token as the page asks it), this
+# server tells the tutor service the project is gone, with the creation time read from its
+# status before the destroy and the learner's choice to forget what was learned there. A
+# failure here leaves the destroy as it is: it is logged, and the operation's status says it
+# (`knowledge`) to a page that follows it.
+
+DESTROY_POLL_S = 1.0
+DESTROY_WATCH_S = 3600          # a destroy not over in an hour is not waited for
+TUTOR_REMOVED_TRIES = 40        # the tutor still answering in the project ("busy"), or away
+TUTOR_REMOVED_RETRY_S = 3.0
+_DESTROYS: dict[str, asyncio.Task] = {}   # op_id -> the task that tells the tutor service
+
+
+def _watch_destroy(op_id: str, broker_token: str, project: str, created: str, forget: bool) -> None:
+    loop = asyncio.get_running_loop()
+    task = loop.create_task(_after_destroy(op_id, broker_token, project, created, forget))
+    _DESTROYS[op_id] = task
+    task.add_done_callback(lambda _t: loop.call_later(DESTROY_WATCH_S, _DESTROYS.pop, op_id, None))
+
+
+async def _after_destroy(op_id: str, broker_token: str, project: str, created: str, forget: bool) -> dict | None:
+    """Wait for the destroy to end; when it is done, tell the tutor service. Returns what the
+    page is told ({told: true, forgotten} or {told: false, message}), or None when the destroy
+    did not happen (failed: the project is still there)."""
+    deadline = time.monotonic() + DESTROY_WATCH_S
+    while True:
+        try:
+            reply = await broker_call("op", {"op_id": op_id}, token=broker_token)
+        except (BrokerUnavailable, BrokerForbidden):
+            reply = {}
+        state = (reply.get("result") or {}).get("state") if reply.get("ok") else None
+        if state == "done":
+            break
+        if state == "failed":
+            return None
+        if not reply.get("ok") and (reply.get("error") or {}).get("kind") == "unauthorized" or time.monotonic() > deadline:
+            log.warning(f"destroy of {project}: its end was not seen; the tutor service is not told")
+            return {"told": False, "message": "The end of the destroy was not seen, so the tutor was not told the project is gone."}
+        await asyncio.sleep(DESTROY_POLL_S)
+    message = "The tutor service did not answer."
+    for _ in range(TUTOR_REMOVED_TRIES):
+        got = await _tutor_fetch("POST", "/projects/removed", body={"project": project, "created": created, "forget": forget})
+        if got is not None and got[1].get("ok"):
+            log.info(f"destroy of {project}: the tutor service is told ({'forgotten' if forget else 'kept'})")
+            return {"told": True, "forgotten": forget}
+        if got is not None:
+            error = got[1].get("error") or {}
+            message = str(error.get("message") or error.get("kind") or "refused")
+            if error.get("kind") != "busy":
+                break
+        await asyncio.sleep(TUTOR_REMOVED_RETRY_S)
+    log.warning(f"destroy of {project}: the tutor service was not told: {message}")
+    return {"told": False, "message": f"The tutor service was not told the project is gone: {message}"}
+
+
+async def _destroy_told(op_id: str) -> dict | None:
+    """What the tutor service was told after this destroy, once the operation is done: waited
+    for a little (the call follows the operation's end), None when this server is not telling."""
+    task = _DESTROYS.get(op_id)
+    if task is None:
+        return None
+    await asyncio.wait({task}, timeout=20)
+    if not task.done() or task.cancelled() or task.exception() is not None:
+        return {"told": False, "message": "The tutor service is still being told the project is gone."}
+    return task.result()
 
 
 # ---- the origin proxy: HTTP and WebSocket on every origin port ----------------------
@@ -1980,6 +2095,32 @@ def build_app() -> web.Application:
     app.router.add_get("/broker/tutor/instructions", instructions)
     app.router.add_put("/broker/tutor/instructions", instructions)
     app.router.add_post("/broker/tutor/instructions/reset", _tutor_route("/instructions/reset"))
+    # The knowledge base: the brief, the records, the global proposals, the lessons done, the
+    # change log with undo; a project's insights; the cards of a conversation. (POST
+    # /projects/removed is this server's own call after a destroy, never the browser's.)
+    app.router.add_get("/broker/tutor/project/{name}/insights", tutor_project_lessons_handler)
+    app.router.add_get("/broker/tutor/knowledge/brief", _tutor_route("/knowledge/brief"))
+    records = _tutor_route("/knowledge/records")
+    app.router.add_get("/broker/tutor/knowledge/records", records)
+    app.router.add_post("/broker/tutor/knowledge/records", records)
+    record = _tutor_route("/knowledge/records/{id}")
+    app.router.add_get("/broker/tutor/knowledge/records/{id}", record)
+    app.router.add_patch("/broker/tutor/knowledge/records/{id}", record)
+    app.router.add_delete("/broker/tutor/knowledge/records/{id}", record)
+    app.router.add_put("/broker/tutor/knowledge/background", _tutor_route("/knowledge/background"))
+    app.router.add_get("/broker/tutor/knowledge/evidence/{id}", _tutor_route("/knowledge/evidence/{id}"))
+    app.router.add_get("/broker/tutor/knowledge/proposals", _tutor_route("/knowledge/proposals"))
+    proposal = _tutor_route("/knowledge/proposals/{id}")
+    app.router.add_get("/broker/tutor/knowledge/proposals/{id}", proposal)
+    app.router.add_patch("/broker/tutor/knowledge/proposals/{id}", proposal)
+    app.router.add_post("/broker/tutor/knowledge/proposals/{id}/approve", _tutor_route("/knowledge/proposals/{id}/approve"))
+    app.router.add_post("/broker/tutor/knowledge/proposals/{id}/dismiss", _tutor_route("/knowledge/proposals/{id}/dismiss"))
+    app.router.add_get("/broker/tutor/knowledge/lessons", _tutor_route("/knowledge/lessons"))
+    app.router.add_get("/broker/tutor/knowledge/changes", _tutor_route("/knowledge/changes"))
+    app.router.add_post("/broker/tutor/knowledge/changes/{id}/undo", _tutor_route("/knowledge/changes/{id}/undo"))
+    app.router.add_get("/broker/tutor/cards/{id}", _tutor_route("/cards/{id}"))
+    app.router.add_post("/broker/tutor/cards/{id}/check", _tutor_route("/cards/{id}/check"))
+    app.router.add_post("/broker/tutor/cards/{id}/answer", _tutor_route("/cards/{id}/answer"))
     return app
 
 

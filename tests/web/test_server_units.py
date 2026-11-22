@@ -540,7 +540,7 @@ def test_a_create_hands_the_broker_its_fields_the_token_and_the_op_id_it_returns
                                    headers=with_session(client))
         return answer.status, await answer.json()
     status, said = served(test)
-    (verb, args, token, op_id), = fake.calls
+    (verb, args, token, op_id), = [call for call in fake.calls if call[0] != "status"]   # a destroy reads the status first
     assert status == 200 and said == {"ok": True, "op_id": op_id}
     assert (verb, args, token) == ("create", {"name": "p1", "memory": "1g", "pids": 200, "cpus": "1.5"}, BROKER_TOKEN)
     assert broker.checked_op_id(op_id) == op_id and op_id.startswith("p1-create-")
@@ -601,7 +601,7 @@ def test_each_action_reaches_the_broker_under_its_own_verb_with_an_op_id(fake, a
                                    headers=with_session(client))
         return answer.status, await answer.json()
     status, said = served(test)
-    (verb, args, token, op_id), = fake.calls
+    (verb, args, token, op_id), = [call for call in fake.calls if call[0] != "status"]   # a destroy reads the status first
     assert status == 200 and said == {"ok": True, "op_id": op_id}
     assert (verb, token) == (action, BROKER_TOKEN) and broker.checked_op_id(op_id).startswith(f"p1-{action}-")
     assert args == ({"name": "p1", "proof": RIGHT_PROOF} if action == "destroy" else {"name": "p1"})
@@ -611,7 +611,7 @@ def test_a_destroy_without_a_proof_is_handed_on_without_one(fake):
     async def test(client):
         answer = await client.post("/broker/project/p1/destroy", data="not json", headers=with_session(client))
         return answer.status
-    assert served(test) == 200 and fake.calls[0][:2] == ("destroy", {"name": "p1"})
+    assert served(test) == 200 and fake.calls[-1][:2] == ("destroy", {"name": "p1"})
 
 
 @pytest.mark.parametrize("action", ["frob", "list", "create", "limit", "status", "Start", "login", "first_password"])

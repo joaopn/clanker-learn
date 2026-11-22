@@ -60,7 +60,7 @@ function h(tag, attrs, ...kids) {
         else if (k.startsWith("on")) e.addEventListener(k.slice(2), v);
         else e.setAttribute(k, v === true ? "" : String(v));
     }
-    for (const kid of kids.flat()) {
+    for (const kid of kids.flat(Infinity)) {
         if (kid === null || kid === undefined || kid === false) continue;
         e.append(kid instanceof Node ? kid : String(kid));
     }
@@ -69,7 +69,7 @@ function h(tag, attrs, ...kids) {
 
 const enc = encodeURIComponent;
 // replaceChildren without the null and false entries (which it would write as text).
-const fill = (el, ...kids) => el.replaceChildren(...kids.flat().filter((k) => k !== null && k !== undefined && k !== false));
+const fill = (el, ...kids) => el.replaceChildren(...kids.flat(Infinity).filter((k) => k !== null && k !== undefined && k !== false));
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const projectPath = (name, tail) => `/broker/project/${enc(name)}${tail || ""}`;
 
@@ -83,7 +83,7 @@ function toast(text, bad) {
 }
 
 function loadLayout() {
-    const none = { project: null, tab: null, page: null, lessons: {}, columns: {}, expanded: [] };
+    const none = { project: null, tab: null, page: null, kbView: null, lessons: {}, columns: {}, expanded: [] };
     try {
         const v = JSON.parse(localStorage.getItem(LAYOUT_KEY) || "{}");
         const lessons = {};
@@ -105,7 +105,8 @@ function loadLayout() {
         }
         return { project: typeof v.project === "string" ? v.project : null,
                  tab: typeof v.tab === "string" ? v.tab : null,
-                 page: v.page === "settings" ? "settings" : null,
+                 page: v.page === "settings" || v.page === "knowledge" ? v.page : null,
+                 kbView: typeof v.kbView === "string" && v.kbView.length <= 300 ? v.kbView : null,
                  lessons, columns,
                  expanded: Array.isArray(v.expanded) ? v.expanded.filter((x) => typeof x === "string") : [] };
     } catch (_) {
@@ -115,7 +116,7 @@ function loadLayout() {
 
 function saveLayout() {
     try {
-        localStorage.setItem(LAYOUT_KEY, JSON.stringify({ project: S.current, tab: S.current ? tabOf(S.current) : null, page: S.page,
+        localStorage.setItem(LAYOUT_KEY, JSON.stringify({ project: S.current, tab: S.current ? tabOf(S.current) : null, page: S.page, kbView: S.kb.view,
                                                          lessons: S.lessonOf, expanded: [...S.expanded], columns: S.cols }));
     } catch (_) { /* no storage: the page works without it */ }
 }
@@ -178,7 +179,9 @@ const S = {
     panes: {},             // "project|tab" -> pane record
     timers: [],
     shell: null,           // the app's fixed elements once logged in
-    page: null,            // "settings" while Settings is shown in place of a project
+    page: null,            // "settings" or "knowledge" while that page is shown in place of a project
+    kb: { view: "brief", raw: false, showRetired: false, q: "", seq: 0, changes: null, next: null, navData: null },   // the Knowledge page
+    kbOpen: 0,             // global insights proposed by a tutor that wait for the learner (the dot)
     software: null,        // Settings -> Software: the broker's rows, as last read
     softwareError: null,
     builds: {},            // a build in flight: target ("agent:claude" | "editor") -> {opId, verb}
@@ -345,19 +348,22 @@ function enterApp(projects) {
     const panes = h("div", { class: "panes" });
     const empty = h("div", { class: "pane page" });
     const settings = makeSettingsPane();
-    panes.append(empty, settings.el);
+    const knowledge = makeKnowledgePane();
+    panes.append(empty, settings.el, knowledge.el);
     document.getElementById("app").replaceChildren(h("div", { class: "shell" },
         h("nav", { class: "rail" },
             h("div", { class: "rail-head" }, h("span", {}, "PROJECTS")),
             rail,
             h("div", { class: "rail-foot" },
                 h("button", { class: "foot", onclick: newProjectDialog }, "+ New project"),
+                h("button", { class: "foot knowledge-btn", onclick: () => showKnowledge() }, h("span", {}, "◆ Knowledge"), h("span", { class: "kdot", hidden: true })),
                 h("button", { class: "foot settings-btn", onclick: showSettings }, "⚙ Settings"),
                 h("button", { class: "foot", onclick: logout }, "Log out"))),
         h("div", { class: "main" }, tabbar, panes)));
-    S.shell = { rail, tabbar, panes, empty, settings };
+    S.shell = { rail, tabbar, panes, empty, settings, knowledge };
     const layout = loadLayout();
     S.page = layout.page;
+    if (layout.kbView) S.kb.view = layout.kbView;
     S.lessonOf = layout.lessons;
     S.cols = layout.columns;
     for (const [p, c] of Object.entries(S.cols)) if (c.focus && p !== layout.project) S.tabs[p] = c.focus;
@@ -379,6 +385,7 @@ function enterApp(projects) {
     refreshProjects();
     if (S.current) refreshServices(S.current);
     if (S.page === "settings") { refreshSoftware(); refreshTutorSettings(); }
+    if (S.page === "knowledge") renderKnowledge();
     seedBuilds();
     render();
 }
@@ -394,7 +401,8 @@ function teardownApp() {
                        page: null, software: null, softwareError: null, builds: {}, checking: new Set(), models: null,
                        expanded: new Set(), lessons: {}, lessonOf: {}, activity: new Set(), tutorError: null,
                        tutorSettings: null, tutorSettingsError: null, filesOrigins: new Map(), editorFile: {},
-                       cols: {}, tabLayout: null, dragging: false, renderPending: false });
+                       cols: {}, tabLayout: null, dragging: false, renderPending: false,
+                       kb: { view: "brief", raw: false, showRetired: false, q: "", seq: 0, changes: null, next: null, navData: null }, kbOpen: 0 });
 }
 
 async function refreshProjects() {
@@ -489,6 +497,7 @@ function renderRail() {
     if (S.listError) rows.push(h("div", { class: "none bad" }, S.listError));
     S.shell.rail.replaceChildren(...rows);
     S.shell.rail.parentNode.querySelector(".settings-btn").classList.toggle("sel", S.page === "settings");
+    renderKbFoot();
 }
 
 function selectProject(name) {
@@ -523,6 +532,7 @@ function tabsOf(name) {
         const [project, id] = key.split("|");
         if (project === name && pane.kind === "web" && !rows[id]) tabs.push({ id, label: pane.label, type: "other", gone: true });
     }
+    tabs.push({ id: "insights", label: "Insights", type: "kb" });
     return { tabs, raw };
 }
 
@@ -535,6 +545,7 @@ function renderTabbar() {
     const name = S.current;
     bar.classList.remove("cols");
     if (S.page === "settings") { S.tabLayout = null; bar.replaceChildren(h("div", { class: "tb projchip" }, "Settings")); return; }
+    if (S.page === "knowledge") { S.tabLayout = null; bar.replaceChildren(h("div", { class: "tb projchip" }, "Knowledge")); return; }
     if (!name) { S.tabLayout = null; bar.replaceChildren(h("div", { class: "tb projchip" }, "clanker-learn")); return; }
     const { tabs, raw } = tabsOf(name);
     tabs.push({ id: "ports", label: "Ports", type: "ports" });
@@ -578,11 +589,12 @@ function makeTab(name, t, col, on) {
     const url = pane && pane.url;
     const tab = h("div", { class: `tb t-${t.type}` + (on ? " on" : "") + (t.gone ? " gone" : ""), "data-tab": t.id, "data-column": String(col),
                            title: t.gone ? "This app no longer listens in the sandbox" : t.type === "lesson" ? "the lesson's conversation with the tutor"
+                               : t.type === "kb" ? "what this project's tutor has learned about how you learn"
                                : t.type === "ports" ? null : (t.row ? `port ${t.row.default_port} of the sandbox` : "a terminal in the sandbox"),
                            // consumeTabDragClick swallows the one click the browser makes on the tab after a drag.
                            onclick: () => { if (!consumeTabDragClick()) showTab(name, t.id); } },
         h("span", { class: "tl" }, t.label),
-        t.type !== "cli" && t.type !== "ports" && url ? h("a", { class: "newtab", href: url, target: "_blank", rel: "noopener noreferrer",
+        t.type !== "cli" && t.type !== "ports" && t.type !== "kb" && url ? h("a", { class: "newtab", href: url, target: "_blank", rel: "noopener noreferrer",
                                                                   title: "Open in a new browser tab", onclick: (ev) => ev.stopPropagation() }, "↗") : null);
     armTabDrag(tab, name, t.id);
     return tab;
@@ -607,6 +619,7 @@ function ensurePane(name, id) {
     if (pane) return pane;
     if (id === "shell") pane = makeShellPane(name);
     else if (id === "ports") pane = makePortsPane(name);
+    else if (id === "insights") pane = makeInsightsPane(name);
     else if (lessonTabId(id)) pane = makeLessonPane(name, lessonTabId(id));
     else {
         const row = (S.services[name] || {})[id];
@@ -632,6 +645,8 @@ function showPane() {
     const multi = !!L && L.columns.length > 1 && !narrowScreen();
     if (S.page === "settings") {
         shown.push({ el: S.shell.settings.el, col: 0 });
+    } else if (S.page === "knowledge") {
+        shown.push({ el: S.shell.knowledge.el, col: 0 });
     } else if (!name) {
         empty.replaceChildren(h("div", { class: "page-inner" }, h("h1", {}, "No project shown"),
             h("p", { class: "sub" }, S.projects.length ? "Pick a project on the left." : "Make one with “+ New project” on the left.")));
@@ -1485,6 +1500,7 @@ async function refreshTutor() {
         S.activity = new Set();
     }
     await Promise.all([...S.expanded].filter((n) => projectRow(n)).map(refreshLessons));
+    await refreshKbOpen();
     renderRail();
 }
 
@@ -2245,7 +2261,12 @@ const TOOL_WORDS = { shell: "ran", read: "read", write: "wrote", edit: "edited",
 // label, and what it gave when opened.
 // The tutor's own tools (kind "learn"), in plain words.
 const LEARN_WORDS = { plan_get: "looked at the plan", lesson_get: "looked at the lesson", lesson_history: "read the lessons done so far",
-                      lesson_close: "closed the lesson", plan_propose: "proposed a study plan", plan_change_propose: "proposed a change to the plan" };
+                      lesson_close: "closed the lesson", plan_propose: "proposed a study plan", plan_change_propose: "proposed a change to the plan",
+                      brief_get: "read the brief", records_search: "searched what it knows about you",
+                      insight_record: "recorded an insight", insight_replace: "replaced an insight", insight_retire: "retired an insight",
+                      preference_record: "recorded a preference", goal_record: "recorded a goal",
+                      global_insight_propose: "proposed a global insight", exercise_define: "set an exercise",
+                      exercise_check: "ran the exercise's check", quiz_ask: "asked a quick question", answer_grade: "graded your answer" };
 
 // What was sent to a "learn" tool, readable: its JSON arguments indented, or as they came.
 function learnDetail(detail) {
@@ -2489,6 +2510,112 @@ function proposalCard(name, p) {
     return card;
 }
 
+// ---- an exercise and a quick question (the mock's exercise and quiz blocks) ------------------
+//
+// The tutor sets them; the learner acts on them in place. A check runs the exercise's command in
+// the sandbox (up to half a minute); an answer is one of the options. When no answer is being
+// written the action goes to the tutor as a message of its own, written by the system; while one
+// is, the card changes at once and the tutor is told with the learner's next message.
+
+// "I ran the check of …" as the learner sees it: what happened, not words they typed.
+const composedWords = (text) => String(text || "").replace(/^I /, "You ");
+const LETTERS = "ABCDEFGH";
+const letterOf = (i) => (Number.isInteger(i) && i >= 0 && i < LETTERS.length ? LETTERS[i] : String(i));
+
+// What the learner did on a card, sent: the card as it is now, and the message that followed (or
+// the line saying the tutor hears of it with the next message).
+async function cardAction(c, what, body, host, said) {
+    const asMessage = !host.busy();
+    const r = await tutorApi("POST", `/cards/${enc(c.id)}/${what}`, { ...body, as_message: asMessage });
+    const res = r.body.ok && r.body.result;
+    if (!res || !res.card) { said.className = "card-said bad"; said.textContent = errText(r.body); said.hidden = false; return null; }
+    if (res.sent) { said.hidden = true; host.begun(res.sent); }
+    else { said.className = "card-said note"; said.textContent = "The tutor is told with your next message."; said.hidden = false; }
+    return res.card;
+}
+
+function exerciseCard(name, c, host) {
+    const w = { c: null, busy: false };
+    const el = h("div", { class: "blk exercise" });
+    const said = h("div", { class: "card-said", hidden: true });
+    w.el = el;
+    const draw = () => {
+        const x = w.c;
+        const last = x.last_check && typeof x.last_check === "object" ? x.last_check : null;
+        const check = x.check && typeof x.check === "object" ? x.check : {};
+        const state = x.state === "passed" ? h("span", { class: "bh-state okc" }, "✓ passed")
+            : x.state === "failed" ? h("span", { class: "bh-state badc" }, last && last.timed_out ? "✗ did not finish in time" : "✗ failed")
+            : h("span", { class: "bh-state" }, "not checked yet");
+        const btn = h("button", { class: "primary", disabled: w.busy, onclick: async () => {
+            w.busy = true;
+            draw();
+            const card = await cardAction(w.c, "check", {}, host, said);
+            w.busy = false;
+            if (card) w.c = card;
+            draw();
+        } }, w.busy ? "Checking… (up to half a minute)" : x.state === "unchecked" ? "Check" : "Check again");
+        const result = last ? h("details", { class: "ex-result", open: x.state === "failed" },
+            h("summary", {}, `Last check, by ${last.by === "learner" ? "you" : "the tutor"}, ${fmtWhen(last.at)}: `,
+                last.timed_out ? "it did not finish in time" : `exit ${last.exit_code}`, Number.isFinite(last.seconds) ? ` · ${last.seconds} s` : null),
+            h("pre", {}, String(last.output || "").trim() ? String(last.output) : "(no output)"),
+            last.output_cut ? h("div", { class: "note" }, "Only the end of the output is kept.") : null) : null;
+        fill(el,
+            h("div", { class: "blk-head" }, h("span", { class: "bh-title" }, "◎ ", String(x.title || "Exercise")), state),
+            h("ol", { class: "ex-steps" }, (Array.isArray(x.steps) ? x.steps : []).map((st) => h("li", { class: "md" }, mdRender(String(st), { project: name, blocks: null })))),
+            h("div", { class: "ex-check" }, "Check: ", h("code", {}, String(check.command || "")),
+                Number.isInteger(check.expect_exit) && check.expect_exit !== 0 ? ` (passes with exit ${check.expect_exit})` : null),
+            result,
+            h("div", { class: "blk-foot" }, h("span", { class: "grow" }, "The check runs in your sandbox; what it gives back is kept."), btn),
+            said);
+    };
+    w.update = (c2) => { w.c = c2; if (!w.busy) draw(); };
+    w.update(c);
+    return w;
+}
+
+function questionCard(name, c, host) {
+    const w = { c: null, picked: null, busy: false };
+    const el = h("div", { class: "blk quiz" });
+    const said = h("div", { class: "card-said", hidden: true });
+    w.el = el;
+    const draw = () => {
+        const x = w.c;
+        const answered = x.state === "answered" && x.answer && typeof x.answer === "object";
+        const choice = answered ? x.answer.choice : w.picked;
+        const rightAt = answered ? x.right_choice : null;
+        const options = (Array.isArray(x.options) ? x.options : []).map((o, i) => {
+            let cls = "qopt";
+            if (choice === i) cls += " picked";
+            if (answered) cls += i === rightAt ? " right" : i === choice ? " wrong" : "";
+            return h("button", { class: cls, type: "button", disabled: answered || w.busy, onclick: () => { w.picked = i; draw(); } },
+                h("span", { class: "qdot" }), h("span", { class: "qletter" }, letterOf(i)), h("span", { class: "qtext" }, String(o)));
+        });
+        const go = h("button", { class: "primary", disabled: w.picked === null || w.busy, onclick: async () => {
+            w.busy = true;
+            draw();
+            const card = await cardAction(w.c, "answer", { choice: w.picked }, host, said);
+            w.busy = false;
+            if (card) w.c = card;
+            draw();
+        } }, w.busy ? "Sending…" : "Answer");
+        const foot = answered
+            ? h("div", { class: "blk-foot qfoot" }, h("div", { class: `grow ${x.answer.right ? "okc" : "badc"}` },
+                x.answer.right ? "✓ Right." : `✗ Not quite: the right answer is ${letterOf(rightAt)}.`),
+                typeof x.explanation === "string" && x.explanation.trim()
+                    ? h("div", { class: "qexpl md" }, mdRender(x.explanation, { project: name, blocks: null })) : null)
+            : h("div", { class: "blk-foot" }, h("span", { class: "grow" }, "Your answer is kept, right or wrong."), go);
+        fill(el,
+            h("div", { class: "blk-head" }, h("span", { class: "bh-title" }, "? Quick question"),
+                h("span", { class: "bh-state" + (answered ? (x.answer.right ? " okc" : " badc") : "") },
+                    answered ? (x.answer.right ? "✓ answered right" : "✗ answered wrong") : "waiting for your answer")),
+            h("div", { class: "qq md" }, mdRender(String(x.question || ""), { project: name, blocks: null })),
+            h("div", { class: "qopts" }, options), foot, said);
+    };
+    w.update = (c2) => { w.c = c2; if (!w.busy) draw(); };
+    w.update(c);
+    return w;
+}
+
 function makeLessonPane(name, id) {
     const titleEl = h("span", { class: "lt" }, lessonTitle(name, id));
     const objEl = h("span", { class: "lo" });
@@ -2513,6 +2640,19 @@ function makeLessonPane(name, id) {
         let c = cards.get(p.id);
         if (c) c.update(p); else { c = proposalCard(name, p); cards.set(p.id, c); }
         return c;
+    };
+    // An exercise or a quick question, by its id: one card each, updated in place.
+    const tasks = new Map();
+    const host = {
+        busy: () => !!(pane.turn || pane.sending),
+        // The action sent as a message of its own: shown, and its answer followed.
+        begun: (sent) => { if (sent && sent.run && typeof sent.run.id === "string" && !pane.turn) begun(sent); },
+    };
+    const taskOf = (c) => {
+        if (!c || typeof c !== "object" || typeof c.id !== "string" || (c.kind !== "exercise" && c.kind !== "question")) return null;
+        let w = tasks.get(c.id);
+        if (w) w.update(c); else { w = c.kind === "exercise" ? exerciseCard(name, c, host) : questionCard(name, c, host); tasks.set(c.id, w); }
+        return w;
     };
     summaryBtn.addEventListener("click", () => {
         const l = pane.lesson;
@@ -2594,8 +2734,16 @@ function makeLessonPane(name, id) {
             const c = cardOf(p);
             if (c) cardsEl.append(c.el);
         }
+        for (const c of (Array.isArray(m.cards) ? m.cards : [])) {
+            const w = taskOf(c);
+            if (w) cardsEl.append(w.el);
+        }
         cardsEl.hidden = !cardsEl.childElementCount;
-        if (you) body.textContent = String(m.text || "");
+        // A message the system wrote for the learner (a card's check or answer sent as a
+        // message): what happened, in a quiet line in their place, not as typed words.
+        const composed = you && m.composed === true;
+        if (composed) body.textContent = composedWords(m.text);
+        else if (you) body.textContent = String(m.text || "");
         else body.append(mdRender(String(m.text || ""), { project: name, blocks: blocks || null }));
         // A stretch of the answer with no text (only tools, or a card) has no empty text box.
         body.hidden = !you && !String(m.text || "").trim();
@@ -2603,7 +2751,8 @@ function makeLessonPane(name, id) {
         // proposal's outcome): not theirs, so only behind a quiet line that opens.
         const told = you && typeof m.context === "string" && m.context.trim()
             ? h("details", { class: "told" }, h("summary", {}, "what the tutor was told"), h("pre", {}, m.context)) : null;
-        const el = h("div", { class: `msg ${you ? "you" : "tutor"}`, "data-run": m.run_id === undefined || m.run_id === null ? null : String(m.run_id) },
+        if (composed) body.className = "body composed-line";
+        const el = h("div", { class: `msg ${you ? "you" : "tutor"}${composed ? " composed" : ""}`, "data-run": m.run_id === undefined || m.run_id === null ? null : String(m.run_id) },
             h("div", { class: "av" }, you ? "Y" : "T"),
             // The tools a stretch of the answer used come after its text, as they were run; its cards after them.
             h("div", { class: "mc" }, h("div", { class: "who" }, you ? "You" : "Tutor"), body, told, traces, cardsEl));
@@ -2654,7 +2803,13 @@ function makeLessonPane(name, id) {
         if (row) row.running = null;
         setComposer();
         renderRail();
-        if (ended) refreshLessons(name);
+        if (ended) {
+            refreshLessons(name);
+            // The tutor may have recorded an insight: an Insights tab shown beside is read again.
+            const ip = S.panes[paneKey(name, "insights")];
+            if (ip) { ip.stale = true; if (!ip.el.hidden) ip.update(); }
+            if (S.page === "knowledge") { S.kb.changes = null; renderKnowledge(); }
+        }
     }
     function onEvent(turn, ev) {
         if (pane.turn !== turn || !Number.isInteger(ev.seq) || ev.seq <= turn.lastSeq) return;   // seen already
@@ -2666,6 +2821,14 @@ function makeLessonPane(name, id) {
                 // A card arrives while the answer is written; the message that follows holds it.
                 const c = cardOf(d.proposal);
                 if (c) { const draft = draftOf(turn); draft.cards.append(c.el); draft.cards.hidden = false; toBottom(); }
+                break;
+            }
+            case "exercise":
+            case "question": {
+                // Made, or changed (the tutor's check; the learner's action on it): a card shown
+                // already is updated where it is, a new one goes with the answer being written.
+                const w = taskOf(d.card);
+                if (w && !w.el.isConnected) { const draft = draftOf(turn); draft.cards.append(w.el); draft.cards.hidden = false; toBottom(); }
                 break;
             }
             case "text_delta":
@@ -2819,6 +2982,11 @@ function makeLessonPane(name, id) {
         }
         ta.value = "";
         tell("");
+        begun(res);
+    }
+
+    // A message stored and its answer started: shown, and the answer followed.
+    function begun(res) {
         const empty = emptyNote();
         if (empty) empty.remove();
         if (res.message) inner.append(messageEl(res.message).el);
@@ -2853,6 +3021,516 @@ function makeLessonPane(name, id) {
     pane.close = pane.hide;
     setComposer();
     pane.setLesson(lessonRow(name, id));
+    return pane;
+}
+
+// ---- the knowledge base: the Knowledge page and a project's Insights tab (the mock's) --------
+//
+// What every tutor knows about the learner (the brief: their background, goals, preferences,
+// the global insights they approved, the lessons done lately), the global insights tutors
+// propose, each project's insights, the lessons done, and every change with its undo. All of it
+// is the tutor service's records; the page only shows them and sends the learner's edits.
+
+const INSIGHT_KINDS = { misconception: "misconception", strength: "strength", worked: "what worked", did_not_work: "what did not work" };
+const INSIGHT_CLASS = { misconception: "k-bad", strength: "k-good", worked: "k-good", did_not_work: "k-warn" };
+const RECORD_WORDS = { goal: "a goal", preference: "a preference", background: "your background", insight: "an insight", global: "a global insight" };
+const CHANGE_WORDS = { add: "added", edit: "edited", delete: "deleted", replace: "replaced", retire: "retired", approve: "approved", undo: "undid a change to" };
+const KB_VIEWS = new Set(["brief", "global", "lessons", "history"]);
+const LINE_MAX = 500;
+const BACKGROUND_MAX = 4000;
+
+const kbKey = (project, created) => `p:${project}|${created}`;
+const removedMark = (x) => (x && x.project_removed ? " (removed)" : "");
+const whereWords = (x) => (x && x.project ? `${x.project}${removedMark(x)}` : "");
+const shortWhen = (s) => { const d = new Date(s); return s && !isNaN(d) ? d.toLocaleString([], { dateStyle: "short", timeStyle: "short" }) : String(s || ""); };
+const dayOf = (s) => (typeof s === "string" ? s.slice(0, 10) : "");
+const byWords = (by) => (by && by.who === "tutor" ? `the tutor in ${by.project || "a project"}` : "you");
+const kbList = (r, key) => (r.body.ok && r.body.result && Array.isArray(r.body.result[key]) ? r.body.result[key] : null);
+
+// What a record or a proposal rests on, in full: the evidence and the insights it cites.
+function evidenceEl(e) {
+    const d = e && e.data && typeof e.data === "object" ? e.data : {};
+    const where = [whereWords(e), dayOf(e.at)].filter(Boolean).join(" · ");
+    let what;
+    if (e.kind === "check") {
+        const words = d.timed_out ? "did not finish in time" : d.passed ? "passed" : "failed";
+        what = [h("span", {}, `A check of “${d.title || "an exercise"}”, run by ${d.by === "learner" ? "you" : "the tutor"}: `,
+                  h("span", { class: d.passed ? "okc" : "badc" }, words), d.exit_code === null || d.exit_code === undefined ? "" : ` (exit ${d.exit_code})`),
+                h("div", {}, h("code", {}, String(d.command || ""))),
+                String(d.output || "").trim() ? h("pre", { class: "ev-out" }, String(d.output)) : null];
+    } else if (e.kind === "quote") {
+        what = [h("span", { class: "quote" }, `Your words: “${d.sentence || ""}”`)];
+    } else if (e.kind === "answer" && d.how === "typed") {
+        what = [h("span", {}, `Your answer to “${d.question || ""}”: `), h("span", { class: "quote" }, `“${d.quote || ""}”`), " ",
+                h("span", { class: d.right ? "okc" : "badc" }, d.right ? "right" : "not right"), d.note ? h("div", { class: "note" }, String(d.note)) : null];
+    } else if (e.kind === "answer") {
+        what = [h("span", {}, `Your answer to “${d.question || ""}”: ${letterOf(d.choice)} “${d.choice_text || ""}”, `),
+                h("span", { class: d.right ? "okc" : "badc" }, d.right ? "right" : `wrong (the right one is ${letterOf(d.right_choice)})`)];
+    } else if (e.kind === "completion") {
+        what = [h("span", {}, `The lesson “${d.title || ""}” done: ${d.one_line || ""}`)];
+    } else {
+        what = [h("span", {}, String(e.kind || "evidence"))];
+    }
+    return h("div", { class: "evrow" }, h("div", {}, what), where ? h("div", { class: "when" }, where) : null);
+}
+
+function restsEl(detail) {
+    const ev = detail && Array.isArray(detail.evidence) ? detail.evidence : [];
+    const ins = detail && Array.isArray(detail.insights) ? detail.insights : [];
+    if (!ev.length && !ins.length) return h("div", { class: "note" }, "Nothing that is still kept.");
+    return h("div", {}, ev.map(evidenceEl), ins.map((r) => h("div", { class: "evrow" },
+        h("div", {}, r.insight_kind ? h("span", { class: `kindp ${INSIGHT_CLASS[r.insight_kind] || ""}` }, INSIGHT_KINDS[r.insight_kind] || r.insight_kind) : null, " ",
+            `The insight “${r.text}”`), h("div", { class: "when" }, whereWords(r)))));
+}
+
+// "What it rests on", read when it is opened (or at once, `open`).
+function restsOn(rec, open) {
+    const ro = rec.rests_on && typeof rec.rests_on === "object" ? rec.rests_on : {};
+    const n = (Array.isArray(ro.evidence) ? ro.evidence.length : 0) + (Array.isArray(ro.insights) ? ro.insights.length : 0);
+    if (!n) return null;
+    const box = h("div", { class: "rests-body" }, h("span", { class: "note" }, "Asking…"));
+    const d = h("details", { class: "rests" }, h("summary", {}, "what it rests on"), box);
+    let asked = false;
+    const ask = async () => {
+        if (!d.open || asked) return;
+        asked = true;
+        const r = await tutorApi("GET", `/knowledge/records/${enc(rec.id)}`);
+        const got = r.body.ok && r.body.result && r.body.result.record;
+        fill(box, got ? restsEl(got.rests_on_detail) : h("span", { class: "bad" }, errText(r.body)));
+    };
+    d.addEventListener("toggle", ask);
+    if (open) { d.open = true; ask(); }
+    return d;
+}
+
+// One record, to read, edit in place (its text; an insight's kind too) and delete. Every change
+// is in the History, where it can be undone.
+function recordRow(rec, opts) {
+    const o = opts || {};
+    const el = h("div", { class: "ins" + (rec.state === "retired" ? " retired" : "") });
+    const said = h("div", { class: "bad small", hidden: true });
+    const bad = (text) => { said.textContent = text; said.hidden = false; };
+    const kindEl = () => (rec.kind === "insight" || rec.insight_kind) && rec.insight_kind
+        ? h("span", { class: `kindp ${INSIGHT_CLASS[rec.insight_kind] || ""}` }, INSIGHT_KINDS[rec.insight_kind] || rec.insight_kind) : null;
+    const approved = rec.kind === "global" && !(rec.by && rec.by.who === "tutor") && rec.project;
+    const meta = () => [rec.by && rec.by.who === "tutor" ? `recorded by ${byWords(rec.by)}` : approved ? `approved by you, proposed in ${whereWords(rec)}` : "written by you",
+        o.withProject && rec.project && !approved && !(rec.by && rec.by.who === "tutor" && rec.by.project === rec.project && !rec.project_removed) ? `from ${whereWords(rec)}`
+            : rec.project_removed ? "from a removed project" : null,
+        dayOf(rec.updated_at || rec.created_at),
+        rec.state === "retired" ? (rec.replaced_by ? "replaced" : `retired${rec.reason ? `: ${rec.reason}` : ""}`) : null].filter(Boolean).join(" · ");
+    const show = () => {
+        const act = rec.state === "active" ? h("div", { class: "ins-act" },
+            h("button", { onclick: edit }, "Edit"),
+            h("button", { onclick: async (ev) => {
+                ev.target.disabled = true;
+                const r = await tutorApi("DELETE", `/knowledge/records/${enc(rec.id)}`);
+                if (!r.body.ok) { ev.target.disabled = false; bad(errText(r.body)); return; }
+                toast("Deleted. The History can undo it.");
+                if (o.onChanged) o.onChanged();
+            } }, "Delete")) : null;
+        fill(el, kindEl(), h("div", { class: "ins-main" }, h("div", { class: "ins-text" }, String(rec.text)), h("div", { class: "ins-ev" }, meta()),
+            restsOn(rec, o.openRests), said), act);
+    };
+    const edit = () => {
+        const text = h("textarea", { class: "kb-edit", rows: 2, maxlength: LINE_MAX, "aria-label": "The text" });
+        text.value = String(rec.text);
+        const kind = rec.kind === "insight" ? h("select", { "aria-label": "Its kind" },
+            Object.entries(INSIGHT_KINDS).map(([k, v]) => h("option", { value: k, selected: rec.insight_kind === k }, v))) : null;
+        const save = h("button", { class: "primary", onclick: async () => {
+            const body = {};
+            if (text.value.trim() !== String(rec.text)) body.text = text.value;
+            if (kind && kind.value !== rec.insight_kind) body.insight_kind = kind.value;
+            if (!Object.keys(body).length) { show(); return; }
+            save.disabled = true;
+            const r = await tutorApi("PATCH", `/knowledge/records/${enc(rec.id)}`, body);
+            save.disabled = false;
+            if (!r.body.ok) { bad(errText(r.body)); return; }
+            if (o.onChanged) o.onChanged(); else { Object.assign(rec, r.body.result.record); show(); }
+        } }, "Save");
+        fill(el, h("div", { class: "ins-main" }, text, kind ? h("div", { class: "kb-kind" }, kind) : null, said,
+            h("div", { class: "row-btns kb-btns" }, h("button", { onclick: show }, "Cancel"), save)));
+        text.focus();
+    };
+    show();
+    return el;
+}
+
+// A line the learner adds in their own words: a goal, a preference, a global insight.
+function addRow(kind, placeholder, onChanged) {
+    const input = h("input", { type: "text", maxlength: LINE_MAX, placeholder, autocomplete: "off" });
+    const said = h("div", { class: "bad small", hidden: true });
+    const go = h("button", { type: "submit" }, "Add");
+    return h("form", { class: "addrow", method: "post", action: "#", onsubmit: async (ev) => {
+        ev.preventDefault();
+        if (!input.value.trim()) return;
+        go.disabled = true;
+        const r = await tutorApi("POST", "/knowledge/records", { kind, text: input.value });
+        go.disabled = false;
+        if (!r.body.ok) { said.textContent = errText(r.body); said.hidden = false; return; }
+        onChanged();
+    } }, input, go, said);
+}
+
+function summaryDialog(sm) {
+    openModal(`Summary: ${sm.title}`, [
+        h("p", { class: "note" }, [whereWords(sm), sm.closed_at ? `done ${fmtWhen(sm.closed_at)}` : null].filter(Boolean).join(" · ")),
+        sm.one_line ? h("p", { class: "sum-line" }, String(sm.one_line)) : null,
+        h("div", { class: "sum-text" }, String(sm.summary || "The tutor wrote no summary.")),
+        h("p", { class: "note" }, "The line in bold is what later lessons' tutors are given, in every project."),
+    ], [h("button", { onclick: closeModal }, "Close")]);
+}
+
+function summaryRow(sm, withProject) {
+    return h("div", { class: "rowline sumrow", title: "Read the summary", onclick: () => summaryDialog(sm) },
+        h("div", { class: "grow" }, h("b", {}, String(sm.title || "Lesson")), withProject ? h("span", { class: "muted" }, ` · ${whereWords(sm)}`) : null,
+            sm.one_line ? h("div", { class: "ins-ev" }, String(sm.one_line)) : null),
+        h("span", { class: "when" }, dayOf(sm.closed_at)));
+}
+
+// A project's insights: the ones in force, and the retired ones behind a switch.
+function insightsCard(records, o) {
+    const active = records.filter((r) => r.state === "active");
+    const retired = records.filter((r) => r.state !== "active");
+    const sw = h("label", { class: "switch" }, h("input", { type: "checkbox", checked: !!o.showRetired, onchange: (ev) => o.onRetired(ev.target.checked) }),
+        ` show retired (${retired.length})`);
+    const shown = o.showRetired ? [...active, ...retired] : active;
+    return h("div", { class: "card" }, h("div", { class: "card-head" }, "Insights", h("span", { class: "grow head-note" }, `${active.length} in use`), retired.length ? sw : null),
+        shown.length ? shown.map((r) => recordRow(r, { onChanged: o.onChanged })) : h("div", { class: "none" }, o.empty || "None yet. A tutor records them as lessons go on."));
+}
+
+// ---- the dot: a global insight waits for the learner
+
+async function refreshKbOpen() {
+    const r = await tutorApi("GET", "/knowledge/proposals?state=open");
+    if (!S.loggedIn) return;
+    if (r.body.ok && r.body.result && Number.isInteger(r.body.result.open)) {
+        const was = S.kbOpen;
+        S.kbOpen = r.body.result.open;
+        if (was !== S.kbOpen) { renderKbFoot(); if (S.page === "knowledge" && S.kb.navData) drawKbNav(); }
+    }
+}
+
+function renderKbFoot() {
+    if (!S.shell) return;
+    const btn = S.shell.rail.parentNode.querySelector(".knowledge-btn");
+    if (!btn) return;
+    btn.classList.toggle("sel", S.page === "knowledge");
+    btn.querySelector(".kdot").hidden = !(S.kbOpen > 0);
+    btn.title = S.kbOpen > 0 ? `${S.kbOpen} global insight(s) proposed by a tutor wait for you` : "What every tutor knows about you";
+}
+
+// ---- the Knowledge page
+
+function showKnowledge(view) {
+    S.page = "knowledge";
+    if (view) S.kb.view = view;
+    S.kb.changes = null;   // the History is read again when it is shown
+    saveLayout();
+    render();
+    renderKnowledge();
+}
+
+function makeKnowledgePane() {
+    const nav = h("div", { class: "kb-nav" });
+    const body = h("div", { class: "page-inner" });
+    const page = h("div", { class: "page kb-page" }, body);
+    const el = h("div", { class: "pane kb", hidden: true }, nav, page);
+    return { el, nav, body, page };
+}
+
+// The projects the page knows of: those there now, and the removed ones whose insights or
+// lessons are kept.
+function kbProjects(insights, summaries) {
+    const out = new Map();
+    for (const p of S.projects) if (typeof p.created === "string") out.set(kbKey(p.name, p.created), { project: p.name, created: p.created, removed: false, live: true });
+    for (const x of [...insights, ...summaries]) {
+        if (!x || !x.project) continue;
+        const key = kbKey(x.project, x.created);
+        if (!out.has(key)) out.set(key, { project: x.project, created: x.created, removed: !!x.project_removed, live: false });
+    }
+    return [...out.entries()].map(([key, v]) => ({ key, ...v }));
+}
+
+function drawKbNav() {
+    const { nav } = S.shell.knowledge;
+    const d = S.kb.navData;
+    const v = S.kb.view;
+    const item = (id, label, count, dot) => h("div", { class: "kn" + (v === id ? " on" : ""), onclick: () => showKnowledge(id) },
+        h("span", {}, label), dot ? h("span", { class: "kdot", title: "A proposal waits for you" }) : null,
+        count === null || count === undefined ? null : h("span", { class: "kc" }, String(count)));
+    const projects = d.projects.map((p) => item(p.key, `${p.project}${p.live ? "" : " (removed)"}`,
+        d.insights.filter((r) => r.state === "active" && kbKey(r.project, r.created) === p.key).length));
+    fill(nav, h("div", { class: "kh" }, "ABOUT YOU, EVERYWHERE"),
+        item("brief", "Your brief"), item("global", "Global insights", d.globals, S.kbOpen > 0),
+        h("div", { class: "kh" }, "PER PROJECT"), projects.length ? projects : h("div", { class: "kn none-kn" }, "No project yet."),
+        h("div", { class: "kh" }, "EVERYTHING"), item("lessons", "Lessons done", d.summaries.length), item("history", "History"));
+}
+
+async function renderKnowledge() {
+    if (!S.shell || S.page !== "knowledge") return;
+    const seq = ++S.kb.seq;
+    const v = S.kb.view;
+    const [ins, sums, globals, props] = await Promise.all([tutorApi("GET", "/knowledge/records?kind=insight&all=1"),
+        tutorApi("GET", "/knowledge/lessons"), tutorApi("GET", "/knowledge/records?kind=global"), tutorApi("GET", "/knowledge/proposals?state=open")]);
+    if (seq !== S.kb.seq || S.page !== "knowledge") return;
+    const { body } = S.shell.knowledge;
+    const insights = kbList(ins, "records");
+    const summaries = kbList(sums, "lessons");
+    if (!insights || !summaries) {
+        fill(body, h("h1", {}, "Knowledge"), h("p", { class: "bad" }, errText((insights ? sums : ins).body)),
+            h("div", { class: "btns" }, h("button", { onclick: renderKnowledge }, "Try again")));
+        return;
+    }
+    const gl = kbList(globals, "records") || [];
+    const proposals = kbList(props, "proposals") || [];
+    if (props.body.ok && Number.isInteger(props.body.result.open)) S.kbOpen = props.body.result.open;
+    S.kb.navData = { insights, summaries, globals: gl.length, projects: kbProjects(insights, summaries) };
+    if (!KB_VIEWS.has(v) && !S.kb.navData.projects.some((p) => p.key === v)) S.kb.view = "brief";
+    drawKbNav();
+    renderKbFoot();
+    const again = () => renderKnowledge();
+    let view;
+    switch (S.kb.view) {
+        case "brief": view = await briefView(again); break;
+        case "global": view = await globalView(gl, proposals, again); break;
+        case "lessons": view = await lessonsView(); break;
+        case "history": view = await historyView(); break;
+        default: {
+            const p = S.kb.navData.projects.find((x) => x.key === S.kb.view);
+            view = projectView(p, insights.filter((r) => kbKey(r.project, r.created) === p.key),
+                summaries.filter((sm) => kbKey(sm.project, sm.created) === p.key), again);
+        }
+    }
+    if (seq !== S.kb.seq || S.page !== "knowledge") return;
+    fill(body, view);
+}
+
+async function briefView(again) {
+    const r = await tutorApi("GET", "/knowledge/brief");
+    const res = r.body.ok && r.body.result;
+    if (!res || !res.parts) return [h("h1", {}, "Your brief"), h("p", { class: "bad" }, errText(r.body))];
+    const parts = res.parts;
+    const toggle = h("div", { class: "seg-toggle" },
+        h("button", { class: S.kb.raw ? "" : "on", onclick: () => { S.kb.raw = false; again(); } }, "Overview"),
+        h("button", { class: S.kb.raw ? "on" : "", onclick: () => { S.kb.raw = true; again(); } }, "As a tutor reads it"));
+    if (S.kb.raw) {
+        return [h("div", { class: "kb-top" }, h("div", {}, h("h1", {}, "Your brief"),
+                h("div", { class: "sub" }, "The exact text every tutor is given at the start of each lesson, in every project. It is put together from the records by the program, never written by a model.")), toggle),
+            h("div", { class: "card" }, h("div", { class: "card-head" }, "As a tutor reads it", h("span", { class: "grow head-note" }, `${String(res.text).length} characters`)),
+                h("pre", { class: "rawbrief" }, String(res.text)),
+                res.cut ? h("div", { class: "note pad-note" }, `${res.cut} line(s) were left out to keep it short. A tutor can still find them with its search.`) : null),
+            h("p", { class: "note" }, "A project's tutor is also told that project's own insights, after this text.")];
+    }
+    // The background: a box the learner writes.
+    const bg = h("textarea", { class: "kb-bg", rows: 5, maxlength: BACKGROUND_MAX, placeholder: "Comfortable with Python and SQL, new to streaming…", "aria-label": "Your background" });
+    bg.value = parts.background ? String(parts.background.text) : "";
+    const bgSaid = h("span", { class: "note grow" }, parts.background ? `Saved ${fmtWhen(parts.background.updated_at)}.` : "Not written yet.");
+    const bgSave = h("button", { class: "primary", onclick: async () => {
+        bgSave.disabled = true;
+        const r2 = await tutorApi("PUT", "/knowledge/background", { text: bg.value });
+        bgSave.disabled = false;
+        if (!r2.body.ok) { bgSaid.className = "bad grow"; bgSaid.textContent = errText(r2.body); return; }
+        toast(bg.value.trim() ? "Your background is saved. Every tutor reads it from its next lesson." : "Your background is removed.");
+        again();
+    } }, "Save");
+    bg.addEventListener("input", () => { bgSaid.className = "note grow"; bgSaid.textContent = "Not saved yet."; });
+    const lines = (rows, kind, empty, placeholder) => [
+        rows.length ? rows.map((x) => recordRow(x, { onChanged: again, openRests: true, withProject: true })) : h("div", { class: "none" }, empty),
+        addRow(kind, placeholder, again)];
+    const recently = Array.isArray(parts.recently) ? parts.recently : [];
+    const globalsIn = Array.isArray(parts.global_insights) ? parts.global_insights : [];
+    return [
+        h("div", { class: "kb-top" }, h("div", {}, h("h1", {}, "Your brief"),
+            h("div", { class: "sub" }, "What every tutor knows about you before a lesson starts, in any project. A tutor records a goal or a preference only from a sentence you wrote; you can write, change or delete any of them.")), toggle),
+        h("div", { class: "card" }, h("div", { class: "card-head" }, "Your background", h("span", { class: "grow head-note" }, "in your own words; only you write it")),
+            h("div", { class: "form" }, h("p", { class: "note" }, "What you know already and what you work with. Every tutor reads it as you wrote it."), bg,
+                h("div", { class: "row-btns kb-btns" }, bgSaid, bgSave))),
+        h("div", { class: "two" },
+            h("div", { class: "card" }, h("div", { class: "card-head" }, "Your goals"),
+                lines(parts.goals || [], "goal", "None yet.", "Add a goal in your own words…")),
+            h("div", { class: "card" }, h("div", { class: "card-head" }, "How you want to be taught"),
+                lines(parts.preferences || [], "preference", "None yet.", "Add a preference in your own words…"))),
+        h("div", { class: "two" },
+            h("div", { class: "card" }, h("div", { class: "card-head" }, "How you learn",
+                h("span", { class: "grow head-note" }, h("button", { class: "link", onclick: () => showKnowledge("global") }, `global insights (${globalsIn.length})`))),
+                globalsIn.length ? globalsIn.map((g) => h("div", { class: "rowline" }, h("span", { class: "grow" }, String(g.text))))
+                    : h("div", { class: "none" }, "None yet. A tutor proposes them; you approve them.")),
+            h("div", { class: "card" }, h("div", { class: "card-head" }, "Recently", h("span", { class: "grow head-note" }, "lessons done, in any project")),
+                recently.length ? recently.map((sm) => summaryRow(sm, true)) : h("div", { class: "none" }, "No lesson done yet."))),
+        h("p", { class: "note" }, "A project's tutor is also told that project's own insights. The lessons' summaries and your background stand in for a list of what you know."),
+    ];
+}
+
+// A global insight a tutor proposes: a new one, a replacement, a retirement; with where it came
+// from, what it rests on, the like insights of the other projects, the text to edit, and the
+// learner's decision.
+function globalProposalRow(p, again) {
+    const said = h("div", { class: "bad small", hidden: true });
+    const bad = (text) => { said.textContent = text; said.hidden = false; };
+    const action = p.action === "replace" ? "Replaces a global insight" : p.action === "retire" ? "Retires a global insight" : "A new global insight";
+    const lessonTitle = (() => {
+        const l = lessonRow(p.project, String(p.lesson_id));
+        if (l && !p.project_removed) return `“${l.title}”`;
+        const sm = S.kb.navData && S.kb.navData.summaries.find((x) => String(x.lesson_id) === String(p.lesson_id));
+        return sm ? `“${sm.title}”` : "a lesson";
+    })();
+    const text = p.action === "retire" ? null : h("textarea", { class: "kb-edit", rows: 2, maxlength: LINE_MAX, "aria-label": "The insight, as every tutor would read it" });
+    if (text) text.value = String(p.text || "");
+    const similar = Array.isArray(p.similar) ? p.similar : [];
+    const approve = h("button", { class: "primary", onclick: async () => {
+        approve.disabled = true;
+        const body = text && text.value.trim() !== String(p.text || "") ? { text: text.value } : {};
+        const r = await tutorApi("POST", `/knowledge/proposals/${enc(p.id)}/approve`, body);
+        approve.disabled = false;
+        if (!r.body.ok) { bad(errText(r.body)); return; }
+        toast("Approved: every tutor is told it from its next message.");
+        again();
+    } }, "Approve");
+    const dismiss = h("button", { onclick: async () => {
+        dismiss.disabled = true;
+        const r = await tutorApi("POST", `/knowledge/proposals/${enc(p.id)}/dismiss`, {});
+        dismiss.disabled = false;
+        if (!r.body.ok) { bad(errText(r.body)); return; }
+        toast("Dismissed: nothing is changed. The tutor hears of it with your next message there.");
+        again();
+    } }, "Dismiss");
+    const rests = h("details", { class: "rests" }, h("summary", {}, "what it rests on"), h("div", { class: "rests-body" }, restsEl(p.rests_on_detail)));
+    return h("div", { class: "ins proposed" },
+        h("div", { class: "ins-main" },
+            h("div", { class: "prop-what" }, action, h("span", { class: "ins-ev" }, ` · proposed by the tutor in ${whereWords(p)}, lesson ${lessonTitle} · ${dayOf(p.created_at)}`)),
+            p.target ? h("div", { class: "prop-target" }, p.action === "retire" ? "To stop telling every tutor: " : "In force now: ", h("span", { class: "quote" }, `“${p.target.text}”`)) : null,
+            text ? h("div", { class: "kb-kind" }, text, h("div", { class: "note" }, "Edit it as you want every tutor to read it.")) : null,
+            p.reason ? h("div", { class: "ins-ev" }, `Why: ${p.reason}`) : null,
+            rests,
+            similar.length ? h("div", { class: "similar" }, h("div", { class: "note" }, "Like it, in your other projects (the tutor that proposes it does not see these):"),
+                similar.map((x) => h("div", { class: "simrow" }, x.insight_kind ? h("span", { class: `kindp ${INSIGHT_CLASS[x.insight_kind] || ""}` }, INSIGHT_KINDS[x.insight_kind] || x.insight_kind) : null,
+                    h("span", { class: "grow" }, String(x.text), h("span", { class: "ins-ev" }, ` · ${whereWords(x)}`))))) : null,
+            said,
+            h("div", { class: "row-btns kb-btns" }, dismiss, approve)));
+}
+
+async function globalView(globals, proposals, again) {
+    for (const p of proposals) {
+        if (!p.project_removed && projectRow(p.project) && !S.lessons[p.project]) await refreshLessons(p.project);
+    }
+    return [
+        h("h1", {}, "Global insights"),
+        h("div", { class: "sub" }, "The few things every tutor, in every project, is told about how you learn. A tutor can only propose one; it is told to the others once you approve it. There is no limit on how many."),
+        h("div", { class: "capbar" }, `${globals.length} in use`, proposals.length ? ` · ${proposals.length} waiting for you` : ""),
+        proposals.length ? h("div", { class: "card" }, h("div", { class: "card-head" }, "Waiting for you", h("span", { class: "grow head-note" }, "a tutor proposed these")),
+            proposals.map((p) => globalProposalRow(p, again))) : null,
+        h("div", { class: "card" }, h("div", { class: "card-head" }, "In use"),
+            globals.length ? globals.map((g) => recordRow(g, { onChanged: again, withProject: true })) : h("div", { class: "none" }, "None yet."),
+            addRow("global", "Add one yourself, in your own words…", again)),
+    ];
+}
+
+function projectView(p, records, summaries, again) {
+    return [
+        h("h1", {}, `${p.project}: insights`, p.live ? null : h("span", { class: "kindp head-pill" }, "removed")),
+        h("div", { class: "sub" }, p.live ? "What this project's tutor has learned about how you learn here. Only this project's tutors are told these; the others are not."
+            : "This project was removed. Its insights and lessons are kept here, and no tutor is told its insights."),
+        insightsCard(records, { showRetired: S.kb.showRetired, onRetired: (on) => { S.kb.showRetired = on; again(); }, onChanged: again }),
+        h("div", { class: "card" }, h("div", { class: "card-head" }, "Lessons done here"),
+            summaries.length ? summaries.map((sm) => summaryRow(sm, false)) : h("div", { class: "none" }, "No lesson done yet.")),
+    ];
+}
+
+async function lessonsView() {
+    const q = S.kb.q || "";
+    const r = await tutorApi("GET", `/knowledge/lessons${q.trim() ? `?q=${enc(q.trim())}` : ""}`);
+    const rows = kbList(r, "lessons");
+    const search = h("input", { type: "text", placeholder: "Search the titles and summaries…", autocomplete: "off", "aria-label": "Search the lessons" });
+    search.value = q;
+    const list = h("div", {}, rows ? (rows.length ? rows.map((sm) => summaryRow(sm, true)) : h("div", { class: "none" }, q.trim() ? "No lesson holds every word of that." : "No lesson done yet."))
+        : h("div", { class: "none bad" }, errText(r.body)));
+    const form = h("form", { class: "addrow", method: "get", action: "#", onsubmit: (ev) => { ev.preventDefault(); S.kb.q = search.value; renderKnowledge(); } },
+        search, h("button", { type: "submit" }, "Search"));
+    return [h("h1", {}, "Lessons done"), h("div", { class: "sub" }, "Every lesson a tutor closed, in every project, newest first. Open one to read its summary."),
+        h("div", { class: "card" }, form, list)];
+}
+
+// One change: who, where, what, before and after; Undo.
+function changeRow(c) {
+    const items = Array.isArray(c.items) ? c.items : [];
+    const first = items.find((it) => it.after || it.before) || {};
+    const rec = first.after || first.before || {};
+    const who = c.by && c.by.who === "tutor" ? "the tutor" : "you";
+    const where = c.by && c.by.who === "tutor" ? c.by.project : rec.project ? `${rec.project}${rec.project_removed ? " (removed)" : ""}` : "everywhere";
+    const kinds = (Array.isArray(c.kinds) ? c.kinds : []).map((k) => RECORD_WORDS[k] || k).join(", ");
+    const said = h("div", { class: "small", hidden: true });
+    const undo = c.undone ? h("span", { class: "note" }, "undone") : h("button", { onclick: async () => {
+        undo.disabled = true;
+        const r = await tutorApi("POST", `/knowledge/changes/${enc(c.id)}/undo`, {});
+        undo.disabled = false;
+        if (!r.body.ok) {
+            said.className = "bad small";
+            said.textContent = r.body.error && r.body.error.kind === "conflict" ? `Not undone: ${r.body.error.message || "it changed since."}` : errText(r.body);
+            said.hidden = false;
+            return;
+        }
+        toast("Undone.");
+        S.kb.changes = null;
+        renderKnowledge();
+    } }, "Undo");
+    const ba = items.filter((it) => it.before && it.after && (it.before.text !== it.after.text || it.before.insight_kind !== it.after.insight_kind
+        || it.before.state !== it.after.state));
+    const textOf = (x) => `${x.insight_kind ? `(${INSIGHT_KINDS[x.insight_kind] || x.insight_kind}) ` : ""}${x.text}${x.state === "retired" ? " [retired]" : ""}`;
+    const added = c.action === "replace" ? items.filter((it) => !it.before && it.after) : [];
+    return h("div", { class: "hist" + (c.undone ? " undone" : "") },
+        h("span", { class: "when" }, shortWhen(c.at)),
+        h("span", { class: "who" }, `${who} · ${where}`),
+        h("div", { class: "what" }, h("div", {}, `${CHANGE_WORDS[c.action] || c.action} ${kinds}: `, h("span", { class: "quote" }, `“${rec.text || ""}”`)),
+            c.note ? h("div", { class: "note" }, String(c.note)) : null,
+            ba.length || added.length ? h("details", { class: "rests" }, h("summary", {}, "before and after"),
+                ba.map((it) => h("div", { class: "ba" }, h("div", {}, h("span", { class: "note" }, "before: "), textOf(it.before)),
+                    h("div", {}, h("span", { class: "note" }, "after: "), textOf(it.after)))),
+                added.map((it) => h("div", { class: "ba" }, h("span", { class: "note" }, "new: "), textOf(it.after)))) : null,
+            said),
+        undo);
+}
+
+async function historyView() {
+    if (!S.kb.changes) {
+        const r = await tutorApi("GET", "/knowledge/changes?limit=50");
+        const rows = kbList(r, "changes");
+        if (!rows) return [h("h1", {}, "History"), h("p", { class: "bad" }, errText(r.body))];
+        S.kb.changes = rows;
+        S.kb.next = r.body.result.next;
+    }
+    const more = S.kb.next !== null && S.kb.next !== undefined ? h("div", { class: "addrow" }, h("button", { onclick: async (ev) => {
+        ev.target.disabled = true;
+        const r = await tutorApi("GET", `/knowledge/changes?limit=50&before=${enc(S.kb.next)}`);
+        const rows = kbList(r, "changes");
+        if (!rows) { ev.target.disabled = false; toast(errText(r.body), true); return; }
+        S.kb.changes = [...S.kb.changes, ...rows];
+        S.kb.next = r.body.result.next;
+        renderKnowledge();
+    } }, "Show more")) : null;
+    return [h("h1", {}, "History"),
+        h("div", { class: "sub" }, "Every change to what tutors know about you, newest first: by you or by a tutor. Any change can be undone, unless what it changed was changed again since."),
+        h("div", { class: "card" }, S.kb.changes.length ? S.kb.changes.map(changeRow) : h("div", { class: "none" }, "Nothing changed yet."), more)];
+}
+
+// ---- a project's Insights tab
+
+function makeInsightsPane(name) {
+    const body = h("div", { class: "page-inner" }, h("div", { class: "none" }, "Asking…"));
+    const el = h("div", { class: "pane page insights-pane" }, body);
+    const pane = { kind: "insights", el, showRetired: false, stale: true };
+    const load = async () => {
+        pane.stale = false;
+        const r = await tutorApi("GET", `/project/${enc(name)}/insights?all=1`);
+        const rows = kbList(r, "records");
+        fill(body, h("h1", {}, `${name}: insights`),
+            h("div", { class: "sub" }, "What this project's tutor has learned about how you learn here. Only this project's tutors are told these. ",
+                h("button", { class: "link", onclick: () => showKnowledge("brief") }, "Open the Knowledge page"), " for your brief and every project."),
+            rows ? insightsCard(rows, { showRetired: pane.showRetired, onRetired: (on) => { pane.showRetired = on; load(); }, onChanged: load })
+                : h("p", { class: "bad" }, errText(r.body)));
+    };
+    // Read again each time it is shown: a lesson may have added one meanwhile.
+    pane.update = () => { if (pane.stale) load(); };
+    pane.hide = () => { pane.stale = true; };
     return pane;
 }
 
@@ -3490,6 +4168,7 @@ function projectDialog(name) {
         if (r.body.ok) refreshProjects();
     } }, limits.rows, h("div", { class: "btns" }, limitsGo));
     const pw = h("input", { type: "password", autocomplete: "current-password" });
+    const forget = h("input", { type: "checkbox" });
     const destroyGo = h("button", { class: "danger", type: "submit", disabled: !!op }, "Destroy the project");
     const destroyForm = h("form", { method: "post", action: "#", onsubmit: async (ev) => {
         ev.preventDefault();
@@ -3497,11 +4176,13 @@ function projectDialog(name) {
         destroyGo.disabled = true;
         const proof = await deriveLoginProof(pw.value);
         pw.value = "";
-        const r = await api("POST", projectPath(name, "/destroy"), { proof });
+        const r = await api("POST", projectPath(name, "/destroy"), { proof, forget: forget.checked });
         destroyGo.disabled = false;
         if (!r.body.ok) { said.className = "bad"; said.textContent = errText(r.body); return; }
         followOp(r.body.op_id, `Destroying ${name}`);
     } }, h("p", { class: "note" }, "The sandbox, its workspace and its ports go, for good. Type your password to confirm."),
+        h("label", { class: "checkrow" }, forget, " also forget what I learned here"),
+        h("p", { class: "note" }, "Otherwise the lessons' summaries, this project's insights and what you said there stay for your other projects' tutors, marked as from a removed project. Its conversations go either way."),
         formRow("Password", pw), h("div", { class: "btns" }, destroyGo));
     const running = p.state === "running";
     const agentsBox = h("details", { class: "more agents-box", open: true }, h("summary", {}, "Agents"));
@@ -3575,7 +4256,13 @@ async function followOp(opId, title, opts) {
     state.textContent = (ok ? "Done" : "Failed") + msg;
     state.className = "opstate " + (ok ? "good" : "bad");
     if (opts.endNote && ok) state.after(h("p", { class: "note" }, opts.endNote));
-    if (!scrim || !scrim.isConnected) toast(`${title}: ${ok ? "done" : "failed"}${msg}`, !ok);
+    // After a destroy: whether the tutor service was told the project is gone.
+    const kn = ok && result.knowledge && typeof result.knowledge === "object" ? result.knowledge : null;
+    const knWords = !kn ? "" : kn.told ? (kn.forgotten ? "What you learned in this project is forgotten." : "What you learned in this project is kept, marked as from a removed project.")
+        : String(kn.message || "The tutor service was not told the project is gone.");
+    if (kn) state.after(h("p", { class: kn.told ? "note" : "bad" }, knWords));
+    if (!scrim || !scrim.isConnected) toast(`${title}: ${ok ? "done" : "failed"}${msg}${kn && !kn.told ? `. ${knWords}` : ""}`, !ok || (kn && !kn.told));
+    if (kn && S.page === "knowledge") renderKnowledge();
     if (opts.onEnd) opts.onEnd(ok);
     await refreshProjects();
     if (S.current) refreshServices(S.current);
