@@ -68,7 +68,7 @@ import broker_auth  # its own standard library only: where the password is kept
 import guard
 
 STATE_FILE = "/run/cl/state.json"
-NET_DIR = "/sys/class/net"
+NET_DEV = "/proc/net/dev"  # this network namespace's interfaces; under sysbox /sys/class/net shows the machine's
 DAEMON_LOG = "/var/log/dockerd.log"
 DAEMON_LOG_MAX = 5 * 1024 * 1024
 DAEMON_JSON = "/etc/docker/daemon.json"
@@ -258,11 +258,16 @@ def foreign_bridges(interfaces):
     return sorted(name for name in interfaces if guard.is_inner_bridge(name))
 
 
-def network_refusal(net_dir):
-    """Why the network is not this container's own, or "" when it is. A listing that cannot be
-    read is a refusal too: nothing may be opened on a network that cannot be told."""
+def network_refusal(net_dev):
+    """Why the network is not this container's own, or "" when it is. The interfaces are read
+    from /proc/net/dev (two header lines, then "<name>: <counters>" per interface), which shows
+    this process's network namespace; under sysbox /sys/class/net shows the machine's. A
+    listing that cannot be read is a refusal too: nothing may be opened on a network that
+    cannot be told."""
     try:
-        found = foreign_bridges(os.listdir(net_dir))
+        with open(net_dev) as fh:
+            lines = fh.read().splitlines()[2:]
+        found = foreign_bridges(line.split(":", 1)[0].strip() for line in lines if ":" in line)
     except OSError as exc:
         return f"This container's network interfaces could not be listed ({exc}), so nothing was started and its port was not opened. " + HOW_TO_RUN
     return NOT_ITS_OWN_NETWORK.format(found=", ".join(found)) if found else ""
@@ -829,7 +834,7 @@ def unforeseen(exc):
 def main():
     stop = Stop()
     set_state("starting")
-    not_my_network = network_refusal(NET_DIR)
+    not_my_network = network_refusal(NET_DEV)
     if not not_my_network:
         serve_status()
     try:

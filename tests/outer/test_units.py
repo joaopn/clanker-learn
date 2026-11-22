@@ -163,22 +163,27 @@ class StopAlreadyAsked:
         return True
 
 
+def fake_net_dev(tmp_path, interfaces):
+    """A file in /proc/net/dev's shape that lists the given interfaces."""
+    net = tmp_path / "net_dev"
+    net.write_text("Inter-|   Receive\n face |bytes    packets\n"
+                   + "".join(f"{name:>6}: 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n" for name in interfaces))
+    return net
+
+
 def main_with(monkeypatch, tmp_path, interfaces, own_processes):
     """Run the whole of main() with a stop already asked for, on a network that holds the
     given interfaces. Nothing real is served, brought up or ended: every such call is only
     recorded, with the state it was made in. Returns the record."""
     calls = []
-    net = tmp_path / "net"
-    net.mkdir()
-    for name in interfaces:
-        (net / name).touch()
+    net = fake_net_dev(tmp_path, interfaces)
     monkeypatch.setattr(init, "Stop", StopAlreadyAsked)
     monkeypatch.setattr(init, "serve_status", lambda: calls.append("serve"))
     monkeypatch.setattr(init, "bring_up", lambda stop: calls.append("bring up") or (None, None))
     monkeypatch.setattr(init, "end_everything_else", lambda: calls.append("end while " + init.state["state"]) or True)
     monkeypatch.setattr(init, "own_process_namespace", lambda parent, pid1: own_processes)
     monkeypatch.setattr(init, "STATE_FILE", str(tmp_path / "state.json"))
-    monkeypatch.setattr(init, "NET_DIR", str(net))
+    monkeypatch.setattr(init, "NET_DEV", str(net))
     init.main()
     return calls
 
@@ -216,7 +221,7 @@ def test_a_network_that_cannot_be_listed_is_refused_without_a_port(monkeypatch, 
     assert init.network_refusal(str(tmp_path / "eth0-only")) != ""
     calls = main_with(monkeypatch, tmp_path, [], own_processes=True)
     assert calls[:2] == ["serve", "bring up"]  # an empty listing is a network of its own
-    monkeypatch.setattr(init, "NET_DIR", str(tmp_path / "missing"))
+    monkeypatch.setattr(init, "NET_DEV", str(tmp_path / "missing"))
     calls.clear()
     init.main()
     assert calls == ["end while refused"] and "could not be listed" in init.state["reason"]
@@ -244,8 +249,7 @@ def test_the_child_that_starts_sandboxes_is_ended_before_they_are_stopped(monkey
             return None
 
     calls = []
-    net = tmp_path / "net"
-    net.mkdir()
+    net = fake_net_dev(tmp_path, [])
     daemon, child, broker = Running(), Running(), Running()
     keeper = Running()
     keeper.pid, keeper.ended, keeper.reported = 4242, False, False
@@ -269,7 +273,7 @@ def test_the_child_that_starts_sandboxes_is_ended_before_they_are_stopped(monkey
     monkeypatch.setattr(init, "end_everything_else", lambda: calls.append("end the rest") or True)
     monkeypatch.setattr(init, "watch", lambda d, dns: calls.append("watch"))   # never the real one: it would write rules here
     monkeypatch.setattr(init, "STATE_FILE", str(tmp_path / "state.json"))
-    monkeypatch.setattr(init, "NET_DIR", str(net))
+    monkeypatch.setattr(init, "NET_DEV", str(net))
     init.main()
     assert calls == ["bring up", "clear the broker's folders", "start the projects", "start the broker", "start the web keeper",
                      "end the child", "end the broker's group", "end the web keeper's group", "stop the containers", "stop the daemon",
@@ -513,8 +517,7 @@ def test_the_status_page_is_served_on_the_status_port(monkeypatch):
 
 def test_a_wrong_status_port_refuses_the_start_before_anything_is_done(monkeypatch, tmp_path):
     done = []
-    net = tmp_path / "net"
-    net.mkdir()
+    net = fake_net_dev(tmp_path, [])
     problem = "CL_STATUS_PORT is 'eighty': it must be a whole number from 1 to 65535."
     monkeypatch.setattr(init, "STATUS_PORT_PROBLEM", problem)
     monkeypatch.setattr(init, "Stop", StopAlreadyAsked)
@@ -524,7 +527,7 @@ def test_a_wrong_status_port_refuses_the_start_before_anything_is_done(monkeypat
     monkeypatch.setattr(init, "guard_up", lambda: done.append("rules") or ())
     monkeypatch.setattr(init, "end_everything_else", lambda: True)
     monkeypatch.setattr(init, "STATE_FILE", str(tmp_path / "state.json"))
-    monkeypatch.setattr(init, "NET_DIR", str(net))
+    monkeypatch.setattr(init, "NET_DEV", str(net))
     init.main()
     assert done == ["serve"]                      # the page says why; nothing else was done
     assert (init.state["state"], init.state["reason"]) == ("refused", problem)
@@ -935,8 +938,7 @@ def test_after_a_refusal_the_keeper_is_forgotten_and_its_state_dropped(monkeypat
             return self.is_set()
 
     calls, codes = [], []
-    net = tmp_path / "net"
-    net.mkdir()
+    net = fake_net_dev(tmp_path, [])
     process = keeper_process()
     process.say(b'{"web": "up"}\n{"sandbox_image": "ready"}\n{"agents": "ready: 2.1.330"}\n{"editor": "ready: 4.126.0"}\n')
 
@@ -961,7 +963,7 @@ def test_after_a_refusal_the_keeper_is_forgotten_and_its_state_dropped(monkeypat
     monkeypatch.setattr(init, "end_everything_else", lambda: True)
     monkeypatch.setattr(init, "watch", watch)
     monkeypatch.setattr(init, "STATE_FILE", str(tmp_path / "state.json"))
-    monkeypatch.setattr(init, "NET_DIR", str(net))
+    monkeypatch.setattr(init, "NET_DEV", str(net))
     init.main()
     assert calls == ["start the web keeper", ("watch", "up", "ready", "ready: 2.1.330", "ready: 4.126.0")]
     assert init.state["state"] == "refused"
