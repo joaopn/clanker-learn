@@ -1,4 +1,4 @@
-"""The Editor: code-server, started in every sandbox by its init, reached through the real web
+"""The Editor: code-server, in a project that was given it, behind its lazy-start stub, reached through the real web
 server's origin-port proxy in a real outer container in privileged mode, as test_web_apps.py
 reaches a web app. Requests come from the neighbour container (`peer`).
 """
@@ -22,7 +22,11 @@ def test_the_editor_of_a_new_project_opens_through_its_origin_port(image, peer, 
         set_password(one, PASSWORD)
         page = Page(one)
         assert page.post("/broker/login", {"proof": proof()})["status"] == 200
-        act(page, "/broker/project", {"name": "editing"})
+        deadline = time.monotonic() + 120                             # the keeper takes the editor's distribution
+        while not str(one.state().get("editor", "")).startswith("ready"):
+            assert time.monotonic() < deadline, one.state()
+            time.sleep(0.5)
+        act(page, "/broker/project", {"name": "editing", "editor": True})
         assert list(services(page, "editing"))[:2] == ["editor", "files"]   # the page's tabs, in this order
         opened = page.post("/broker/project/editing/origin", {"port": EDITOR_PORT})   # listed always, never detected
         assert opened["status"] == 200 and said(opened)["ok"], opened

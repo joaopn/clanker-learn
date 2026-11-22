@@ -430,7 +430,7 @@ def test_a_recreate_gives_a_new_container_and_runs_the_recipe_once(lab):
     assert limits_inside(lab, "rec")["memory"] == "max"
     setup_becomes(lab, "rec", "done")
     assert lab.sh("cat /data/projects/rec/.learn/runs /data/projects/rec/.learn/ran-as").stdout.split() == ["run", "learner"]
-    assert lab.sandbox("rec", "ls", "/opt").stdout.split() == ["cl", "from-recipe"]           # the recipe's file; the earlier marker is gone
+    assert lab.sandbox("rec", "ls", "/opt").stdout.split() == ["agent-dist", "cl", "editor-dist", "from-recipe"]           # the recipe's file; the earlier marker is gone
     assert as_learner(lab, "rec", "cat ~/in-home /workspace/work").stdout.split() == ["mine", "work"]
     assert "running the setup recipe" in lab.inner("logs", "cl-sb-rec").stderr
 
