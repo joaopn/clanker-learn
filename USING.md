@@ -2,7 +2,7 @@
 
 This is the page as you meet it, once clanker-learn runs and you have a password ([INSTALL.md](INSTALL.md) says how). Open `https://127.0.0.1:7788` and log in. The password never leaves the browser: the page sends a proof made from it. A login lasts a working day (8 hours).
 
-The page has your projects down the left side, and the open project's tabs on the right. The gear at the bottom of the list opens Settings.
+The page has your projects down the left side, and the open project's tabs on the right. Under the list are `+ New project`, **Knowledge** (what every tutor knows about you) and **Settings**.
 
 ## Projects
 
@@ -22,7 +22,7 @@ The box shows the progress. A project cannot be given Claude Code or the editor 
 - **Recreate** gives the project a new container from the current sandbox image. The workspace and the home folder stay, with Claude Code's login and sessions; what was installed elsewhere is gone, and the setup recipe (below) brings it back. A stopped project is running afterwards.
 - **Agents**: add Claude Code to a project that has none, **Update** it to the version fetched in Settings, change its model and effort. These work while the project runs, without a restart. A project made before projects had agents is recreated first, then given Claude Code here.
 - **Limits**: change them. They apply at once, with two exceptions the box tells you about: a memory limit is removed only when the project is next recreated, and on sysbox a processor limit is removed only at its next start.
-- **Destroy** asks for your password again, then removes the sandbox, its workspace, its home folder and its ports, for good. Its lessons stay in the tutor's records but are no longer shown: a new project of the same name starts empty. If a destroy is cut short, run it again: a project being destroyed is never started.
+- **Destroy** asks for your password again, then removes the sandbox, its workspace, its home folder and its ports, for good, and its conversations with them: a new project of the same name starts empty. It also asks whether to **forget what you learned there**. Left unticked, the lessons' summaries and the goals and preferences you stated there stay for your other projects' tutors, and the project's insights stay on the Knowledge page for you, told to no tutor; all marked as from a removed project; ticked, they go too. The tutor service is told at the end of the destroy; if it could not be told, the box says so. If a destroy is cut short, run it again: a project being destroyed is never started.
 
 ## Goals and the study plan
 
@@ -67,7 +67,11 @@ Nothing of it is fetched from outside the project: a picture named by a web addr
 
 A lesson continues through Claude Code's own session in the project's home folder; `claude --resume` in the Shell lists it.
 
-**Exercises and quick questions.** The tutor can set an exercise with a check that runs in the sandbox, and ask a multiple-choice question. The page does not show them as cards yet: you see only the tool line. The tutor is told that the learner sees a card, so it may wait for an answer you cannot give there: tell it in the conversation.
+**Exercises.** The tutor can set an exercise as a card in its answer: a title, the steps, and the check, a command shown on the card. Do the steps in the Shell or the Editor, then press **Check**: the command runs in your sandbox (up to half a minute) and the card says passed or failed, with the command's output under "Last check". **Check again** runs it again as often as you like. The tutor can run the check too; the card says who ran it last. What a check gives back is kept, and is the kind of evidence an insight about you can rest on.
+
+**Quick questions.** The tutor can ask a multiple-choice question as a card. Pick an option and press **Answer**: the card says right or not, shows the right one and the tutor's explanation, and keeps your answer, right or wrong.
+
+**What the tutor is told, and when.** When no answer is being written, a Check or an Answer goes to the tutor at once as a message of its own, which clanker-learn writes for you ("You ran the check of …", "You answered …"), and the tutor answers it. While an answer is being written, the card changes at once and the tutor is told with your next message; the card says so. A message clanker-learn wrote for you never counts as your own words: no goal or preference is recorded from it. Under each of your messages, "what the tutor was told" opens what went to the tutor before your words: the lesson's opening, how you decided on a card.
 
 ## The Shell
 
@@ -94,7 +98,7 @@ Drag a tab to the side of the tab area to open a second column, and again for a 
 
 ## Settings
 
-The gear at the bottom of the project list.
+`⚙ Settings`, at the bottom of the project list.
 
 **Software** has a row for Claude Code and one for the editor: the version fetched, the version in effect, and whether the two agree.
 
@@ -109,22 +113,37 @@ Each is fetched by its maker's own installer, in a container that is thrown away
 - **The Claude token**, which every project's tutor uses when it is set (see "Signing in to Claude"). It is not shown again once set; you can replace or remove it.
 - **The tutor's instructions**: the text every tutor is given with each of your messages, in every project. Read it, change it and save it; a lesson under way follows the new text from its next message, starting again from its files. **Back to the shipped text** puts clanker-learn's own text back.
 
-Settings has no Backup section yet: backups are made with the `cl` command ([INSTALL.md](INSTALL.md)).
+**Backup** makes a backup of everything clanker-learn keeps, and lists the ones there are.
 
-## What the tutor keeps about you
+- **Make a backup** starts one and shows its log while it runs. It can be closed: the backup goes on, and the section says one is being made, also after a reload.
+- Each backup is a row: its name, its size, when it was made, and the projects in it. One made while projects were running says which: files being written at that moment may be torn. Stop the projects first for a clean copy.
+- **Download** saves the file in your browser's downloads.
+- **Remove** asks for your password again, then removes it for good.
 
-clanker-learn keeps a small knowledge base about you, shared by every project, and a **brief** made from it, which every tutor is told when a lesson starts. The brief holds:
+A backup holds your projects' workspaces and home folders, the tutor's conversations and what it knows about you, and the settings. It does not hold the fetched Claude Code and editor, which are fetched again, nor what was installed in a sandbox outside its workspace and home folder, which the setup recipe brings back. It holds the password's hash, the Claude token and every project's keys: keep it as safely as those. Restoring one is a command, `cl restore`, and not a button, because it replaces everything ([INSTALL.md](INSTALL.md) says how).
 
-- **your goals** and **how you want to be taught**, each recorded by a tutor only with a sentence you typed, quoted exactly (12 characters at least). A tutor never records one it inferred;
-- **your background**, as you wrote it;
-- **insights on how you learn that you approved for every tutor**;
-- **the lessons done recently**, in any project, with one line each.
+**How it runs** says which way clanker-learn was started: privileged or sysbox ([INSTALL.md](INSTALL.md)). In privileged mode, it says what that means, and a quiet line, "privileged mode", at the bottom of the project list leads there.
 
-Besides the brief, each project's tutors keep **insights on how you learn in that project** (a misconception, a strength, what worked), each resting on evidence the system itself saw: a check that ran, an answer you typed, a lesson's summary, or a sentence you typed. These are told only to that project's tutors; another project's never reach them. A tutor changes an insight only by replacing or retiring it, never by editing it in place, and every change is logged with what it was before.
+## What the tutor keeps about you: the Knowledge page
 
-A tutor can also propose a **global insight**, one that holds beyond its project. It is told to no tutor until you approve it.
+clanker-learn keeps a small knowledge base about you, shared by every project. **Knowledge**, under the project list, shows all of it, and you can change or delete any of it. Its dot is lit when a tutor proposes something that waits for you.
 
-The **Knowledge page**, where you read all of this, change or delete any of it, undo a change, write your background, and approve or dismiss the global insights proposed, comes with the next change. Until then the records are kept and used as above, but you cannot see or change them from the page, nor approve a global insight.
+**Your brief** is what every tutor is told about you when a lesson starts, in any project. It has these parts:
+
+- **Your background**: what you know already and what you work with, in a box you write. Only you write it; every tutor reads it as you wrote it from its next lesson.
+- **Your goals** and **how you want to be taught**. A tutor records one only with a sentence you typed in a lesson, quoted exactly (12 characters at least), and never one it inferred. Each line says who recorded it, and "what it rests on" shows your sentence. You can add your own, in your own words, and edit or delete any.
+- **How you learn**: the global insights you approved (below).
+- **Recently**: the lessons done lately, in any project, one line each; open one for its summary.
+
+"As a tutor reads it" shows the exact text a tutor is given, put together from the records by the program, never written by a model.
+
+**Global insights** are the few things every tutor, in every project, is told about how you learn. A tutor can only propose one: a new one, a replacement, or the retirement of one. A proposal waits under "Waiting for you", with the project and lesson it came from, why, what it rests on, and the like insights of your other projects. Edit its text as you want every tutor to read it, then **Approve** (every tutor is told it from its next message) or **Dismiss** (nothing changes; the tutor that proposed it hears of it with your next message there). You can also add one yourself. There is no limit on how many.
+
+**A project's insights**, under "Per project" on the Knowledge page and in the project's **Insights** tab: what its tutors learned about how you learn there (a misconception, a strength, what worked, what did not). Each rests on something clanker-learn itself saw: a check that ran, an answer you gave, a lesson's summary, or a sentence you typed; "what it rests on" shows it. Only that project's tutors are told them. A tutor changes one only by replacing or retiring it; "show retired" shows those too. A destroyed project's insights and lessons stay here, marked as removed, unless you chose to forget them; no tutor is told them.
+
+**Lessons done**: every lesson a tutor closed, in every project, newest first, with a search over the titles and summaries. The line in bold of a summary is what later lessons' tutors are given.
+
+**History**: every change to what the tutors know about you, by you or by a tutor, newest first, with what it was before and after. **Undo** takes a change back, unless what it changed was changed again since.
 
 ## What a sandbox brings back by itself
 

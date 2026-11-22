@@ -650,6 +650,13 @@ async def broker_lifecycle_handler(request: web.Request) -> web.Response:
     return web.json_response(body, status=status)
 
 
+async def broker_mode_handler(request: web.Request) -> web.Response:
+    """GET /broker/mode — {mode: "sysbox" | "privileged" | null}, the way clanker-learn runs,
+    for Settings and the line under the project list (gated read)."""
+    status, body = await _relay(request, "mode")
+    return web.json_response(body, status=status)
+
+
 # ---- Settings -> Backup ---------------------------------------------------------------
 
 # A backup's name as the core makes it, matched whole: the browser's name reaches no path
@@ -2147,6 +2154,7 @@ def build_app() -> web.Application:
     app.router.add_post("/broker/software/build", broker_build_handler)
     app.router.add_post("/broker/software/refresh-check", broker_refresh_check_handler)
     app.router.add_post("/broker/software/pin-reset", broker_pin_reset_handler)
+    app.router.add_get("/broker/mode", broker_mode_handler)
     app.router.add_get("/broker/backups", broker_backups_handler)
     app.router.add_post("/broker/backups", broker_backup_make_handler)
     app.router.add_get("/broker/backups/active", broker_backup_active_handler)

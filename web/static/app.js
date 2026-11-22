@@ -201,6 +201,10 @@ const S = {
     dragging: false,       // a tab or a splitter is being dragged: the strip and the panes are not rebuilt
     renderPending: false,  // a render was asked for during the drag
     wasNarrow: false,      // the window was at phone width at the last render
+    mode: null,            // the way clanker-learn runs, "sysbox" or "privileged" (/broker/mode), once read
+    backups: null,         // Settings -> Backup: the broker's rows, as last read
+    backupsError: null,
+    backupOp: null,        // the op_id of the backup being made, or null
 };
 
 const tabOf = (project) => S.tabs[project] || "shell";
@@ -380,13 +384,15 @@ function enterApp(projects) {
     if (S.current) S.expanded.add(S.current);
     S.timers.push(setInterval(refreshProjects, PROJECTS_EVERY_MS));
     S.timers.push(setInterval(() => { if (S.current) refreshServices(S.current); }, SERVICES_EVERY_MS));
-    S.timers.push(setInterval(() => { if (S.page === "settings") refreshSoftware(); }, SERVICES_EVERY_MS));
+    S.timers.push(setInterval(() => { if (S.page === "settings") { refreshSoftware(); refreshBackups(); } }, SERVICES_EVERY_MS));
     window.addEventListener("resize", onWindowResize);
     refreshProjects();
     if (S.current) refreshServices(S.current);
-    if (S.page === "settings") { refreshSoftware(); refreshTutorSettings(); }
+    if (S.page === "settings") { refreshSoftware(); refreshTutorSettings(); refreshBackups(); }
     if (S.page === "knowledge") renderKnowledge();
     seedBuilds();
+    seedBackup();
+    refreshMode();
     render();
 }
 
@@ -402,7 +408,8 @@ function teardownApp() {
                        expanded: new Set(), lessons: {}, lessonOf: {}, activity: new Set(), tutorError: null,
                        tutorSettings: null, tutorSettingsError: null, filesOrigins: new Map(), editorFile: {},
                        cols: {}, tabLayout: null, dragging: false, renderPending: false,
-                       kb: { view: "brief", raw: false, showRetired: false, q: "", seq: 0, changes: null, next: null, navData: null }, kbOpen: 0 });
+                       kb: { view: "brief", raw: false, showRetired: false, q: "", seq: 0, changes: null, next: null, navData: null }, kbOpen: 0,
+                       mode: null, backups: null, backupsError: null, backupOp: null });
 }
 
 async function refreshProjects() {
@@ -495,6 +502,10 @@ function renderRail() {
     });
     if (!rows.length) rows.push(h("div", { class: "none" }, "No project yet."));
     if (S.listError) rows.push(h("div", { class: "none bad" }, S.listError));
+    // In privileged mode, a quiet line at the bottom of the list, leading to what that means.
+    if (S.mode === "privileged") {
+        rows.push(h("button", { class: "mode-line", title: "What privileged mode means: Settings", onclick: () => showSettings("mode") }, "privileged mode"));
+    }
     S.shell.rail.replaceChildren(...rows);
     S.shell.rail.parentNode.querySelector(".settings-btn").classList.toggle("sel", S.page === "settings");
     renderKbFoot();
@@ -3648,12 +3659,16 @@ function renderInstructions(st, note) {
 
 // ---- Settings -> Software (RS's Sandboxes -> Software: renderSoftwareScreen and its lane) -----
 
-function showSettings() {
+function showSettings(part) {
     S.page = "settings";
     saveLayout();
     refreshSoftware();
     refreshTutorSettings();
+    refreshBackups();
     render();
+    renderMode();
+    // "mode": the line under the project list leads to that part of Settings.
+    if (part === "mode" && S.shell) S.shell.settings.mode.scrollIntoView({ block: "start" });
 }
 
 function makeSettingsPane() {
@@ -3661,6 +3676,8 @@ function makeSettingsPane() {
     const said = h("p", { class: "muted sw-said" });
     const tutor = h("div", { class: "card-body tutor-set" }, h("div", { class: "none" }, "Asking…"));
     const instr = h("div", { class: "card-body tutor-instr" }, h("div", { class: "none" }, "Asking…"));
+    const backup = h("div", { class: "card-body backup-set" }, h("div", { class: "none" }, "Asking…"));
+    const mode = h("div", { class: "card mode-set" }, h("div", { class: "card-head" }, "How it runs"), h("div", { class: "none" }, "Asking…"));
     const el = h("div", { class: "pane page", hidden: true }, h("div", { class: "page-inner" },
         h("h1", {}, "Settings"),
         h("p", { class: "sub" }, "The software clanker-learn deploys into the projects' sandboxes. Each is fetched in a throwaway container and copied into a project from there."),
@@ -3668,8 +3685,10 @@ function makeSettingsPane() {
             h("p", { class: "note sw-hint" }, "Running projects keep the agent versions they have until Update is pressed in their Config box (Agents); new projects get these. " +
                 "A newer editor reaches a project at its next start.")),
         said,
-        h("div", { class: "card" }, h("div", { class: "card-head" }, "Tutor"), tutor, instr)));
-    return { el, table, said, tutor, instr };
+        h("div", { class: "card" }, h("div", { class: "card-head" }, "Tutor"), tutor, instr),
+        h("div", { class: "card" }, h("div", { class: "card-head" }, "Backup"), backup),
+        mode));
+    return { el, table, said, tutor, instr, backup, mode };
 }
 
 // The build lane's target for a row (the broker's build_target).
@@ -3867,6 +3886,155 @@ async function pinReset(row, btn) {
     const v = r.body.result && r.body.result.version;
     swTell(`${row.row}: back to ${v || row.repo_version}, the version clanker-learn ships. Use repo version changes the pin only: Pull to fetch it.`);
     refreshSoftware();
+}
+
+// ---- Settings -> How it runs: the mode (sysbox or privileged) ---------------------------------
+
+async function refreshMode() {
+    const r = await api("GET", "/broker/mode");
+    if (!S.loggedIn) return;
+    const m = r.body.ok && r.body.result ? r.body.result.mode : null;
+    S.mode = m === "sysbox" || m === "privileged" ? m : null;
+    render();
+    renderMode();
+}
+
+function renderMode() {
+    if (!S.shell) return;
+    const box = S.shell.settings.mode;
+    const head = h("div", { class: "card-head" }, "How it runs");
+    const said = S.mode === "privileged"
+        ? [h("p", { class: "tutor-state" }, h("span", { class: "dot inline warn" }), " Privileged mode: the clanker-learn container was started with --privileged."),
+            h("p", {}, "That container is root-equivalent on this machine, so what stands between a sandbox and the machine is an ordinary container boundary " +
+                "and clanker-learn's guard rules. Sysbox adds a user namespace beneath them; the install guide says how to run it that way.")]
+        : S.mode === "sysbox"
+            ? [h("p", { class: "tutor-state" }, h("span", { class: "dot inline up" }), " Sysbox: the clanker-learn container runs under sysbox's runtime."),
+                h("p", {}, "Root inside it is not root on this machine: on top of the sandboxes' own container boundary and clanker-learn's guard rules, " +
+                    "the whole of clanker-learn lives in a user namespace of its own.")]
+            : [h("p", { class: "muted" }, "The mode could not be read.")];
+    box.replaceChildren(head, h("div", { class: "form" }, said));
+}
+
+// ---- Settings -> Backup: make one (an operation of its own lane), list, download, remove ------
+
+function fmtSize(n) {
+    if (!Number.isFinite(n)) return "?";
+    const units = ["bytes", "KB", "MB", "GB"];
+    let i = 0;
+    while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
+    return i === 0 ? `${n} bytes` : `${n.toFixed(1)} ${units[i]}`;
+}
+
+async function refreshBackups() {
+    if (!S.loggedIn || refreshBackups.busy) return;
+    refreshBackups.busy = true;
+    try {
+        const r = await api("GET", "/broker/backups");
+        if (!S.loggedIn) return;
+        if (r.body.ok && Array.isArray(r.body.result)) { S.backups = r.body.result; S.backupsError = null; }
+        else S.backupsError = errText(r.body);
+        renderBackups();
+    } finally {
+        refreshBackups.busy = false;
+    }
+}
+
+function backupTell(text, bad) {
+    if (!S.shell) return;
+    const said = S.shell.settings.backup.querySelector(".backup-said");
+    if (!said) return;
+    said.className = (bad ? "bad" : "muted") + " backup-said";
+    said.textContent = text;
+    said.hidden = !text;
+}
+
+function renderBackups() {
+    if (!S.shell) return;
+    const box = S.shell.settings.backup;
+    const keep = box.querySelector(".backup-said");
+    const said = h("p", { class: keep ? keep.className : "muted backup-said" }, keep ? keep.textContent : "");
+    said.hidden = !said.textContent;
+    const about = h("div", { class: "form" },
+        h("p", { class: "note" }, "A backup is one file with your projects' workspaces and home folders, the tutor's conversations and what it knows about you, and the settings; " +
+            "not the fetched software, which is fetched again, nor what was installed into a sandbox outside its workspace and home folder, which the project's setup recipe brings back."),
+        h("p", { class: "note" }, "It holds the password's hash, the Claude token and every project's keys: keep it as safely as those. " +
+            "Restoring one is a command, ", h("code", {}, "cl restore"), " (the install guide says how), because it replaces everything."));
+    const busy = !!S.backupOp;
+    const make = h("button", { class: "primary", disabled: busy, title: busy ? "A backup is being made" : null, onclick: () => makeBackup(make) }, "Make a backup");
+    const doing = busy ? h("span", { class: "sw-busy grow" }, "Making a backup… ",
+        h("button", { class: "link", onclick: () => followOp(S.backupOp, "Making a backup") }, "log")) : h("span", { class: "grow" });
+    const rows = [];
+    if (!S.backups) rows.push(h("div", { class: S.backupsError ? "none bad" : "none" }, S.backupsError || "Asking…"));
+    else if (!S.backups.length) rows.push(h("div", { class: "none" }, "No backup yet."));
+    for (const b of S.backups || []) {
+        if (!b || typeof b.backup !== "string") continue;
+        const projects = Array.isArray(b.projects) ? b.projects.map(String) : [];
+        const running = Array.isArray(b.running) ? b.running.map(String) : [];
+        const what = b.problem ? h("span", { class: "bad" }, String(b.problem))
+            : h("span", { class: "muted" }, projects.length ? `${projects.length} project${projects.length === 1 ? "" : "s"}: ${projects.join(", ")}` : "no project",
+                b.kind && b.kind !== "backup" ? ` (${String(b.kind)})` : null);
+        const download = h("a", { class: "btnlink", href: `/broker/backups/${enc(b.backup)}/download`, download: b.backup }, "Download");
+        const remove = h("button", { onclick: () => removeBackupDialog(b.backup) }, "Remove");
+        rows.push(h("div", { class: "bk-row" },
+            h("div", { class: "bk-main" },
+                h("div", { class: "bk-name" }, h("code", {}, b.backup)),
+                h("div", { class: "bk-meta" }, h("span", {}, fmtSize(b.size)), b.made_at ? h("span", {}, fmtWhen(b.made_at)) : null, what),
+                running.length ? h("div", { class: "warnc bk-ran" }, `Made while ${running.join(", ")} ${running.length === 1 ? "was" : "were"} running: files being written at that moment may be torn.`) : null),
+            h("div", { class: "sw-act" }, download, remove)));
+    }
+    if (S.backups && S.backupsError) rows.push(h("div", { class: "none bad" }, S.backupsError));
+    box.replaceChildren(about, h("div", { class: "bk-bar" }, doing, make), said, h("div", { class: "bk-list" }, rows));
+}
+
+// The backup the page follows: registered, followed (in a dialog, or not), dropped at its end.
+function followBackup(opId, background) {
+    S.backupOp = opId;
+    renderBackups();
+    return followOp(opId, "Making a backup", { background, onEnd: (ok) => {
+        if (S.backupOp === opId) S.backupOp = null;
+        backupTell(ok ? "" : "The backup failed: its log says why.", !ok);
+        refreshBackups();
+        renderBackups();
+    } });
+}
+
+async function makeBackup(btn) {
+    btn.disabled = true;
+    backupTell("");
+    const r = await api("POST", "/broker/backups");
+    if (!r.body.ok || !r.body.op_id) { btn.disabled = false; backupTell(errText(r.body), true); return; }
+    followBackup(r.body.op_id, false);
+}
+
+// After a reload (or a login): a backup in flight is found again and followed quietly.
+async function seedBackup() {
+    const r = await api("GET", "/broker/backups/active");
+    const ops = r.body.ok && r.body.result && Array.isArray(r.body.result.ops) ? r.body.result.ops : [];
+    const op = ops.find((o) => o && typeof o.op_id === "string");
+    if (op && S.backupOp !== op.op_id) followBackup(op.op_id, true);
+}
+
+// Removing asks for the password again, as destroying a project does.
+function removeBackupDialog(name) {
+    const pw = h("input", { type: "password", autocomplete: "current-password" });
+    const said = h("p", { class: "bad" });
+    const go = h("button", { class: "danger", type: "submit" }, "Remove the backup");
+    const form = h("form", { method: "post", action: "#", onsubmit: async (ev) => {
+        ev.preventDefault();
+        if (!pw.value) { said.textContent = "Removing a backup needs your password again."; return; }
+        go.disabled = true;
+        const proof = await deriveLoginProof(pw.value);
+        pw.value = "";
+        const r = await api("POST", "/broker/backups/remove", { backup: name, proof });
+        go.disabled = false;
+        if (!r.body.ok) { said.textContent = errText(r.body); return; }
+        closeModal();
+        backupTell(`${name} is removed.`);
+        refreshBackups();
+    } }, h("p", {}, h("code", {}, name), " goes for good: it may be the only copy of a project destroyed since. Type your password to confirm."),
+        formRow("Password", pw), said, h("div", { class: "btns" }, h("button", { type: "button", onclick: closeModal }, "Cancel"), go));
+    openModal("Remove a backup", form, []);
+    pw.focus();
 }
 
 // ---- dialogs: a new project, a project's actions, an operation's progress -------------------
@@ -4182,7 +4350,7 @@ function projectDialog(name) {
         followOp(r.body.op_id, `Destroying ${name}`);
     } }, h("p", { class: "note" }, "The sandbox, its workspace and its ports go, for good. Type your password to confirm."),
         h("label", { class: "checkrow" }, forget, " also forget what I learned here"),
-        h("p", { class: "note" }, "Otherwise the lessons' summaries, this project's insights and what you said there stay for your other projects' tutors, marked as from a removed project. Its conversations go either way."),
+        h("p", { class: "note" }, "Otherwise the lessons' summaries and the goals and preferences you stated there stay for your other projects' tutors, and this project's insights stay on the Knowledge page for you, told to no tutor; all marked as from a removed project. Its conversations go either way."),
         formRow("Password", pw), h("div", { class: "btns" }, destroyGo));
     const running = p.state === "running";
     const agentsBox = h("details", { class: "more agents-box", open: true }, h("summary", {}, "Agents"));

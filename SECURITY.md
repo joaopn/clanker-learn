@@ -8,7 +8,7 @@ clanker-learn runs a language model (Claude Code) with full rights in a sandbox,
 
 - **A sandbox is treated as untrusted.** Whatever runs in it may try to reach your machine, your network, the other projects and clanker-learn's own services. Those are what is defended.
 - **Within a project, nothing is defended from the sandbox.** The tutor of a project works in that project's sandbox and believes what it finds there. What is in a sandbox can steer its tutor.
-- **Your machine is defended only as far as the mode allows.** In privileged mode, clanker-learn's container is root-equivalent on the machine.
+- **Your machine is defended only as far as the mode allows.** In privileged mode, clanker-learn's container is root-equivalent on the machine. Settings, under "How it runs", says which mode it was started in, and in privileged mode a line at the bottom of the project list says "privileged mode".
 
 ## The parts and what each holds
 
@@ -42,7 +42,7 @@ The services a sandbox shares a network with (the web server, the tutor service)
 - **The password never leaves the browser.** The page derives a proof from it (PBKDF2-SHA256, 600,000 rounds, with a fixed salt) and sends that, over the page's HTTPS. The broker stores a scrypt hash of the proof, with a salt of its own, on the data volume.
 - **A session** is a token made by the broker and held in its memory for at most 8 hours; a restart of the broker or a new password ends every session. The web server keeps the token on its side, under a cookie that is `HttpOnly`, `Secure`, `SameSite=Strict` and sent only to the login's own paths.
 - **Wrong passwords**: after 10 within a minute, logins are refused for a minute. The set-up code for the first password has the same limit, works only while no password is set, never replaces one, and is printed only in the container's log.
-- **Step-up**: destroying a project, and removing a backup through the broker, need the password again in the request, beside the session.
+- **Step-up**: destroying a project, and removing a backup in Settings, need the password again in the request, beside the session.
 - **Origin checks**: every request that changes something, and every terminal connection, is refused unless the browser says it comes from the page's own address.
 - **Web-app tabs** each have a port of their own, behind a session for that project: a cookie made from the login, `HttpOnly`, `Secure`, `SameSite=Strict`, that lasts no longer than the login. The web server takes its own cookies out of a request before passing it to a web app, and out of the app's answer.
 - **The page's content-security policy**: scripts from the page's own files only, none inline; fetches and the terminal's connection to the page's own address only; frames and pictures only from the page's host over HTTPS (the web-app tabs, and the project's files server for a lesson's pictures and pages); no plugins, no form sent by the browser itself, and the page cannot be framed by another.
@@ -70,7 +70,9 @@ Claude Code in a sandbox reaches one thing of clanker-learn's own: the tool serv
 
 - A **goal** or a **preference** is recorded only with a sentence you typed in that project, quoted exactly (at least 12 characters), and found by clanker-learn in your own messages. A message the page composed for you (an answer on a card) does not count.
 - An **insight** rests on evidence clanker-learn itself saw (a check that ran, an answer it graded with your typed words, a lesson's summary) or on a sentence you typed. It is changed only by being replaced or retired, and every change is logged with what it was before.
-- A **global insight**, told to every project's tutors, exists only after you approve it. A tutor can only propose one. (The page to approve them comes with the next change; until then none is told to any tutor.)
+- A **global insight**, told to every project's tutors, exists only after you approve it on the Knowledge page. A tutor can only propose one.
+- **Everything is yours to change**: the Knowledge page edits or deletes any record, and every change, by you or by a tutor, is in its History and can be undone.
+- **Destroying a project** tells the tutor service, which keeps the project's lesson summaries, insights and your sentences there marked as from a removed project, or forgets them if you ticked that. Its conversations go either way.
 
 ## What is not protected
 
@@ -82,7 +84,7 @@ Each of these is true today. They are stated once, here.
 - **While an answer is being written, anything in the sandbox can use its token.** The token is in the environment of Claude Code and of what it runs, so a program there can call the tutor's tools as the tutor would, within the same rules.
 - **A check shows a state of the sandbox, not who made it.** An exercise's check that passes says the files were right when it ran, not that you wrote them: the tutor, or anything else in the sandbox, could have.
 - **A quick question's answer is in the sandbox.** The tutor gives the right answer to the tool when it asks the question, and Claude Code keeps its session files in the project's home folder, which you can read from the Shell.
-- **A backup holds the keys.** It holds the password's hash, the Claude token, each project's Claude Code login and the keys into every sandbox, unencrypted. Keep it as such.
+- **A backup holds the keys.** It holds the password's hash, the Claude token, each project's Claude Code login and the keys into every sandbox, unencrypted. Keep it as such. Anyone logged in to the page can download one: the web server is handed one backup at a time, for one download, and never the folder of backups.
 - **Raw TCP ports you name by hand have no login in front of them.** Anything that can reach that port on your machine reaches the sandbox's port.
 - **The tool server is the one thing of clanker-learn's own that a sandbox reaches**, and it runs in the tutor service, the process that holds the keys into every sandbox and the Claude token. A flaw in it would be reachable from any sandbox.
 - **The proof the browser sends is the same at every login.** To clanker-learn it is as good as the password; it travels only inside the page's HTTPS.

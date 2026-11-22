@@ -33,23 +33,18 @@ docker logs clanker-learn
 
 Open `https://127.0.0.1:7788` in a browser on the same machine, accept its self-made certificate, and type the set-up code that the log shows to choose your password. Then press `+ New project`.
 
-This runs the container privileged, which makes it root-equivalent on your machine. [INSTALL.md](INSTALL.md) says what that gives up, and how to run it on sysbox instead.
+This runs the container privileged, which makes it root-equivalent on your machine; Settings and a line under the project list say so. [INSTALL.md](INSTALL.md) says what that gives up, and how to run it on sysbox instead.
 
 ## How far it is built
 
-It is a first version, being built in steps. What exists: projects and their sandboxes; the page with the Shell, the Editor, web-app tabs and ports; Claude Code and the editor fetched once and copied into each project, and updated from Settings; Goals and the study plan; lessons as conversations with the tutor, with diagrams, plots, pictures and pages; tabs side by side; the tutor's records about you, and the brief every tutor reads; backups and restores, as commands.
+It is a first version. What exists: projects and their sandboxes; the page with the Shell, the Editor, web-app tabs and ports; Claude Code and the editor fetched once and copied into each project, and updated from Settings; Goals and the study plan; lessons as conversations with the tutor, with diagrams, plots, pictures, pages, exercises and quick questions; tabs side by side; the Knowledge page, where you read and change what the tutor keeps about you and approve the insights it proposes for every project; backups, made, downloaded and removed in Settings, and restored with a command.
 
-What does not exist yet:
-
-- A second agent. Only Claude Code drives the tutor; pi is planned.
-- The Knowledge page, where you would read and change what the tutor keeps about you and approve the insights it proposes for every project. The tutor keeps its records already; the page comes with the next change.
-- Exercises and quick questions as cards in the conversation. The tutor can set them, but the page does not show them yet: you see only the tool line.
-- Backups on the page. They are made and restored with the `cl` command for now.
+What is left is a second agent: only Claude Code drives the tutor so far, and pi is planned.
 
 ## Documents
 
 - [INSTALL.md](INSTALL.md): running it, the first start, settings, where your data is, backups, updating, uninstalling, and what to do when it refuses to start.
-- [USING.md](USING.md): the page, projects, lessons, the Shell and the Editor, Settings, what the tutor keeps about you, and the `cl` command.
+- [USING.md](USING.md): the page, projects, lessons, exercises and questions, the Shell and the Editor, Settings with its backups, the Knowledge page, and the `cl` command.
 - [SECURITY.md](SECURITY.md): what each part holds, what a sandbox can and cannot reach, and what is not protected.
 
 ## Tests

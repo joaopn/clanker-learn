@@ -86,7 +86,8 @@ read; `backup_rm` (step-up: a backup may be the only copy of what was destroyed,
 for its exports) and `backup_fetch` are audited and answered at once. `backup_fetch` links one
 backup into the web server's own folder for one download (core.backup_fetch says why not the
 folder of backups). A restore is not a verb: it replaces everything, and is the `cl` command
-only.
+only. `mode` is a read: the mode the init declared (sysbox or privileged), for Settings and
+the line under the project list.
 """
 import base64
 import contextlib
@@ -183,6 +184,7 @@ FIELDS = {
     "backup_list": frozenset(),
     "backup_rm": frozenset({"backup"}),
     "backup_fetch": frozenset({"backup"}),
+    "mode": frozenset(),
 }
 
 
@@ -756,6 +758,10 @@ def dispatch(verb, args, token=None, tokens=None, *, op_id=None, audit=None, spa
             return ok({"ops": ops_in_flight(builds=True)})
         if verb == "backup_active":
             return ok({"ops": ops_in_flight(backups=True)})
+
+        # Settings: the mode clanker-learn runs in (sysbox or privileged), behind the login.
+        if verb == "mode":
+            return ok({"mode": core.running_mode()})
 
         # Settings -> Backup: the list, a removal, a backup made readable for one download.
         if verb == "backup_list":

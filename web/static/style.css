@@ -284,6 +284,23 @@ ul.plain { margin: 6px 0 6px 20px; line-height: 1.5; }
 .sw-hint { padding: 10px 16px 12px; }
 .sw-said:empty { display: none; }
 
+/* ---- Settings -> Backup, How it runs; the mode's line under the project list ---- */
+.backup-set .form p { margin: 8px 0; line-height: 1.45; }
+.bk-bar { display: flex; align-items: center; gap: 12px; padding: 4px 16px 12px; }
+.backup-said { padding: 0 16px 10px; line-height: 1.45; }
+.bk-list { border-top: 1px solid var(--border); }
+.bk-row { display: flex; align-items: center; gap: 12px; padding: 9px 16px; border-bottom: 1px solid #333; font-size: 13px; }
+.bk-row:last-child { border-bottom: 0; }
+.bk-main { flex: 1; min-width: 0; }
+.bk-name code { overflow-wrap: anywhere; }
+.bk-meta { display: flex; flex-wrap: wrap; gap: 4px 14px; margin-top: 4px; }
+.bk-ran { margin-top: 4px; font-size: 12.5px; line-height: 1.4; }
+a.btnlink { display: inline-block; text-decoration: none; color: inherit; border-radius: 4px; padding: 3px 10px; font-size: 12.5px; background: var(--btn-secondary-bg); }
+a.btnlink:hover { background: var(--btn-secondary-bg-hover); }
+.mode-set .form p { margin: 8px 0; line-height: 1.45; }
+.mode-line { display: block; width: 100%; text-align: left; background: none; border-radius: 0; padding: 10px 16px; color: var(--fg-faint); font-size: 12px; }
+.mode-line:hover { background: none; color: var(--warn-fg); text-decoration: underline; }
+
 /* ---- lessons in the list (the mock's lesson rows) ---- */
 .chev { color: var(--fg-faint); background: none; padding: 0 2px; font-size: 11px; width: 16px; }
 .chev:hover { color: var(--fg-base); background: none; }
@@ -637,6 +654,8 @@ button.qopt:disabled { opacity: 1; cursor: default; }
     .sw-row { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
     .sw-head { display: none; }
     .sw-act { justify-self: start; }
+    .bk-row { flex-direction: column; align-items: stretch; gap: 8px; }
+    .bk-row .sw-act { justify-content: flex-start; }
     .shell { flex-direction: column; }
     .pane.kb { flex-direction: column; }
     .kb-nav { width: auto; height: auto; max-height: 30%; padding: 4px 0; border-right: 0; border-bottom: 1px solid var(--border); display: flex; flex-wrap: wrap; }

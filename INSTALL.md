@@ -17,6 +17,8 @@ The container needs to run a Docker daemon of its own. Docker allows that in two
 
 **Sysbox** (`--runtime=sysbox-runc -e CL_MODE=sysbox`) needs [sysbox](https://github.com/nestybox/sysbox) installed on the machine. The container then runs in a user namespace of its own: root inside it is not root on the machine, so something that gets out of a sandbox is still confined. It is supported by the code, and is the safer way, but it has not yet been run on a real machine. One thing is not known there: whether a restart of clanker-learn keeps what was installed in each sandbox outside its workspace and home folder. If it does not, recreating a project brings that back through its setup recipe (see [USING.md](USING.md)).
 
+The page says which of the two it runs in: Settings, under "How it runs". In privileged mode it also says what that means, and a quiet line, "privileged mode", at the bottom of the project list leads there.
+
 ## Build the image
 
 From a copy of this repository:
@@ -144,7 +146,7 @@ In the two volumes, and nowhere else.
 - `web/`: the page's certificate and which tab is on which port.
 - `dist/`: the fetched Claude Code and editor.
 - `versions.local.env`: the versions you raised in Settings.
-- `backups/`: the backups.
+- `backups/`: the backups. It is made at the first start, empty.
 
 `clanker-learn-docker`, mounted at `/var/lib/docker`: the inner Docker's images and each project's container, which holds what was installed in the sandbox outside its workspace and home folder.
 
@@ -165,14 +167,14 @@ A raised version is kept in `/data/versions.local.env`, over the repository's fi
 
 ## Backing up and restoring
 
-A backup is one archive of everything clanker-learn keeps, made inside the container:
+A backup is one archive of everything clanker-learn keeps. Make one in the page, in Settings, Backup: **Make a backup** shows its log while it runs, and each backup is listed with its size, when it was made and its projects, with **Download** and **Remove** (which asks for your password again). Or from the machine:
 
 ```
 docker exec clanker-learn cl backup
 docker exec clanker-learn cl backups
 ```
 
-`cl backup` writes `/data/backups/cl-backup-<date>T<time>Z.tar.gz` and says its size and how long it took. `cl backups` lists them, newest first. Most of a backup is the copies of Claude Code and the editor in each project's home folder: on a test machine, two new projects made a backup of 1.1 GB in under half a minute. A backup can be made while projects run, but files being written at that moment may be torn: the command says which projects were running. Stop them first for a clean copy.
+`cl backup` writes `/data/backups/cl-backup-<date>T<time>Z.tar.gz` and says its size and how long it took. `cl backups` lists them, newest first. Most of a backup is the copies of Claude Code and the editor in each project's home folder: on a test machine, two new projects made a backup of 1.1 GB in under half a minute. A backup can be made while projects run, but files being written at that moment may be torn: the command, and the backup's row in Settings, say which projects were running. Stop them first for a clean copy.
 
 What is inside: every project's workspace, home folder, record, keys and ports; the tutor's database (copied so that a running tutor does not tear it), the Claude token and the tutor's keys; the password's hash; the page's certificate; the versions you raised.
 
@@ -180,13 +182,13 @@ What is not inside: the fetched Claude Code and editor (a new installation fetch
 
 **Keep a backup as you would keep the keys to everything.** It holds the password's hash, the Claude token if you set one, each project's Claude Code login, and the keys into every sandbox. It is not encrypted.
 
-To keep one off the machine, copy it out:
+To keep one off the machine, press **Download** beside it in Settings, Backup, or copy it out:
 
 ```
 docker cp clanker-learn:/data/backups/cl-backup-<date>T<time>Z.tar.gz .
 ```
 
-To remove one:
+To remove one, press **Remove** beside it, or:
 
 ```
 docker exec clanker-learn cl backup-rm cl-backup-<date>T<time>Z.tar.gz
@@ -200,15 +202,14 @@ docker exec clanker-learn cl restore cl-backup-<date>T<time>Z.tar.gz
 
 A restore **replaces everything** clanker-learn keeps with what the backup holds: projects made since the backup are gone, and the password is the backup's. Before it changes anything it makes a backup of what is there, named in its answer, so a restore can be undone by restoring that one. It refuses while a project runs, while the tutor is writing an answer, and while a backup, a fetch of the software or an operation on a project is under way. It refuses a backup made by a newer clanker-learn. Afterwards, log in again with the backup's password and start your projects: each one's container is made again, and its setup recipe runs once.
 
-To restore onto a new installation, start it and wait for its first start to finish, then copy the backup in and restore it. A new installation has no folder of backups yet, so make it first:
+To restore onto a new installation, start it and wait for its first start to finish, then copy the backup in and restore it:
 
 ```
-docker exec clanker-learn mkdir -p -m 700 /data/backups
 docker cp cl-backup-<date>T<time>Z.tar.gz clanker-learn:/data/backups/
 docker exec clanker-learn cl restore cl-backup-<date>T<time>Z.tar.gz
 ```
 
-There are no scheduled backups. Restores are made with this command only; the page cannot make or restore one yet.
+There are no scheduled backups. A restore is made with this command only, never in the page, because it replaces everything.
 
 ## Updating clanker-learn
 

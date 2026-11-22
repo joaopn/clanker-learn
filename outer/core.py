@@ -2126,6 +2126,9 @@ def web_up(settings, say=say_nothing):
     if front is None:
         docker("network", "create", "--subnet", FRONT_SUBNET, "--label", "cl.role=front", FRONT_NET)
     os.makedirs(f"{DATA}/web", mode=0o700, exist_ok=True)
+    # The backups' folder, there from the first start: an archive is copied into it for a
+    # restore onto a new installation (write_backup makes it too, with the same mode).
+    os.makedirs(f"{DATA}/backups", mode=0o700, exist_ok=True)
     tutor_secret()   # mounted into the container: there before it is made
     args = web_args(settings, image)
     existing = inspect_container(WEB_CONTAINER)
@@ -2599,6 +2602,17 @@ def image_identity():
     with contextlib.suppress(CoreError):
         out["tutor_db_version"] = tutor_db_version_supported()
     return out
+
+
+def running_mode():
+    """The mode this clanker-learn runs in, "sysbox" or "privileged", as the init declared it
+    (its state, else CL_MODE, which the broker inherits from it); None when neither says."""
+    with contextlib.suppress(OSError, ValueError, AttributeError):
+        mode = json.loads(read_text("/run/cl/state.json")).get("mode")
+        if mode in ("sysbox", "privileged"):
+            return mode
+    mode = os.environ.get("CL_MODE", "")
+    return mode if mode in ("sysbox", "privileged") else None
 
 
 def backup(say=say_nothing):
