@@ -13,7 +13,8 @@ progress of an operation, a project's
 terminal (a WebSocket relayed to the sandbox's sshd, where it runs tmux), a project's session
 cookie (which its web-app tabs are opened with), a project's tabs (the files server, the web
 apps named by hand or detected, the raw TCP ports named by hand), opening a web app on an
-origin port of its own, and the ports named by hand. Every route on the page's port is refused
+origin port of its own, the ports named by hand, and the relay to the tutor service (a
+lesson's conversation, its run's event stream passed through). Every route on the page's port is refused
 without a login but the page and its files (static/), the login and the set-up.
 
 Besides the page's port it listens on every port of two ranges, on the same address: on an
@@ -1279,6 +1280,197 @@ async def broker_port_remove_handler(request: web.Request) -> web.Response:
     return await _port_relay(request, "port_remove", _forward(body, "port_remove"))
 
 
+# ---- the tutor: a relay to the tutor service (cl-tutor) -----------------------------
+#
+# The tutor service has no login of its own: it trusts this server's session check and a
+# secret the two share (a file mounted into both). Nothing of the browser's request goes
+# upstream but the method, the route's own path (built here from parts checked against
+# _TUTOR_ID_RE), the query and a JSON object; no cookie, no other header. The host is
+# CL_TUTOR_URL's, never the request's. The event stream of a run is passed through as it
+# comes, as _proxy_http passes an app's body (RS's streaming proxy, cut to one GET).
+
+TUTOR_URL = URL(os.environ.get("CL_TUTOR_URL", "http://cl-tutor:7801"))
+TUTOR_SECRET_FILE = Path("/run/cl-secret/tutor")
+TUTOR_CALL_TIMEOUT_S = 60
+# What the tutor service makes ids of: letters, digits, dashes. Matched whole.
+_TUTOR_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,63}")
+
+
+def _tutor_unavailable() -> web.Response:
+    return web.json_response(
+        {"ok": False, "error": {"kind": "unavailable", "message": "The tutor service is not running."}},
+        status=502)
+
+
+def _tutor_secret() -> str | None:
+    """The secret shared with the tutor service, read at every request (the file may come
+    after this server starts), or None when there is none. Never logged, never answered."""
+    try:
+        secret = TUTOR_SECRET_FILE.read_text().strip()
+    except OSError:
+        return None
+    return secret or None
+
+
+async def _tutor_gate(request: web.Request) -> web.Response | None:
+    """The checks every tutor route makes before anything else, in the order the other
+    routes make them: the origin for anything but GET, then the login. None when both pass."""
+    if request.method != "GET" and not origin_ok(request):
+        return web.Response(status=403, text="origin rejected")
+    if _broker_session(request) is None:
+        return _unauthorized()
+    return None
+
+
+async def _tutor_call(method: str, path: str, *, query=None, body: dict | None = None) -> web.Response:
+    """One call to the tutor service, its answer passed back with its status and JSON body.
+    The service down, absent, or refusing the secret is the contract's 502."""
+    secret = _tutor_secret()
+    if secret is None:
+        return _tutor_unavailable()
+    url = TUTOR_URL.with_path(path).with_query(query or {})
+    timeout = ClientTimeout(total=TUTOR_CALL_TIMEOUT_S, sock_connect=PASSTHROUGH_CONNECT_TIMEOUT_S)
+    try:
+        async with ClientSession(timeout=timeout) as sess, sess.request(
+                method, url, headers={"X-CL-Secret": secret}, allow_redirects=False,
+                **({"json": body} if body is not None else {})) as upstream:
+            status = upstream.status
+            text = await upstream.text()
+    except Exception as e:  # noqa: BLE001 - whatever went wrong on the way, the service is not there
+        log.info(f"tutor service: {method} {path} failed: {type(e).__name__}")
+        return _tutor_unavailable()
+    if status == 401:
+        # The service does not take this server's secret: nothing the browser can mend, and
+        # not the login's 401 either.
+        log.warning("tutor service: the shared secret was refused")
+        return _tutor_unavailable()
+    try:
+        answer = json.loads(text)
+    except ValueError:
+        return _tutor_unavailable()
+    return web.json_response(answer, status=status)
+
+
+async def _tutor_body(request: web.Request) -> dict | None | web.Response:
+    """The request's JSON object to forward, None when it sent no body, or a 400. Bounded by
+    aiohttp's request size limit (1 MiB; a larger body is its 413)."""
+    if not request.body_exists:
+        return None
+    body = await _json_body(request)
+    return _bad_request() if body is None else body
+
+
+async def tutor_project_lessons_handler(request: web.Request) -> web.Response:
+    """GET|POST /broker/tutor/project/{name}/lessons — a project's lessons, and a new one
+    ({title}). The project is named upstream by the name and the creation time of the
+    broker's `status`, never by what the browser sends; an unknown project is the broker's
+    refusal, answered as the project routes answer it."""
+    refused = await _tutor_gate(request)
+    if refused is not None:
+        return refused
+    body = None
+    if request.method == "POST":
+        body = await _json_body(request)
+        if body is None:
+            return _bad_request()
+    status, reply = await _relay(request, "status", {"name": request.match_info.get("name", "")})
+    if status != 200 or not reply.get("ok"):
+        return web.json_response(reply, status=status)
+    result = reply.get("result") or {}
+    project, created = result.get("name"), result.get("created")
+    if not isinstance(project, str) or not isinstance(created, str):
+        return web.json_response({"ok": False, "error": {"kind": "failed"}}, status=500)
+    if request.method == "GET":
+        return await _tutor_call("GET", "/lessons", query={"project": project, "created": created})
+    return await _tutor_call("POST", "/lessons", body={**{k: body[k] for k in ("title",) if k in body},
+                                                        "project": project, "created": created})
+
+
+def _tutor_route(template: str):
+    """A handler forwarding a route of the contract as it is: `template` is the upstream path,
+    with `{id}` filled from the request's path after the id is checked."""
+    async def handler(request: web.Request) -> web.Response:
+        refused = await _tutor_gate(request)
+        if refused is not None:
+            return refused
+        path = template
+        if "{id}" in template:
+            ident = request.match_info.get("id", "")
+            if not _TUTOR_ID_RE.fullmatch(ident):
+                return web.json_response(
+                    {"ok": False, "error": {"kind": "not_found", "message": "There is no such lesson or run."}},
+                    status=404)
+            path = template.replace("{id}", ident)
+        body = await _tutor_body(request)
+        if isinstance(body, web.Response):
+            return body
+        return await _tutor_call(request.method, path, query=request.rel_url.query, body=body)
+    return handler
+
+
+async def tutor_stream_handler(request: web.Request) -> web.StreamResponse:
+    """GET /broker/tutor/runs/{id}/stream — a run's events, passed through as they come:
+    each chunk written as it arrives, no total timeout (a turn can take many minutes), and
+    the upstream request closed when the browser goes away."""
+    refused = await _tutor_gate(request)
+    if refused is not None:
+        return refused
+    ident = request.match_info.get("id", "")
+    if not _TUTOR_ID_RE.fullmatch(ident):
+        return web.json_response(
+            {"ok": False, "error": {"kind": "not_found", "message": "There is no such run."}}, status=404)
+    secret = _tutor_secret()
+    if secret is None:
+        return _tutor_unavailable()
+    url = TUTOR_URL.with_path(f"/runs/{ident}/stream").with_query(request.rel_url.query)
+    timeout = ClientTimeout(total=None, sock_read=None, sock_connect=PASSTHROUGH_CONNECT_TIMEOUT_S)
+    async with ClientSession(timeout=timeout, auto_decompress=False) as sess:
+        try:
+            req_ctx = sess.get(url, headers={"X-CL-Secret": secret}, allow_redirects=False)
+            upstream = await req_ctx.__aenter__()
+        except Exception as e:  # noqa: BLE001 - as _proxy_http's connect guard
+            log.info(f"tutor service: stream {ident} failed: {type(e).__name__}")
+            return _tutor_unavailable()
+        try:
+            if upstream.status != 200 or not upstream.content_type.startswith("text/event-stream"):
+                status, text = upstream.status, await upstream.text()
+                if status == 401:
+                    log.warning("tutor service: the shared secret was refused")
+                    return _tutor_unavailable()
+                try:
+                    return web.json_response(json.loads(text), status=status)
+                except ValueError:
+                    return _tutor_unavailable()
+            response = web.StreamResponse(status=200, headers={
+                "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+            await response.prepare(request)
+
+            async def pump():
+                async for chunk in upstream.content.iter_any():
+                    await response.write(chunk)
+
+            # aiohttp does not cancel a handler whose browser went away, and a write notices
+            # it only at the next event: look at the connection every second meanwhile.
+            task = asyncio.ensure_future(pump())
+            try:
+                while not task.done():
+                    await asyncio.wait({task}, timeout=1)
+                    if request.transport is None or request.transport.is_closing():
+                        task.cancel()
+                        break
+                # The browser gone, or the service gone mid-stream: either way the stream ends.
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await task
+                with contextlib.suppress(ConnectionError):
+                    await response.write_eof()
+            finally:
+                task.cancel()
+            return response
+        finally:
+            upstream.close()   # the connection, not returned to the pool: upstream sees the close
+            await req_ctx.__aexit__(None, None, None)
+
+
 # ---- the origin proxy: HTTP and WebSocket on every origin port ----------------------
 
 class _UpstreamDown(Exception):
@@ -1760,6 +1952,20 @@ def build_app() -> web.Application:
     app.router.add_get("/broker/op/{op_id}/log", broker_op_log_handler)
     app.router.add_get("/broker/op/{op_id}/alive", broker_op_alive_handler)
     app.router.add_get("/broker/op/{op_id}", broker_op_status_handler)
+    # The tutor (the contract with cl-tutor's routes).
+    app.router.add_get("/broker/tutor/project/{name}/lessons", tutor_project_lessons_handler)
+    app.router.add_post("/broker/tutor/project/{name}/lessons", tutor_project_lessons_handler)
+    lesson = _tutor_route("/lessons/{id}")
+    app.router.add_get("/broker/tutor/lessons/{id}", lesson)
+    app.router.add_patch("/broker/tutor/lessons/{id}", lesson)
+    app.router.add_delete("/broker/tutor/lessons/{id}", lesson)
+    app.router.add_post("/broker/tutor/lessons/{id}/messages", _tutor_route("/lessons/{id}/messages"))
+    app.router.add_get("/broker/tutor/runs/{id}/stream", tutor_stream_handler)
+    app.router.add_post("/broker/tutor/runs/{id}/cancel", _tutor_route("/runs/{id}/cancel"))
+    app.router.add_get("/broker/tutor/activity", _tutor_route("/activity"))
+    settings = _tutor_route("/settings")
+    app.router.add_get("/broker/tutor/settings", settings)
+    app.router.add_put("/broker/tutor/settings", settings)
     return app
 
 
