@@ -3,10 +3,15 @@
 // app.js at RS commit 62788a8): the login proof (deriveLoginProof) and the terminal
 // (openTerminal, handleControl). Settings -> Software, the New project box's Agents and the
 // Config box's Agents are RS's (renderSoftwareScreen, mgmtRefreshDialog, agentsBoxContent,
-// mgmtAgentsUpdateDialog) adapted to this page's helpers. Plain script, no framework, no build step.
+// mgmtAgentsUpdateDialog) adapted to this page's helpers. The lessons and their conversation
+// follow the mock's lesson view; three pieces are ported from gaggiclanker's web client (said at
+// their place: the stream client, the context line's wording, the Markdown rules). Plain script,
+// no framework, no build step.
 //
 // Every string that comes from the server or a sandbox goes into the page as text: the
-// page is built with h() below, which makes text nodes, and never with innerHTML.
+// page is built with h() below, which makes text nodes, and never with innerHTML. The tutor's
+// Markdown is parsed by markdown-it into tokens, and the page builds the elements from them
+// (mdRender): markdown-it's own HTML output is never used.
 // The password and the proof live in local variables of the call that uses them, nowhere else.
 "use strict";
 
@@ -21,7 +26,8 @@ const MIN_PASSWORD_LENGTH = 8;
 const PROJECTS_EVERY_MS = 4000;
 const SERVICES_EVERY_MS = 5000;
 const OP_EVERY_MS = 1000;
-const LAYOUT_KEY = "cl-layout";   // browser storage: which project and tab were shown, nothing else
+const LAYOUT_KEY = "cl-layout";   // browser storage: which project, tab and lessons were shown, nothing else
+const LESSON_ID_RE = /^[A-Za-z0-9][A-Za-z0-9-]{0,63}$/;   // what the tutor service makes ids of
 
 const b64 = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf)));
 
@@ -76,19 +82,27 @@ function toast(text, bad) {
 }
 
 function loadLayout() {
+    const none = { project: null, tab: null, page: null, lessons: {}, expanded: [] };
     try {
         const v = JSON.parse(localStorage.getItem(LAYOUT_KEY) || "{}");
+        const lessons = {};
+        if (v.lessons && typeof v.lessons === "object") {
+            for (const [k, id] of Object.entries(v.lessons)) if (typeof id === "string" && LESSON_ID_RE.test(id)) lessons[k] = id;
+        }
         return { project: typeof v.project === "string" ? v.project : null,
                  tab: typeof v.tab === "string" ? v.tab : null,
-                 page: v.page === "settings" ? "settings" : null };
+                 page: v.page === "settings" ? "settings" : null,
+                 lessons,
+                 expanded: Array.isArray(v.expanded) ? v.expanded.filter((x) => typeof x === "string") : [] };
     } catch (_) {
-        return { project: null, tab: null, page: null };
+        return none;
     }
 }
 
 function saveLayout() {
     try {
-        localStorage.setItem(LAYOUT_KEY, JSON.stringify({ project: S.current, tab: S.current ? tabOf(S.current) : null, page: S.page }));
+        localStorage.setItem(LAYOUT_KEY, JSON.stringify({ project: S.current, tab: S.current ? tabOf(S.current) : null, page: S.page,
+                                                         lessons: S.lessonOf, expanded: [...S.expanded] }));
     } catch (_) { /* no storage: the page works without it */ }
 }
 
@@ -156,6 +170,13 @@ const S = {
     builds: {},            // a build in flight: target ("agent:claude" | "editor") -> {opId, verb}
     checking: new Set(),   // targets whose Refresh is asking upstream
     models: null,          // the catalog of Claude's tiers (/broker/models), once read
+    expanded: new Set(),   // projects shown open into their lessons in the list
+    lessons: {},           // project -> {list: [lesson], error: sentence or null}, as last read
+    lessonOf: {},          // project -> the id of its lesson tab (one at a time)
+    activity: new Set(),   // ids of the lessons whose tutor is working (/broker/tutor/activity)
+    tutorError: null,      // why the tutor service could not be asked, or null
+    tutorSettings: null,   // Settings -> Tutor: {claude_token_set}, as last read
+    tutorSettingsError: null,
 };
 
 const tabOf = (project) => S.tabs[project] || "shell";
@@ -316,19 +337,24 @@ function enterApp(projects) {
     S.shell = { rail, tabbar, panes, empty, settings };
     const layout = loadLayout();
     S.page = layout.page;
+    S.lessonOf = layout.lessons;
+    S.expanded = new Set(layout.expanded.filter((n) => projectRow(n)));
     if (layout.project && projectRow(layout.project)) {
         S.current = layout.project;
         if (layout.tab) S.tabs[layout.project] = layout.tab;
+        const lid = lessonTabId(layout.tab);
+        if (lid) S.lessonOf[layout.project] = lid;
     } else if (S.projects.length) {
         S.current = S.projects[0].name;
     }
+    if (S.current) S.expanded.add(S.current);
     S.timers.push(setInterval(refreshProjects, PROJECTS_EVERY_MS));
     S.timers.push(setInterval(() => { if (S.current) refreshServices(S.current); }, SERVICES_EVERY_MS));
     S.timers.push(setInterval(() => { if (S.page === "settings") refreshSoftware(); }, SERVICES_EVERY_MS));
     window.addEventListener("resize", refitVisible);
     refreshProjects();
     if (S.current) refreshServices(S.current);
-    if (S.page === "settings") refreshSoftware();
+    if (S.page === "settings") { refreshSoftware(); refreshTutorSettings(); }
     seedBuilds();
     render();
 }
@@ -341,7 +367,9 @@ function teardownApp() {
     closeModal();
     window.removeEventListener("resize", refitVisible);
     Object.assign(S, { loggedIn: false, projects: [], ops: [], current: null, creating: null, tabs: {}, services: {}, panes: {}, shell: null, listError: null,
-                       page: null, software: null, softwareError: null, builds: {}, checking: new Set(), models: null });
+                       page: null, software: null, softwareError: null, builds: {}, checking: new Set(), models: null,
+                       expanded: new Set(), lessons: {}, lessonOf: {}, activity: new Set(), tutorError: null,
+                       tutorSettings: null, tutorSettingsError: null });
 }
 
 async function refreshProjects() {
@@ -357,10 +385,15 @@ async function refreshProjects() {
             S.listError = errText(list.body);
         }
         if (ops.body.ok) S.ops = (ops.body.result && Array.isArray(ops.body.result.ops)) ? ops.body.result.ops : [];
-        // A project the broker no longer lists loses its panes.
+        // A project the broker no longer lists loses its panes and its lessons.
         for (const key of Object.keys(S.panes)) {
             if (!projectRow(key.split("|")[0])) dropPane(key);
         }
+        if (list.body.ok) {
+            for (const n of [...S.expanded]) if (!projectRow(n) && n !== S.creating) S.expanded.delete(n);
+            for (const n of Object.keys(S.lessons)) if (!projectRow(n)) delete S.lessons[n];
+        }
+        refreshTutor();
         if (S.current && S.current !== S.creating && !projectRow(S.current) && list.body.ok) {
             S.current = S.projects.length ? S.projects[0].name : null;
             if (S.current) refreshServices(S.current);
@@ -411,6 +444,7 @@ function renderRail() {
     const rows = S.projects.map((p) => {
         const st = stateWords(p);
         const op = opOf(p.name);
+        const open = S.expanded.has(p.name);
         return h("div", { class: "proj" + (p.name === S.current && !S.page ? " sel" : "") },
             h("div", { class: "proj-row", onclick: () => selectProject(p.name) },
                 h("span", { class: `dot ${st.cls}` }),
@@ -419,7 +453,10 @@ function renderRail() {
                         op ? h("button", { class: "link", title: "Show the operation's progress",
                                            onclick: (ev) => { ev.stopPropagation(); followOp(op.op_id, `${p.name}: ${OP_WORDS[op.verb] || op.verb}`); } }, "log") : null)),
                 h("button", { class: "gear", title: "Start, stop, limits, destroy",
-                              onclick: (ev) => { ev.stopPropagation(); projectDialog(p.name); } }, "⚙")));
+                              onclick: (ev) => { ev.stopPropagation(); projectDialog(p.name); } }, "⚙"),
+                h("button", { class: "chev", title: open ? "Hide the lessons" : "Show the lessons",
+                              onclick: (ev) => { ev.stopPropagation(); toggleLessons(p.name); } }, open ? "▾" : "▸")),
+            open ? lessonRows(p.name) : null);
     });
     if (!rows.length) rows.push(h("div", { class: "none" }, "No project yet."));
     if (S.listError) rows.push(h("div", { class: "none bad" }, S.listError));
@@ -428,7 +465,8 @@ function renderRail() {
 }
 
 function selectProject(name) {
-    if (S.current === name && !S.page) return;
+    if (!S.expanded.has(name)) { S.expanded.add(name); refreshLessons(name); }
+    if (S.current === name && !S.page) { saveLayout(); renderRail(); return; }
     S.page = null;
     S.current = name;
     saveLayout();
@@ -441,6 +479,8 @@ function selectProject(name) {
 function tabsOf(name) {
     const rows = S.services[name] || {};
     const tabs = [{ id: "shell", label: "Shell", type: "cli" }];
+    const lid = S.lessonOf[name];
+    if (lid) tabs.unshift({ id: lessonTab(lid), label: lessonTitle(name, lid), type: "lesson" });
     const raw = [];
     for (const [id, row] of Object.entries(rows)) {
         if (!row || typeof row !== "object") continue;
@@ -473,7 +513,8 @@ function renderTabbar() {
         const pane = S.panes[paneKey(name, t.id)];
         const url = pane && pane.url;
         items.push(h("div", { class: `tb t-${t.type}` + (tabOf(name) === t.id ? " on" : "") + (t.gone ? " gone" : ""),
-                              title: t.gone ? "This app no longer listens in the sandbox" : (t.row ? `port ${t.row.default_port} of the sandbox` : "a terminal in the sandbox"),
+                              title: t.gone ? "This app no longer listens in the sandbox" : t.type === "lesson" ? "the lesson's conversation with the tutor"
+                                  : (t.row ? `port ${t.row.default_port} of the sandbox` : "a terminal in the sandbox"),
                               onclick: () => showTab(name, t.id) },
             t.label,
             t.type !== "cli" && url ? h("a", { class: "newtab", href: url, target: "_blank", rel: "noopener noreferrer",
@@ -514,6 +555,7 @@ function showPane() {
         if (!pane) {
             if (id === "shell") pane = makeShellPane(name);
             else if (id === "ports") pane = makePortsPane(name);
+            else if (lessonTabId(id)) pane = makeLessonPane(name, lessonTabId(id));
             else {
                 const row = (S.services[name] || {})[id];
                 if (row) pane = makeWebPane(name, id, row);
@@ -532,6 +574,8 @@ function showPane() {
         }
     }
     for (const child of panes.children) child.hidden = child !== visible;
+    // A pane that went out of sight lets go of what it follows (a lesson closes its stream).
+    for (const pane of Object.values(S.panes)) if (pane.el !== visible && pane.hide) pane.hide();
     refitVisible();
 }
 
@@ -849,26 +893,768 @@ async function refreshPorts(name) {
     }));
 }
 
+// ---- the tutor: lessons under a project ---------------------------------------------------
+
+const tutorPath = (tail) => `/broker/tutor${tail}`;
+const lessonTab = (id) => `lesson:${id}`;
+const lessonTabId = (tab) => {
+    if (typeof tab !== "string" || !tab.startsWith("lesson:")) return null;
+    const id = tab.slice(7);
+    return LESSON_ID_RE.test(id) ? id : null;
+};
+const lessonRow = (name, id) => ((S.lessons[name] && S.lessons[name].list) || []).find((l) => l.id === id) || null;
+
+function lessonTitle(name, id) {
+    const row = lessonRow(name, id);
+    if (row && typeof row.title === "string" && row.title) return row.title;
+    const pane = S.panes[paneKey(name, lessonTab(id))];
+    return pane && pane.title ? pane.title : "Lesson";
+}
+
+// Whether a lesson's tutor is working: the activity list, the lesson's own `running`, or the
+// open conversation following an answer.
+function lessonWorking(name, l) {
+    if (S.activity.has(l.id) || l.running) return true;
+    const pane = S.panes[paneKey(name, lessonTab(l.id))];
+    return !!(pane && pane.turn);
+}
+
+function toggleLessons(name) {
+    if (S.expanded.has(name)) S.expanded.delete(name);
+    else { S.expanded.add(name); refreshLessons(name); }
+    saveLayout();
+    renderRail();
+}
+
+async function refreshLessons(name) {
+    if (!S.loggedIn) return;
+    const r = await api("GET", tutorPath(`/project/${enc(name)}/lessons`));
+    if (!S.loggedIn) return;
+    const res = r.body.ok && r.body.result;
+    if (res && Array.isArray(res.lessons)) S.lessons[name] = { list: res.lessons.filter((l) => l && typeof l.id === "string"), error: null };
+    else S.lessons[name] = { list: (S.lessons[name] && S.lessons[name].list) || [], error: errText(r.body) };
+    renderRail();
+    renderTabbar();
+}
+
+// With the page's other polls: who is working, and the lessons of the projects shown open.
+async function refreshTutor() {
+    if (!S.loggedIn) return;
+    const r = await api("GET", tutorPath("/activity"));
+    if (!S.loggedIn) return;
+    const res = r.body.ok && r.body.result;
+    if (res && Array.isArray(res.running)) {
+        S.tutorError = null;
+        S.activity = new Set(res.running.map((x) => x && x.lesson_id).filter((x) => typeof x === "string"));
+        // An open conversation whose tutor started working elsewhere (another browser tab)
+        // joins the answer.
+        for (const pane of Object.values(S.panes)) {
+            // A conversation that could not be read (the tutor service was away) is read again.
+            if (pane.kind === "lesson" && !pane.turn && !pane.loading && !pane.el.hidden && (pane.failed || S.activity.has(pane.lessonId))) pane.reload();
+        }
+    } else {
+        S.tutorError = errText(r.body);
+        S.activity = new Set();
+    }
+    await Promise.all([...S.expanded].filter((n) => projectRow(n)).map(refreshLessons));
+    renderRail();
+}
+
+function lessonRows(name) {
+    const L = S.lessons[name];
+    if (!L) return h("div", { class: "lessons" }, h("div", { class: "lnote" }, "Asking for the lessons…"));
+    if (L.error) return h("div", { class: "lessons" }, h("div", { class: "lnote bad", title: L.error }, L.error));
+    const shown = S.current === name && !S.page ? lessonTabId(tabOf(name)) : null;
+    const rows = L.list.map((l) => {
+        const working = lessonWorking(name, l);
+        return h("div", { class: "lesson-row" + (l.id === shown ? " sel" : ""), onclick: () => openLesson(name, l.id) },
+            working ? h("span", { class: "pulse", title: "The tutor is working" }) : h("span", { class: "lwait", title: "Waiting for you" }, "○"),
+            h("span", { class: "ltitle", title: String(l.title || "") }, String(l.title || "Lesson")),
+            h("button", { class: "gear lgear", title: "Rename or delete",
+                          onclick: (ev) => { ev.stopPropagation(); lessonDialog(name, l); } }, "⋯"));
+    });
+    rows.push(h("div", { class: "lesson-row lnew", onclick: () => newLessonDialog(name) }, "+ New lesson"));
+    return h("div", { class: "lessons" }, rows);
+}
+
+function openLesson(name, id) {
+    const prev = S.lessonOf[name];
+    if (prev && prev !== id) dropPane(paneKey(name, lessonTab(prev)));
+    S.lessonOf[name] = id;
+    S.tabs[name] = lessonTab(id);
+    S.page = null;
+    if (S.current !== name) { S.current = name; refreshServices(name); }
+    saveLayout();
+    render();
+}
+
+// The lesson is not there any more (deleted here or elsewhere): its tab goes.
+function lessonGone(name, id) {
+    dropPane(paneKey(name, lessonTab(id)));
+    if (S.lessonOf[name] === id) delete S.lessonOf[name];
+    if (tabOf(name) === lessonTab(id)) S.tabs[name] = "shell";
+    if (S.lessons[name]) S.lessons[name].list = S.lessons[name].list.filter((l) => l.id !== id);
+    saveLayout();
+    render();
+}
+
+function newLessonDialog(name) {
+    const title = h("input", { type: "text", maxlength: 200, autocomplete: "off", placeholder: "Ownership and borrowing" });
+    const said = h("p", { class: "bad" });
+    const go = h("button", { class: "primary", type: "submit" }, "Create");
+    const form = h("form", { method: "post", action: "#", onsubmit: async (ev) => {
+        ev.preventDefault();
+        if (!title.value.trim()) { said.textContent = "Give the lesson a title."; return; }
+        go.disabled = true;
+        const r = await api("POST", tutorPath(`/project/${enc(name)}/lessons`), { title: title.value.trim() });
+        go.disabled = false;
+        if (!r.body.ok || !r.body.result || typeof r.body.result.id !== "string") { said.textContent = errText(r.body); return; }
+        closeModal();
+        const L = S.lessons[name] || (S.lessons[name] = { list: [], error: null });
+        if (!L.list.some((l) => l.id === r.body.result.id)) L.list.push(r.body.result);
+        S.expanded.add(name);
+        openLesson(name, r.body.result.id);
+        refreshLessons(name);
+    } }, h("p", { class: "muted" }, `A new conversation with the tutor in ${name}.`), formRow("Title", title), said,
+        h("div", { class: "btns" }, h("button", { type: "button", onclick: closeModal }, "Cancel"), go));
+    openModal("New lesson", form, []);
+    title.focus();
+}
+
+function lessonDialog(name, lesson) {
+    const title = h("input", { type: "text", maxlength: 200, autocomplete: "off" });
+    title.value = String(lesson.title || "");
+    const said = h("p", { class: "bad" });
+    const save = h("button", { class: "primary", type: "submit" }, "Rename");
+    const form = h("form", { method: "post", action: "#", onsubmit: async (ev) => {
+        ev.preventDefault();
+        if (!title.value.trim()) { said.textContent = "Give the lesson a title."; return; }
+        save.disabled = true;
+        const r = await api("PATCH", tutorPath(`/lessons/${enc(lesson.id)}`), { title: title.value.trim() });
+        save.disabled = false;
+        if (!r.body.ok) { said.textContent = errText(r.body); return; }
+        closeModal();
+        const row = lessonRow(name, lesson.id);
+        if (row && r.body.result && typeof r.body.result.title === "string") row.title = r.body.result.title;
+        const pane = S.panes[paneKey(name, lessonTab(lesson.id))];
+        if (pane && row) pane.setTitle(row.title);
+        render();
+        refreshLessons(name);
+    } }, formRow("Title", title), h("div", { class: "btns" }, save));
+    const del = h("button", { class: "danger" }, "Delete the lesson");
+    const zone = h("div", {}, h("p", { class: "note" }, "The lesson and its conversation go, for good. The files the tutor made in the sandbox stay."), h("div", { class: "btns" }, del));
+    del.addEventListener("click", () => {
+        const sure = h("button", { class: "danger", onclick: async () => {
+            sure.disabled = true;
+            const r = await api("DELETE", tutorPath(`/lessons/${enc(lesson.id)}`));
+            sure.disabled = false;
+            if (!r.body.ok) { said.textContent = errText(r.body); return; }
+            closeModal();
+            lessonGone(name, lesson.id);
+            refreshLessons(name);
+        } }, "Delete");
+        zone.replaceChildren(h("p", {}, `Delete “${lesson.title}” and its conversation?`),
+            h("div", { class: "btns" }, h("button", { onclick: () => zone.replaceChildren(h("div", { class: "btns" }, del)) }, "Keep it"), sure));
+    });
+    openModal(`Lesson: ${lesson.title}`, [form, h("details", { class: "more danger-zone" }, h("summary", {}, "Delete"), zone), said],
+        [h("button", { onclick: closeModal }, "Close")]);
+    title.focus();
+}
+
+// ---- the context line (ported from gaggiclanker, web/src/lib/chatUsage.ts) ----------------
+
+// Tokens, short: under 1000 as is ("842"), then thousands ("9.6k" below 10k with one
+// decimal, "55k" above with none), then millions by the same rule ("1.5M", "12M").
+function formatTokens(count) {
+    if (count < 1000) return String(Math.round(count));
+    const round = (v) => (v < 10 ? Math.round(v * 10) / 10 : Math.round(v));
+    const thousands = round(count / 1000);
+    if (thousands < 1000) return `${thousands}k`;   // 999,500 rounds to "1000k": that is a million
+    return `${round(count / 1000000)}M`;
+}
+
+const usageNum = (v) => (typeof v === "number" && Number.isFinite(v) ? v : null);
+
+// "Context 55k of 200k tokens (92% cached)": "of N" only with a window, the share only with
+// the last request's cache read; null (no line) when the size is unknown. A part that is
+// missing is left out, never shown as zero.
+function contextFooter(usage) {
+    if (!usage || typeof usage !== "object") return null;
+    const context = usageNum(usage.context_tokens);
+    if (context === null) return null;
+    const win = usageNum(usage.context_window);
+    let text = `Context ${formatTokens(context)}`;
+    if (win !== null && win > 0) text += ` of ${formatTokens(win)}`;
+    text += " tokens";
+    const read = usageNum(usage.cache_read);
+    if (read !== null && context > 0 && read <= context) text += ` (${Math.round((read / context) * 100)}% cached)`;
+    return text;
+}
+
+// ---- the tutor's text: Markdown to elements ------------------------------------------------
+//
+// gaggiclanker's rules (web/src/components/chat/markdown.tsx), over markdown-it's tokens:
+// no raw HTML (markdown-it with html: false, so a <script> stays text); links only with a safe
+// scheme, opened in a new tab without an opener or a referrer, the words kept when the link
+// is not safe; an image is never fetched and becomes a link to its address; a fenced block is
+// plain text in a <pre>; a single newline is a line break; a wide table scrolls in its
+// message. Only the elements named below are ever made, and only text goes into them.
+
+const MD = window.markdownit ? window.markdownit({ html: false, linkify: true, breaks: true, typographer: false }) : null;
+const MD_BLOCK_TAGS = new Set(["p", "h1", "h2", "h3", "h4", "h5", "h6", "ul", "ol", "li", "blockquote", "table", "thead", "tbody", "tr", "th", "td"]);
+
+function safeHref(href) {
+    if (typeof href !== "string") return null;
+    let u;
+    try { u = new URL(href); } catch (_) { return null; }   // relative addresses are refused too
+    return u.protocol === "http:" || u.protocol === "https:" || u.protocol === "mailto:" ? u.href : null;
+}
+
+function mdRender(text) {
+    const frag = document.createDocumentFragment();
+    if (!MD) { frag.append(h("p", { class: "plain-text" }, text)); return frag; }
+    let tokens;
+    try { tokens = MD.parse(String(text), {}); } catch (_) { frag.append(h("p", { class: "plain-text" }, text)); return frag; }
+    const stack = [frag];
+    const top = () => stack[stack.length - 1];
+    for (const t of tokens) {
+        if (t.type === "inline") { mdInline(top(), t.children || []); continue; }
+        if (t.nesting === 1) {
+            if (t.hidden) { stack.push(top()); continue; }   // a tight list's paragraph: its text goes in the item
+            const tag = MD_BLOCK_TAGS.has(t.tag) ? t.tag : "div";
+            const el = document.createElement(tag);
+            if (tag === "ol" && t.attrGet("start") !== null) {
+                const start = Number(t.attrGet("start"));
+                if (Number.isInteger(start)) el.setAttribute("start", String(start));
+            }
+            if (tag === "th" || tag === "td") {
+                const m = /text-align:\s*(left|right|center)/.exec(t.attrGet("style") || "");
+                if (m) el.className = `al-${m[1]}`;
+            }
+            if (tag === "table") top().append(h("div", { class: "md-table" }, el));
+            else top().append(el);
+            stack.push(el);
+        } else if (t.nesting === -1) {
+            if (stack.length > 1) stack.pop();
+        } else if (t.type === "fence" || t.type === "code_block") {
+            top().append(h("pre", { class: "md-pre" }, t.content.replace(/\n$/, "")));
+        } else if (t.type === "hr") {
+            top().append(document.createElement("hr"));
+        } else if (t.content) {
+            top().append(h("p", {}, t.content));   // anything else (html_block cannot occur): as text
+        }
+    }
+    return frag;
+}
+
+function mdInline(parent, children) {
+    const stack = [parent];
+    const top = () => stack[stack.length - 1];
+    let inLink = 0;
+    for (const t of children) {
+        switch (t.type) {
+            case "text": top().append(t.content); break;
+            case "softbreak": case "hardbreak": top().append(document.createElement("br")); break;
+            case "code_inline": top().append(h("code", {}, t.content)); break;
+            case "strong_open": case "em_open": case "s_open": {
+                const el = document.createElement(t.tag === "strong" ? "strong" : t.tag === "s" ? "s" : "em");
+                top().append(el);
+                stack.push(el);
+                break;
+            }
+            case "link_open": {
+                const href = safeHref(t.attrGet("href"));
+                const el = href ? h("a", { href, target: "_blank", rel: "noopener noreferrer" }) : h("span", { class: "md-nolink" });
+                top().append(el);
+                stack.push(el);
+                inLink++;
+                break;
+            }
+            case "strong_close": case "em_close": case "s_close": case "link_close":
+                if (t.type === "link_close") inLink = Math.max(0, inLink - 1);
+                if (stack.length > 1) stack.pop();
+                break;
+            case "image": {
+                // Never fetched: a link to it, its alt text as the words (inside a link, the words only).
+                const label = t.content || t.attrGet("src") || "image";
+                const href = safeHref(t.attrGet("src"));
+                top().append(href && !inLink ? h("a", { href, target: "_blank", rel: "noopener noreferrer", class: "md-img", title: "An image, not shown here: open it in a new tab" }, `image: ${label}`)
+                                            : label);
+                break;
+            }
+            default:
+                if (t.content) top().append(t.content);   // html_inline cannot occur; anything else as text
+        }
+    }
+}
+
+// ---- the stream of an answer (ported from gaggiclanker, web/src/lib/sse.ts) ----------------
+//
+// Server-sent events over fetch and a stream reader. A 401 ends it (the login is gone); every
+// other failure is retried with a back-off from 1 s doubling up to 15 s, and the back-off starts
+// again once a stream opens. The web server does not pass Last-Event-ID on, so each attempt
+// asks with its own address (url(), built from the last event seen); beforeRetry() may end it.
+
+const STREAM_BASE_DELAY_MS = 1000;
+const STREAM_MAX_DELAY_MS = 15000;
+const SSE_FRAME_SEPARATOR = /\r\n\r\n|\n\n|\r\r/;   // CRLF, LF and CR, as the format allows
+
+function takeFrame(buffer) {
+    const m = SSE_FRAME_SEPARATOR.exec(buffer);
+    return m ? { frame: buffer.slice(0, m.index), rest: buffer.slice(m.index + m[0].length) } : null;
+}
+
+function parseSseFrame(frame) {
+    const data = [];
+    let event = "message", id;
+    for (const line of frame.split(/\r?\n/)) {
+        if (line.startsWith(":")) continue;   // a comment: the keep-alive ping
+        if (line.startsWith("data:")) data.push(line.slice(5).trimStart());
+        else if (line.startsWith("event:")) event = line.slice(6).trim();
+        else if (line.startsWith("id:")) id = line.slice(3).trim();
+    }
+    return data.length ? { event, data: data.join("\n"), id } : null;
+}
+
+function abortableDelay(ms, signal) {
+    return new Promise((resolve) => {
+        if (signal.aborted) return resolve();
+        const timer = setTimeout(resolve, ms);
+        signal.addEventListener("abort", () => { clearTimeout(timer); resolve(); }, { once: true });
+    });
+}
+
+// handlers: onEvent(data), onOpen(), onTrouble(status, body) (each failed attempt; status 0
+// is no answer or a dropped stream), onGone() (404: there is no such answer), beforeRetry()
+// (async; false ends it). Returns the function that closes it.
+function subscribeStream(url, handlers) {
+    const controller = new AbortController();
+    let closed = false;
+    (async () => {
+        let wait = STREAM_BASE_DELAY_MS;
+        let first = true;
+        while (!closed) {
+            if (!first) {
+                await abortableDelay(wait, controller.signal);
+                wait = Math.min(wait * 2, STREAM_MAX_DELAY_MS);
+                if (closed) return;
+                if (handlers.beforeRetry && !(await handlers.beforeRetry())) return;
+                if (closed) return;
+            }
+            first = false;
+            try {
+                const res = await fetch(url(), { credentials: "same-origin", cache: "no-store", headers: { Accept: "text/event-stream" }, signal: controller.signal });
+                const type = res.headers.get("Content-Type") || "";
+                if (!res.ok || !res.body || !type.startsWith("text/event-stream")) {
+                    let body = null;
+                    try { body = await res.json(); } catch (_) { /* not JSON */ }
+                    if (res.status === 401) { loggedOut("Your login has ended. Log in again."); return; }
+                    if (res.status === 404) { if (handlers.onGone) handlers.onGone(); return; }
+                    if (handlers.onTrouble) handlers.onTrouble(res.status, body);
+                    continue;
+                }
+                wait = STREAM_BASE_DELAY_MS;
+                if (handlers.onOpen) handlers.onOpen();
+                const decoder = new TextDecoder();
+                const reader = res.body.getReader();
+                let buffer = "";
+                try {
+                    while (!closed) {
+                        const { done, value } = await reader.read();
+                        if (done) break;
+                        buffer += decoder.decode(value, { stream: true });
+                        let next = takeFrame(buffer);
+                        while (next && !closed) {
+                            buffer = next.rest;
+                            const parsed = parseSseFrame(next.frame);
+                            if (parsed) {
+                                let data = null;
+                                try { data = JSON.parse(parsed.data); } catch (_) { /* a malformed frame must not end the stream */ }
+                                if (data && typeof data === "object") handlers.onEvent(data);
+                            }
+                            next = takeFrame(buffer);
+                        }
+                    }
+                } finally {
+                    try { await reader.cancel(); } catch (_) { /* already closed */ }
+                }
+                if (!closed && handlers.onTrouble) handlers.onTrouble(0, null);
+            } catch (_) {
+                if (closed || controller.signal.aborted) return;
+                if (handlers.onTrouble) handlers.onTrouble(0, null);
+            }
+        }
+    })();
+    return () => { closed = true; controller.abort(); };
+}
+
+// ---- a lesson's conversation (after the mock's lesson view) ----------------------------------
+
+const TOOL_WORDS = { shell: "ran", read: "read", write: "wrote", edit: "edited", search: "searched" };
+
+// A tool the tutor used, as the mock's trace line: a tick or a cross (… while it works), the
+// label, and what it gave when opened.
+function toolLine(tool) {
+    const mark = h("span", {});
+    const pre = h("pre", {});
+    const el = h("details", { class: "trace" },
+        h("summary", {}, mark, " ", TOOL_WORDS[tool.kind] ? h("span", { class: "tkind" }, TOOL_WORDS[tool.kind] + " ") : null,
+            h("span", { class: "tlabel" }, String(tool.label || tool.kind || "tool"))),
+        pre);
+    const set = (ok, output) => {
+        mark.className = ok === true ? "okc" : ok === false ? "badc" : "pendc";
+        mark.textContent = ok === true ? "✓" : ok === false ? "✗" : "…";
+        const detail = typeof tool.detail === "string" && tool.detail && tool.detail !== tool.label ? tool.detail : "";
+        const out = typeof output === "string" ? output : "";
+        pre.textContent = [detail, out].filter(Boolean).join("\n\n") || (ok === null || ok === undefined ? "Still working…" : "(no output)");
+    };
+    set(tool.ok, tool.output);
+    return { el, set };
+}
+
+function makeLessonPane(name, id) {
+    const titleEl = h("span", { class: "lt" }, lessonTitle(name, id));
+    const stateEl = h("span", { class: "lo" });
+    const inner = h("div", { class: "conv-inner" });
+    const conv = h("div", { class: "conv" }, inner);
+    const ctx = h("div", { class: "ctxline", hidden: true });
+    const said = h("div", { class: "composer-said", hidden: true });
+    const ta = h("textarea", { rows: 2, placeholder: "Write to the tutor…", "aria-label": "Your message to the tutor" });
+    const btn = h("button", { class: "primary" }, "Send");
+    const el = h("div", { class: "pane lesson-pane" },
+        h("div", { class: "lhead" }, h("div", { class: "lh-main" }, titleEl, stateEl)),
+        conv, ctx,
+        h("div", { class: "composer" }, said, h("div", { class: "composer-inner" }, ta, btn)));
+    const pane = { kind: "lesson", lessonId: id, el, title: null, turn: null, stale: true, loading: false, sending: false };
+    const tools = new Map();   // tool id -> its line, so a result fills the line its call made
+    let follow = true;         // the conversation follows the newest text unless scrolled up
+
+    conv.addEventListener("scroll", () => { follow = conv.scrollHeight - conv.scrollTop - conv.clientHeight < 40; });
+    const toBottom = () => { if (follow) conv.scrollTop = conv.scrollHeight; };
+
+    // A refusal (busy, a failed Stop) stays until the answer ends or the next message; a note
+    // about the connection goes as soon as the connection is back.
+    let trouble = false;
+    const tell = (text) => { trouble = false; said.textContent = text || ""; said.hidden = !text; };
+    const tellTrouble = (text) => { tell(text); trouble = true; };
+    const clearTrouble = () => { if (trouble) tell(""); };
+    pane.setTitle = (t) => { pane.title = t; titleEl.textContent = t; };
+    const setUsage = (usage) => {
+        const text = contextFooter(usage);
+        if (text) { ctx.textContent = text; ctx.hidden = false; }
+    };
+    const setComposer = () => {
+        const busy = !!pane.turn;
+        btn.textContent = busy ? "Stop" : "Send";
+        btn.className = busy ? "danger" : "primary";
+        btn.title = busy ? "Stop the tutor's answer" : "Send (Enter; Shift+Enter for a new line)";
+        stateEl.textContent = busy ? "the tutor is working…" : "";
+    };
+    const sysline = (text, cls) => { inner.append(h("div", { class: "sysline" + (cls ? ` ${cls}` : "") }, h("span", {}, text))); toBottom(); };
+    const emptyNote = () => inner.querySelector(".empty");
+
+    function messageEl(m) {
+        const you = m.role === "user";
+        const body = h("div", { class: you ? "body" : "body md" });
+        const traces = h("div", { class: "traces" });
+        for (const t of (Array.isArray(m.tools) ? m.tools : [])) {
+            if (!t || typeof t !== "object") continue;
+            const line = toolLine(t);
+            if (typeof t.id === "string") tools.set(t.id, line);
+            traces.append(line.el);
+        }
+        traces.hidden = !traces.childElementCount;
+        if (you) body.textContent = String(m.text || "");
+        else body.append(mdRender(String(m.text || "")));
+        const el = h("div", { class: `msg ${you ? "you" : "tutor"}` }, h("div", { class: "av" }, you ? "Y" : "T"),
+            h("div", { class: "mc" }, h("div", { class: "who" }, you ? "You" : "Tutor"), traces, body));
+        return { el, body, traces };
+    }
+
+    // ---- an answer being written
+    function draftOf(turn) {
+        if (turn.draft) return turn.draft;
+        const d = messageEl({ role: "assistant", text: "" });
+        d.text = "";
+        d.toolIds = [];
+        d.body.append(h("span", { class: "pulse typing", title: "The tutor is working" }));
+        inner.append(d.el);
+        turn.draft = d;
+        return d;
+    }
+    function paintDraft(turn) {
+        if (turn.paintQueued) return;
+        turn.paintQueued = true;
+        requestAnimationFrame(() => {
+            turn.paintQueued = false;
+            const d = turn.draft;
+            if (!d) return;
+            d.body.replaceChildren(mdRender(d.text));
+            if (pane.turn === turn) d.body.append(h("span", { class: "pulse typing" }));
+            toBottom();
+        });
+    }
+    function endTurn(turn) {
+        if (pane.turn !== turn) return;
+        turn.close();
+        pane.turn = null;
+        const d = turn.draft;
+        if (d) {
+            if (!d.text && !d.toolIds.length) d.el.remove();
+            else { d.body.replaceChildren(mdRender(d.text)); }
+        }
+        turn.draft = null;
+        tell("");
+        S.activity.delete(id);
+        const row = lessonRow(name, id);
+        if (row) row.running = null;
+        setComposer();
+        renderRail();
+    }
+    function onEvent(turn, ev) {
+        if (pane.turn !== turn || !Number.isInteger(ev.seq) || ev.seq <= turn.lastSeq) return;   // seen already
+        turn.lastSeq = ev.seq;
+        clearTrouble();
+        const d = ev.data && typeof ev.data === "object" ? ev.data : {};
+        switch (ev.kind) {
+            case "text_delta":
+                if (typeof d.text === "string") { draftOf(turn).text += d.text; paintDraft(turn); }
+                break;
+            case "tool_call": {
+                const draft = draftOf(turn);
+                const line = toolLine({ ...d, ok: null, output: "" });
+                if (typeof d.id === "string") { tools.set(d.id, line); draft.toolIds.push(d.id); }
+                draft.traces.append(line.el);
+                draft.traces.hidden = false;
+                toBottom();
+                break;
+            }
+            case "tool_result": {
+                const line = tools.get(d.id);
+                if (line) line.set(d.ok === true ? true : d.ok === false ? false : null, d.output);
+                break;
+            }
+            case "message": {
+                // The stored message replaces what was streamed; tool lines it does not hold yet
+                // stay in a new draft.
+                const m = d.message;
+                if (!m || typeof m !== "object") break;
+                const stored = messageEl(m);
+                const have = new Set((Array.isArray(m.tools) ? m.tools : []).map((t) => t && t.id));
+                const draft = turn.draft;
+                turn.draft = null;
+                if (draft) draft.el.replaceWith(stored.el); else inner.append(stored.el);
+                const left = draft ? draft.toolIds.filter((t) => !have.has(t)) : [];
+                if (left.length) {
+                    const next = draftOf(turn);
+                    for (const t of left) { next.traces.append(tools.get(t).el); next.toolIds.push(t); }
+                    next.traces.hidden = false;
+                }
+                toBottom();
+                break;
+            }
+            case "usage": setUsage(d.usage); break;
+            case "completed": setUsage(d.usage); endTurn(turn); break;
+            case "error": endTurn(turn); sysline(typeof d.message === "string" && d.message ? d.message : "The tutor's answer failed.", "bad"); break;
+            case "cancelled": endTurn(turn); sysline("stopped"); break;
+            default: break;
+        }
+    }
+
+    // Follow an answer from after `after`: replayed first, then as it is written.
+    function join(runId, after) {
+        const turn = { runId, lastSeq: after, draft: null, paintQueued: false, close: () => {} };
+        pane.turn = turn;
+        setComposer();
+        draftOf(turn);
+        turn.close = subscribeStream(() => tutorPath(`/runs/${enc(runId)}/stream?after=${turn.lastSeq}`), {
+            onEvent: (ev) => onEvent(turn, ev),
+            onOpen: clearTrouble,
+            onTrouble: (status, body) => tellTrouble(status ? `${errText(body)} Trying again…` : "The connection to the tutor dropped. Trying again…"),
+            onGone: () => { if (pane.turn === turn) { endTurn(turn); pane.reload(); } },
+            // Before asking again: is this answer still being written? If not, show the lesson as stored.
+            beforeRetry: async () => {
+                const r = await api("GET", tutorPath(`/lessons/${enc(id)}`));
+                if (pane.turn !== turn) return false;
+                if (r.status === 404) { endTurn(turn); lessonGone(name, id); return false; }
+                if (!r.body.ok || !r.body.result) return true;
+                const run = r.body.result.run;
+                if (run && run.id === runId && run.status === "running") return true;
+                endTurn(turn);
+                pane.reload();
+                return false;
+            },
+        });
+    }
+
+    async function load() {
+        if (pane.loading) return;
+        pane.loading = true;
+        if (pane.turn) endTurn(pane.turn);
+        const r = await api("GET", tutorPath(`/lessons/${enc(id)}`));
+        pane.loading = false;
+        if (S.panes[paneKey(name, lessonTab(id))] !== pane) return;   // closed meanwhile
+        if (pane.el.hidden) { pane.stale = true; return; }            // left meanwhile
+        pane.stale = false;
+        if (r.status === 404) { toast("That lesson is not there any more.", true); lessonGone(name, id); return; }
+        const res = r.body.ok && r.body.result;
+        pane.failed = !res || !res.lesson;
+        if (pane.failed) {
+            ctx.hidden = true;
+            inner.replaceChildren(h("div", { class: "empty" }, h("p", { class: "bad" }, errText(r.body)),
+                h("button", { onclick: () => { pane.stale = true; pane.update(); } }, "Try again")));
+            return;
+        }
+        if (typeof res.lesson.title === "string") {
+            pane.setTitle(res.lesson.title);
+            const row = lessonRow(name, id);
+            if (row) row.title = res.lesson.title;
+            renderTabbar();
+        }
+        const run = res.run && res.run.status === "running" ? res.run : null;
+        tools.clear();
+        inner.replaceChildren();
+        // A running answer is rebuilt from its first event: what it stored so far is left out here.
+        for (const m of (Array.isArray(res.messages) ? res.messages : [])) {
+            if (!m || typeof m !== "object") continue;
+            if (run && m.role === "assistant" && m.run_id === run.id) continue;
+            inner.append(messageEl(m).el);
+        }
+        if (!inner.childElementCount && !run) inner.append(h("div", { class: "empty" }, "Write to the tutor to begin."));
+        ctx.hidden = true;
+        setUsage(res.usage);
+        follow = true;
+        if (run) { S.activity.add(id); join(run.id, 0); } else setComposer();
+        renderRail();
+        requestAnimationFrame(toBottom);
+    }
+
+    async function send() {
+        const text = ta.value;
+        if (!text.trim() || pane.turn || pane.sending || pane.loading) return;
+        pane.sending = true;
+        btn.disabled = true;
+        tell("");
+        const r = await api("POST", tutorPath(`/lessons/${enc(id)}/messages`), { text });
+        pane.sending = false;
+        btn.disabled = false;
+        const res = r.body.ok && r.body.result;
+        if (!res || !res.run || typeof res.run.id !== "string") {
+            tell(errText(r.body));
+            // Busy: an answer is being written already (from another browser tab): follow it.
+            if (r.body.error && r.body.error.kind === "busy" && !pane.turn) load();
+            return;
+        }
+        ta.value = "";
+        tell("");
+        const empty = emptyNote();
+        if (empty) empty.remove();
+        if (res.message) inner.append(messageEl(res.message).el);
+        follow = true;
+        S.activity.add(id);
+        join(res.run.id, 0);
+        renderRail();
+        toBottom();
+    }
+
+    async function stop() {
+        const turn = pane.turn;
+        if (!turn) return;
+        btn.disabled = true;
+        const r = await api("POST", tutorPath(`/runs/${enc(turn.runId)}/cancel`));
+        btn.disabled = false;
+        if (!r.body.ok) tell(errText(r.body));
+    }
+
+    btn.addEventListener("click", () => (pane.turn ? stop() : send()));
+    ta.addEventListener("keydown", (ev) => {
+        if (ev.key === "Enter" && !ev.shiftKey && !ev.isComposing) { ev.preventDefault(); if (!pane.turn) send(); }
+    });
+
+    pane.reload = () => { pane.stale = true; if (!pane.el.hidden) load(); };
+    pane.update = () => { if (pane.stale && !pane.loading) load(); };
+    // Leaving the lesson closes its stream; the answer goes on, and is joined again on return.
+    pane.hide = () => {
+        if (pane.turn) endTurn(pane.turn);
+        pane.stale = true;
+    };
+    pane.close = pane.hide;
+    setComposer();
+    return pane;
+}
+
+// ---- Settings -> Tutor ------------------------------------------------------------------------
+
+async function refreshTutorSettings() {
+    if (!S.loggedIn) return;
+    const r = await api("GET", tutorPath("/settings"));
+    if (!S.loggedIn) return;
+    if (r.body.ok && r.body.result && typeof r.body.result.claude_token_set === "boolean") { S.tutorSettings = r.body.result; S.tutorSettingsError = null; }
+    else S.tutorSettingsError = errText(r.body);
+    renderTutorSettings();
+}
+
+function renderTutorSettings(note) {
+    if (!S.shell) return;
+    const box = S.shell.settings.tutor;
+    const st = S.tutorSettings;
+    const said = h("p", { class: note && note.bad ? "bad" : "muted" }, note ? note.text : "");
+    said.hidden = !note;
+    const about = h("p", { class: "note" }, "The tutor in every project signs in to Claude with this token, so a new project's first lesson works without a login in its Shell. " +
+        "Without one, the tutor uses the project's own Claude Code login, made with claude in its Shell.");
+    if (!st) {
+        box.replaceChildren(h("div", { class: S.tutorSettingsError ? "none bad" : "none" }, S.tutorSettingsError || "Asking…"), h("div", { class: "form" }, about));
+        return;
+    }
+    const token = h("input", { type: "password", autocomplete: "off", spellcheck: "false", placeholder: st.claude_token_set ? "a new token to replace it" : "the token" });
+    const put = async (value, btn) => {
+        btn.disabled = true;
+        const r = await api("PUT", tutorPath("/settings"), { claude_token: value });
+        btn.disabled = false;
+        token.value = "";
+        if (!r.body.ok || !r.body.result || typeof r.body.result.claude_token_set !== "boolean") { renderTutorSettings({ text: errText(r.body), bad: true }); return; }
+        S.tutorSettings = r.body.result;
+        renderTutorSettings({ text: value ? "The token is set." : "The token is removed." });
+    };
+    const setBtn = h("button", { class: "primary", type: "submit" }, st.claude_token_set ? "Replace" : "Set");
+    const remove = st.claude_token_set ? h("button", { type: "button", onclick: () => put("", remove) }, "Remove") : null;
+    const form = h("form", { class: "form", method: "post", action: "#", onsubmit: (ev) => {
+        ev.preventDefault();
+        if (!token.value.trim()) { renderTutorSettings({ text: "Paste a token first.", bad: true }); return; }
+        put(token.value.trim(), setBtn);
+    } },
+    h("p", { class: "tutor-state" }, h("span", { class: `dot inline ${st.claude_token_set ? "up" : ""}` }), " ",
+        st.claude_token_set ? "A Claude token is set. It is not shown again." : "No Claude token is set."),
+    about,
+    formRow("Claude token", token, "made with claude setup-token on a machine where you are logged in to Claude"),
+    said,
+    h("div", { class: "btns" }, remove, setBtn));
+    box.replaceChildren(form);
+}
+
 // ---- Settings -> Software (RS's Sandboxes -> Software: renderSoftwareScreen and its lane) -----
 
 function showSettings() {
     S.page = "settings";
     saveLayout();
     refreshSoftware();
+    refreshTutorSettings();
     render();
 }
 
 function makeSettingsPane() {
     const table = h("div", { class: "sw-table" }, h("div", { class: "none" }, "Asking…"));
     const said = h("p", { class: "muted sw-said" });
+    const tutor = h("div", { class: "card-body tutor-set" }, h("div", { class: "none" }, "Asking…"));
     const el = h("div", { class: "pane page", hidden: true }, h("div", { class: "page-inner" },
         h("h1", {}, "Settings"),
         h("p", { class: "sub" }, "The software clanker-learn deploys into the projects' sandboxes. Each is fetched in a throwaway container and copied into a project from there."),
         h("div", { class: "card" }, h("div", { class: "card-head" }, "Software"), table,
             h("p", { class: "note sw-hint" }, "Running projects keep the agent versions they have until Update is pressed in their Config box (Agents); new projects get these. " +
                 "A newer editor reaches a project at its next start.")),
-        said));
-    return { el, table, said };
+        said,
+        h("div", { class: "card" }, h("div", { class: "card-head" }, "Tutor"), tutor)));
+    return { el, table, said, tutor };
 }
 
 // The build lane's target for a row (the broker's build_target).

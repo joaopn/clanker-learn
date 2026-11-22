@@ -4,8 +4,11 @@ tarball was checked against the integrity value the registry publishes for it:
 
   @xterm/xterm 6.0.0       sha512-TQwDdQGtwwDt+2cgKDLn0IRaSxYu1tSUjgKarSDkUM0ZNiSRXFpjxEsvc/Zgc5kq5omJ+V0a8/kIM2WD3sMOYg==
   @xterm/addon-fit 0.11.0  sha512-jYcgT6xtVYhnhgxh3QgYDnnNMYTcf8ElbxxFzX0IZo+vabQqSPAjC3c1wJrKB5E19VwQei89QCiZZP86DCPF7g==
+  markdown-it 14.3.3       sha512-L//tDAkjTjJCU6pBUSBTgs3Kg4InVaZuUZog/b6V12UKhcDQ7S78877ibbCanRExwPuYP1CZD7Gd2dxSy1GXRg==
 
-(RS's web UI uses the same two versions.) The files, unchanged, and their SHA-256:
+(RS's web UI uses the same two versions of xterm.js. markdown-it 14.3.3 is the newest of its
+14 line, published 2026-10-16; the page uses it with raw HTML off and builds the elements from
+its tokens itself.) The files, unchanged, and their SHA-256:
 
   xterm.js           @xterm/xterm 6.0.0, lib/xterm.js
                      14903579ff54664cd72f8e8699e6961a6272c21863ec1c3b118cdc8af5d4a972
@@ -17,6 +20,10 @@ tarball was checked against the integrity value the registry publishes for it:
                      b569f629d00f2626a8100df2a1798210535621e42164dfd426a6fe5aac7b0ccd
   LICENSE.addon-fit  @xterm/addon-fit 0.11.0, LICENSE (MIT)
                      e256f01188af527e4d06d21d06fbf785ae9c50d4b328bf03cbe0ba7f0aa4228f
+  markdown-it.min.js markdown-it 14.3.3, dist/markdown-it.min.js (bundles its dependencies)
+                     494ba53db1aac9f676317dda7062bd9545b5f0bbe3f12b0ab1ab4f813825cfb0
+  LICENSE.markdown-it markdown-it 14.3.3, LICENSE (MIT)
+                     792c48c5a849a15fdf9e37e8bcf9e6d1dd13b32b46c642a748a0a46a9919d473
 
-The two scripts end with a sourceMappingURL comment; the maps are not kept (a browser's
+The three scripts end with a sourceMappingURL comment; the maps are not kept (a browser's
 developer tools may ask for them and get a 404).
