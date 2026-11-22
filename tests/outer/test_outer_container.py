@@ -212,7 +212,7 @@ def test_refuses_without_a_declared_mode_and_answers_with_the_reason(outer, peer
     state = one.wait()
     assert state["state"] == "refused"
     assert "CL_MODE is not set" in state["reason"]
-    assert "--runtime=sysbox-runc" in state["reason"] and "--privileged" in state["reason"]
+    assert "CL_MODE=sysbox" in state["reason"] and "CL_MODE=privileged" in state["reason"]
     assert not daemon_runs(one)
     status, body = fetch_from(peer["name"], f"http://{one.address()}:8080/")
     assert status == 503 and state["reason"] in body
@@ -343,7 +343,7 @@ def test_refuses_the_machines_control_groups_and_starts_nothing(outer):
     machine = machine_with_candidate(outer, "--cgroupns=host")
     state = candidate_state(machine)
     assert state["state"] == "refused", state
-    assert "--cgroupns=private" in state["reason"] and state["mode"] == "privileged"
+    assert "cgroup: private" in state["reason"] and state["mode"] == "privileged"
     assert tools_the_candidate_ran(machine) == ""
     status, body = fetched(machine.inner("exec", CANDIDATE, "python3", "-c", fetch_code("http://127.0.0.1:8080/")).stdout)
     assert status == 503 and state["reason"] in body

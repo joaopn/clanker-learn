@@ -5,7 +5,7 @@ Order of a start, and nothing is skipped:
 
   1. the container must be its own: its own process namespace, with tini as pid 1; a network
      that holds no other Docker daemon's bridges (--network=host is told by them); then the
-     mode the run command declared (CL_MODE=sysbox or privileged) is read and checked, and
+     mode that was declared (CL_MODE=sysbox or privileged) is read and checked, and
      its control groups must be its own (not --cgroupns=host);
   2. the guard rules are applied and checked, before any daemon exists;
   3. the inner Docker daemon is started and waited for, and the rules are checked again
@@ -96,22 +96,21 @@ CAP_SYS_ADMIN = 21
 # route this container already has, so an inner network never shadows the way out.
 ADDRESS_POOL = {"base": "10.210.0.0/16", "size": 24}
 HOW_TO_RUN = (
-    "Start clanker-learn in one of two ways: on sysbox "
-    "(docker run --runtime=sysbox-runc -e CL_MODE=sysbox ...) or privileged "
-    "(docker run --privileged -e CL_MODE=privileged ...)."
+    "Start clanker-learn in one of two ways, set in .env (./setup writes it): CL_MODE=sysbox, "
+    "on a machine with sysbox, or CL_MODE=privileged; then run docker compose up -d."
 )
 SEE_LOG = "The container's log (docker logs) says why."
 CGROUP_STARTS = ("/", "/init.scope")
 NOT_ITS_OWN_NETWORK = (
     "This container's network already holds a Docker daemon's networks ({found}), as it does when it is started with "
     "--network=host, or shares the network of a container in which a Docker daemon runs or ran. Its guard rules and its own "
-    "daemon would act on that network, so nothing was started and its port was not opened. Start it without --network=host, "
-    "on a network of its own. "
+    "daemon would act on that network, so nothing was started and its port was not opened. Start it without network_mode, "
+    "on the network of its own that compose.yaml gives it. "
 ) + HOW_TO_RUN
 NOT_ITS_OWN_CGROUPS = (
     "This container does not have its own control groups, as with --cgroupns=host (which is also Docker's default on a "
     "machine with cgroup v1). Its daemon would manage the machine's control groups, so nothing was started. Start it with "
-    "--cgroupns=private. "
+    "cgroup: private, as compose.yaml does. "
 ) + HOW_TO_RUN
 
 
@@ -843,7 +842,7 @@ def main():
     brokers, broker_tried, hurry_until = [], float("-inf"), 0.0
     keepers, keeper_tried = [], float("-inf")
     if not mine:
-        refuse("This container does not have its own process namespace and init. Start it without --pid=host, without --init and without another entrypoint. " + HOW_TO_RUN, mine=False)
+        refuse("This container does not have its own process namespace and init. Start it without pid: host, init: or another entrypoint (compose.yaml sets none). " + HOW_TO_RUN, mine=False)
     elif not_my_network:
         refuse(not_my_network, mine=False)
     else:

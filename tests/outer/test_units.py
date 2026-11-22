@@ -100,7 +100,7 @@ def test_a_declared_mode_is_taken_when_the_container_can_run_a_daemon(mode):
 def test_an_undeclared_mode_is_refused_naming_both_ways(env):
     with pytest.raises(init.Refused) as refused:
         init.declared_mode(env, IDENTITY_MAP, PRIVILEGED_STATUS)
-    assert "--runtime=sysbox-runc" in str(refused.value) and "--privileged" in str(refused.value)
+    assert "CL_MODE=sysbox" in str(refused.value) and "CL_MODE=privileged" in str(refused.value)
 
 
 @pytest.mark.parametrize("mode", ["sysbox", "privileged"])
@@ -108,14 +108,14 @@ def test_a_plain_container_is_refused_naming_both_ways(mode):
     with pytest.raises(init.Refused) as refused:
         init.declared_mode({"CL_MODE": mode}, IDENTITY_MAP, PLAIN_STATUS)
     assert "neither on sysbox nor privileged" in str(refused.value)
-    assert "--runtime=sysbox-runc" in str(refused.value) and "--privileged" in str(refused.value)
+    assert "CL_MODE=sysbox" in str(refused.value) and "CL_MODE=privileged" in str(refused.value)
 
 
 def test_sysbox_declared_without_a_user_namespace_is_refused():
     with pytest.raises(init.Refused) as refused:
         init.declared_mode({"CL_MODE": "sysbox"}, IDENTITY_MAP, PRIVILEGED_STATUS)
     assert "not in a user namespace" in str(refused.value)
-    assert "--runtime=sysbox-runc" in str(refused.value) and "--privileged" in str(refused.value)
+    assert "CL_MODE=sysbox" in str(refused.value) and "CL_MODE=privileged" in str(refused.value)
 
 
 def test_privileged_declared_without_a_user_namespace_is_taken():
@@ -451,7 +451,7 @@ def test_nothing_is_done_before_the_control_groups_are_known_to_be_its_own(monke
     monkeypatch.setattr(init, "STATE_FILE", str(tmp_path / "state.json"))
     with pytest.raises(init.Refused) as refused:
         init.bring_up(StopAlreadyAsked())
-    assert done == [] and "--cgroupns=private" in str(refused.value)
+    assert done == [] and "cgroup: private" in str(refused.value)
     assert init.state["mode"] == "privileged"  # the refusal still says which mode was declared
     monkeypatch.setattr(init, "own_cgroup_namespace", lambda text: True)
     init.bring_up(StopAlreadyAsked())
