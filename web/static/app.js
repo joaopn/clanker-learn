@@ -215,6 +215,8 @@ const S = {
     theme: null,           // THEMES id
     termTheme: null,       // TERM_THEMES id, or null = follow the interface theme
     railWidth: null,       // px
+    railPinned: false,     // kept: the sidebar stays beside the page (RS's state.railPinned)
+    railExpanded: false,   // in memory: the sidebar is shown (floating over the page while unpinned)
     iframeZoom: null,      // the scale of the Editor and web-app frames
     cliMaxWidth: null,     // px, 0 = full width
     termFontSize: null,    // px
@@ -372,7 +374,7 @@ function enterApp(projects) {
     document.getElementById("app").replaceChildren(h("div", { class: "shell" },
         h("nav", { class: "rail" },
             railSplitter,
-            h("div", { class: "rail-head" }, h("span", {}, "PROJECTS")),
+            h("div", { class: "rail-head" }, h("span", {}, "PROJECTS"), makePinButton()),
             rail,
             h("div", { class: "rail-foot" },
                 h("button", { class: "foot", onclick: newProjectDialog }, "+ New project"),
@@ -381,6 +383,7 @@ function enterApp(projects) {
                 h("button", { class: "foot", onclick: logout }, "Log out"))),
         h("div", { class: "main" }, tabbar, panes)));
     S.shell = { rail, tabbar, panes, empty, settings, knowledge };
+    applyRailState();
     const layout = loadLayout();
     S.page = layout.page;
     if (layout.kbView) S.kb.view = layout.kbView;
@@ -428,6 +431,8 @@ function teardownApp() {
                        cols: {}, tabLayout: null, dragging: false, renderPending: false,
                        kb: { view: "brief", raw: false, showRetired: false, q: "", seq: 0, changes: null, next: null, navData: null }, kbOpen: 0,
                        mode: null, backups: null, backupsError: null, backupOp: null, ctxWindow: {} });
+    // RS's lock: the sidebar comes back as pinned or hidden, never left floating.
+    S.railExpanded = S.railPinned;
 }
 
 async function refreshProjects() {
@@ -534,6 +539,7 @@ function renderRail() {
 function selectProject(name) {
     if (!S.expanded.has(name)) { S.expanded.add(name); refreshLessons(name); }
     if (S.current === name && !S.page) { saveLayout(); renderRail(); return; }
+    collapseRailAfterUse();
     S.page = null;
     S.current = name;
     saveLayout();
@@ -567,7 +573,7 @@ function tabsOf(name) {
     return { tabs, raw };
 }
 
-// The strip: the project's chip, then its tabs (the Ports page among them) in their columns'
+// The strip: the Projects tab, the project's chip, then its tabs (the Ports page among them) in their columns'
 // order. Side by side (desktop, two or three columns), each column's tabs sit in a group above
 // its pane, as RS's renderServiceTabs; at phone width it is one flat strip, as before.
 function renderTabbar() {
@@ -575,9 +581,9 @@ function renderTabbar() {
     const bar = S.shell.tabbar;
     const name = S.current;
     bar.classList.remove("cols");
-    if (S.page === "settings") { S.tabLayout = null; bar.replaceChildren(h("div", { class: "tb projchip" }, "Settings")); return; }
-    if (S.page === "knowledge") { S.tabLayout = null; bar.replaceChildren(h("div", { class: "tb projchip" }, "Knowledge")); return; }
-    if (!name) { S.tabLayout = null; bar.replaceChildren(h("div", { class: "tb projchip" }, "clanker-learn")); return; }
+    if (S.page === "settings") { S.tabLayout = null; bar.replaceChildren(makeProjectsTab(), h("div", { class: "tb projchip" }, "Settings")); return; }
+    if (S.page === "knowledge") { S.tabLayout = null; bar.replaceChildren(makeProjectsTab(), h("div", { class: "tb projchip" }, "Knowledge")); return; }
+    if (!name) { S.tabLayout = null; bar.replaceChildren(makeProjectsTab(), h("div", { class: "tb projchip" }, "clanker-learn")); return; }
     const { tabs, raw } = tabsOf(name);
     tabs.push({ id: "ports", label: "Ports", type: "ports" });
     // A tab that is not there any more (once the list is known) gives the focus to another tab
@@ -596,7 +602,9 @@ function renderTabbar() {
     const tabEl = (id, col) => makeTab(name, byId.get(id), col, on.has(id));
     const rawEls = raw.map(({ row }) => h("div", { class: "tb raw", title: `Raw TCP to port ${row.sandbox_port} of the sandbox. It has no login in front of it.` },
         h("span", { class: "rawlabel" }, String(row.label)), h("code", {}, `${location.hostname}:${row.passthrough_port}`)));
-    const items = [h("div", { class: "tb projchip" }, name)];
+    // The Projects tab first in every branch (RS's ensureProjectsTab: it is the only way to open
+    // a hidden sidebar). With columns it stays before the divider, so the first group starts after it.
+    const items = [makeProjectsTab(), h("div", { class: "tb projchip" }, name)];
     if (multi) {
         bar.classList.add("cols");
         items.push(h("div", { class: "tab-group-divider" }));
@@ -755,6 +763,8 @@ const RAIL_WIDTH_KEY = "cl-rail-width";
 const RAIL_WIDTH_DEFAULT = 250;
 const RAIL_WIDTH_MIN = 80;
 const RAIL_WIDTH_MAX = 480;
+// Whether the sidebar is pinned beside the page (RS's RAIL_PINNED_KEY); unpinned by default.
+const RAIL_PINNED_KEY = "cl-rail-pinned";
 
 // The browser's storage, which may refuse.
 function storeGet(key) { try { return localStorage.getItem(key); } catch (_) { return null; } }
@@ -1295,11 +1305,118 @@ function installRailSplitterDrag(splitter) {
     };
 }
 
+// ---- the sidebar hidden, floating or pinned: RS's rail expand / pin ------------------------------
+
+function loadRailPinned() {
+    return storeGet(RAIL_PINNED_KEY) === "1";
+}
+
+// RS's makeProjectsTab: the first item of the tab strip on every page, which shows and hides
+// the sidebar.
+function makeProjectsTab() {
+    const expanded = S.railPinned || S.railExpanded;
+    return h("div", { class: "tb projects-tab", title: expanded ? "Hide projects" : "Show projects",
+                      onclick: (ev) => { ev.stopPropagation(); toggleRailExpanded(); } },
+        h("span", { class: "projects-chevron" }, expanded ? "◀" : "▶"), h("span", {}, "Projects"));
+}
+
+function makePinButton() {
+    const btn = h("button", { class: "pin-btn", title: "Pin sidebar", onclick: (ev) => { ev.stopPropagation(); togglePinned(); } });
+    btn.innerHTML = '<svg viewBox="0 0 16 16" fill="currentColor" xmlns="http://www.w3.org/2000/svg"><path d="M9.828.722a.5.5 0 0 1 .354.146l4.95 4.95a.5.5 0 0 1 0 .707c-.48.48-1.072.588-1.503.588-.177 0-.335-.018-.46-.039l-3.134 3.134a5.927 5.927 0 0 1 .16 1.013c.046.702-.032 1.687-.72 2.375a.5.5 0 0 1-.707 0l-2.829-2.828-3.182 3.182c-.195.195-1.219.902-1.414.707-.195-.195.512-1.22.707-1.414l3.182-3.182-2.828-2.829a.5.5 0 0 1 0-.707c.688-.688 1.673-.767 2.375-.72a5.922 5.922 0 0 1 1.013.16l3.134-3.133a2.772 2.772 0 0 1-.04-.461c0-.43.108-1.022.589-1.503A.5.5 0 0 1 9.828.722z"/></svg>';
+    return btn;
+}
+
+// RS's applyRailState without its phone branch (this page has no phone layout). Adapted: the
+// terminals are refitted through refitVisible.
+function applyRailState() {
+    const shell = document.querySelector(".shell");
+    if (!shell) return;
+    const expanded = S.railPinned || S.railExpanded;
+    shell.classList.toggle("pinned", S.railPinned);
+    shell.classList.toggle("expanded", expanded);
+    const pinBtn = shell.querySelector(".rail-head .pin-btn");
+    if (pinBtn) {
+        pinBtn.classList.toggle("pinned", S.railPinned);
+        pinBtn.title = S.railPinned ? "Unpin sidebar" : "Pin sidebar";
+    }
+    const chevron = shell.querySelector(".projects-tab .projects-chevron");
+    if (chevron) chevron.textContent = expanded ? "◀" : "▶";
+    const projectsTab = shell.querySelector(".projects-tab");
+    if (projectsTab) projectsTab.title = expanded ? "Hide projects" : "Show projects";
+    // The page's width changes only when the pin does; the terminals measure themselves again.
+    setTimeout(refitVisible, 0);
+}
+
+function toggleRailExpanded() {
+    // The tab is the one show/hide control. If pinned, hiding also unpins (RS).
+    if (S.railPinned) {
+        S.railPinned = false;
+        storeSet(RAIL_PINNED_KEY, "0");
+        S.railExpanded = false;
+    } else {
+        S.railExpanded = !S.railExpanded;
+    }
+    applyRailState();
+}
+
+// RS's auto-collapse of the floating sidebar on any interaction outside it. Two paths, because
+// a click in a frame does not bubble out of it: a pointerdown on this document (a terminal, the
+// tab strip, a page), and the window's blur with a frame as the active element (a click inside
+// the Editor or a web-app tab). A pinned sidebar stays.
+function installRailOutsideClickHandlers() {
+    document.addEventListener("pointerdown", (ev) => {
+        if (!S.railExpanded || S.railPinned) return;
+        // A dialog in front (the New project box, a project's ⚙ box, every openModal) owns the interaction.
+        if (document.querySelector(".scrim")) return;
+        const path = ev.composedPath ? ev.composedPath() : [];
+        for (const node of path) {
+            if (!node || !node.classList) continue;
+            // Inside the sidebar itself: its own handlers run.
+            if (node.classList.contains("rail")) return;
+            // The Projects tab toggles by itself; closing here too would open and close it at once.
+            if (node.classList.contains("projects-tab")) return;
+        }
+        S.railExpanded = false;
+        applyRailState();
+    });
+
+    window.addEventListener("blur", () => {
+        if (!S.railExpanded || S.railPinned) return;
+        // A tick for the focus to settle into the frame before activeElement is read.
+        setTimeout(() => {
+            if (document.activeElement && document.activeElement.tagName === "IFRAME") {
+                S.railExpanded = false;
+                applyRailState();
+            }
+        }, 0);
+    });
+}
+
+function togglePinned() {
+    S.railPinned = !S.railPinned;
+    storeSet(RAIL_PINNED_KEY, S.railPinned ? "1" : "0");
+    // Pinning shows it; unpinning hides it, giving the width back in one click.
+    S.railExpanded = S.railPinned;
+    applyRailState();
+}
+
+// RS collapses the floating sidebar after a project switch; here after something is opened
+// from it (a lesson, a project's tab, Settings, Knowledge), never after a project's lessons
+// are only shown or hidden. A pinned sidebar stays.
+function collapseRailAfterUse() {
+    if (!S.railPinned && S.railExpanded) {
+        S.railExpanded = false;
+        applyRailState();
+    }
+}
+
 // RS's bootstrap of these settings, before the first render. Terminal choice first: applyTheme's
 // repaint reads it.
 function applyInterfaceSettings() {
     S.termTheme = loadStoredTermTheme();
     applyTheme(loadStoredTheme());
+    S.railPinned = loadRailPinned();
+    S.railExpanded = S.railPinned;
     S.railWidth = loadRailWidth();
     applyRailWidth(S.railWidth);
     S.iframeZoom = loadIframeZoom();
@@ -2162,6 +2279,7 @@ function openLesson(name, id) {
     S.lessonOf[name] = id;
     S.tabs[name] = lessonTab(id);
     S.page = null;
+    collapseRailAfterUse();
     if (S.current !== name) { S.current = name; refreshServices(name); }
     saveLayout();
     render();
@@ -3926,6 +4044,7 @@ function renderKbFoot() {
 // ---- the Knowledge page
 
 function showKnowledge(view) {
+    collapseRailAfterUse();
     S.page = "knowledge";
     if (view) S.kb.view = view;
     S.kb.changes = null;   // the History is read again when it is shown
@@ -4469,6 +4588,7 @@ function renderInstructions(st, note) {
 // ---- Settings -> Software (RS's Sandboxes -> Software: renderSoftwareScreen and its lane) -----
 
 function showSettings(part) {
+    collapseRailAfterUse();
     S.page = "settings";
     saveLayout();
     refreshSoftware();
@@ -5409,4 +5529,4 @@ async function followOp(opId, title, opts) {
 
 // ---- go ------------------------------------------------------------------------------------
 
-window.addEventListener("DOMContentLoaded", () => { applyInterfaceSettings(); start(); });
+window.addEventListener("DOMContentLoaded", () => { applyInterfaceSettings(); installRailOutsideClickHandlers(); start(); });
