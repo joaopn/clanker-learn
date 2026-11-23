@@ -1,11 +1,16 @@
 #!/bin/sh
-# ./setup                 Creates .env from .env.example, with CL_MODE set to sysbox when Docker
-#                         has sysbox's runtime and to privileged when it does not. An existing
-#                         .env is never overwritten.
-# ./setup cert-tailscale  Gets a certificate for this machine's tailnet name from Tailscale (Let's
-#                         Encrypt) and gives it to the running clanker-learn's web server in place
-#                         of its self-signed one (RS's `research webui cert-tailscale`). Run it
-#                         again to renew, before the certificate's 90 days run out.
+# ./setup                   Creates .env from .env.example, with CL_MODE set to sysbox when Docker
+#                           has sysbox's runtime and to privileged when it does not. An existing
+#                           .env is never overwritten.
+# ./setup cert-tailscale [--yes | -y]
+#                           Gets a certificate for this machine's tailnet name from Tailscale (Let's
+#                           Encrypt) and gives it to the running clanker-learn's web server in place
+#                           of its self-signed one (RS's `research webui cert-tailscale`). Run it
+#                           again to renew, before the certificate's 90 days run out. When the page
+#                           is published on loopback, it offers to publish it on this machine's
+#                           tailnet address (CL_BIND in .env, then docker compose up -d); it asks in
+#                           a terminal, and without one does it only with --yes.
+# ./setup cert-self-signed  Goes back to the web server's own self-signed certificate.
 set -eu
 cd "$(dirname "$0")"
 
@@ -13,8 +18,9 @@ CONTAINER=clanker-learn
 TLS=/data/web/tls   # cl-web's /data/tls, in the outer container
 
 usage() {
-    echo "usage: ./setup                 create .env (an existing one is kept)"
-    echo "       ./setup cert-tailscale  give clanker-learn a trusted certificate for this machine's tailnet name"
+    echo "usage: ./setup                            create .env (an existing one is kept)"
+    echo "       ./setup cert-tailscale [--yes|-y]  give clanker-learn a trusted certificate for this machine's tailnet name"
+    echo "       ./setup cert-self-signed           go back to the web server's own self-signed certificate"
 }
 
 # A setting of .env (the last line that sets it), or "" when .env or the setting is not there.
@@ -23,16 +29,73 @@ env_value() {
     sed -n "s/^[[:space:]]*$1=\([^[:space:]#]*\).*/\1/p" .env | tail -n 1
 }
 
-cert_tailscale() {
-    if ! command -v tailscale >/dev/null 2>&1; then
-        echo "The tailscale command is not on PATH. Install Tailscale on this machine first: https://tailscale.com/download" >&2
+# Sets $1=$2 in .env (which exists): the last active line that sets $1 is replaced, or the
+# setting is appended. Every other line is kept as it is; the file is written to a temp file
+# (with .env's mode) and moved into place. $2 must hold no sed metacharacters (an address).
+env_set() {
+    line=$(grep -n "^[[:space:]]*$1=" .env | tail -n 1 | cut -d: -f1)
+    cp -p .env .env.tmp
+    if [ -n "$line" ]; then
+        sed "${line}s/.*/$1=$2/" .env > .env.tmp
+    else
+        {
+            cat .env
+            [ -z "$(tail -c 1 .env)" ] || echo
+            echo "$1=$2"
+        } > .env.tmp
+    fi
+    mv .env.tmp .env
+}
+
+# Sets $sysbox to yes when Docker has sysbox's runtime, no when it does not.
+docker_runtimes() {
+    if ! runtimes=$(docker info --format '{{json .Runtimes}}' 2>/dev/null); then
+        echo "Docker could not be asked which runtimes it has (docker info failed). Is Docker running, and may you use it?" >&2
         exit 1
     fi
+    case $runtimes in
+        *'"sysbox-runc"'*) sysbox=yes ;;
+        *) sysbox=no ;;
+    esac
+}
+
+# Writes .env (which does not exist) from .env.example, CL_MODE set by Docker's runtimes.
+create_env() {
+    docker_runtimes
+    if [ "$sysbox" = yes ]; then
+        mode=sysbox
+        echo "Docker has sysbox's runtime (sysbox-runc): CL_MODE=sysbox."
+    else
+        mode=privileged
+        echo "Docker has no sysbox runtime (sysbox-runc), so CL_MODE=privileged: the container will be root-equivalent on this machine."
+        echo "To run on sysbox instead, install sysbox and set CL_MODE=sysbox in .env (INSTALL.md says what each gives)."
+    fi
+    sed "s/^CL_MODE=.*/CL_MODE=$mode/" .env.example > .env.tmp
+    mv .env.tmp .env
+}
+
+require_running() {
     running=$(docker inspect --format '{{.State.Running}}' "$CONTAINER" 2>/dev/null || true)
     if [ "$running" != true ]; then
         echo "The $CONTAINER container is not running, so there is no web server to give the certificate to. Start it (docker compose up -d), then run this again." >&2
         exit 1
     fi
+}
+
+restart_web() {
+    if docker exec "$CONTAINER" docker restart cl-web >/dev/null; then
+        echo "Restarted the web server."
+    else
+        echo "The web server (cl-web) could not be restarted; it takes the certificate at its next start (docker compose restart)." >&2
+    fi
+}
+
+cert_tailscale() {
+    if ! command -v tailscale >/dev/null 2>&1; then
+        echo "The tailscale command is not on PATH. Install Tailscale on this machine first: https://tailscale.com/download" >&2
+        exit 1
+    fi
+    require_running
     # The machine's tailnet name: Self.DNSName of `tailscale status --json`, its trailing dot
     # dropped (RS's _detect_tailscale_fqdn). The JSON is cut at its commas so that the first
     # DNSName after "Self" is Self's, however the JSON is laid out.
@@ -74,45 +137,111 @@ cert_tailscale() {
         && mv -f .custom.new .custom && mv -f key.pem.new key.pem && mv -f cert.pem.new cert.pem"
     echo "Staged the certificate for $fqdn in the web server's folder."
 
-    if docker exec "$CONTAINER" docker restart cl-web >/dev/null; then
-        echo "Restarted the web server."
-    else
-        echo "The web server (cl-web) could not be restarted; it takes the certificate at its next start (docker compose restart)." >&2
-    fi
-
+    # Where the page is published (CL_BIND) against this machine's tailnet address. On loopback
+    # the tailnet name cannot reach it: offer to publish it on the tailnet address, which
+    # re-creates the container (and with it the web server, so no separate restart).
     port=$(env_value CL_WEB_PORT)
     bind=$(env_value CL_BIND)
+    bind=${bind:-127.0.0.1}
+    ts_ip=$(tailscale ip -4 2>/dev/null | head -n 1 || true)
+    publish=no
+    note=
+    case $bind in
+        127.* | localhost | ::1)
+            if [ -z "$ts_ip" ]; then
+                note=no-address
+            else
+                echo
+                echo "The page is published on $bind only, so $fqdn (this machine's tailnet address, $ts_ip) will not reach it."
+                echo "Publishing it on $ts_ip sets CL_BIND=$ts_ip in .env and re-creates the $CONTAINER container with docker compose up -d:"
+                echo "running sandboxes and lessons are stopped and started again; projects and data stay on the volumes."
+                if [ "$assume_yes" = yes ]; then
+                    echo "Publishing it on $ts_ip (--yes)."
+                    publish=yes
+                elif [ -t 0 ]; then
+                    printf 'Publish clanker-learn on %s? [Y/n] ' "$ts_ip"
+                    read -r answer || answer=n
+                    case $answer in
+                        "" | [Yy] | [Yy][Ee][Ss]) publish=yes ;;
+                        *) note=declined ;;
+                    esac
+                else
+                    note=not-asked
+                fi
+            fi ;;
+        "$ts_ip") ;;
+        *) note=other-address ;;
+    esac
+
+    if [ "$publish" = yes ]; then
+        if [ ! -e .env ]; then
+            create_env
+            echo "Wrote .env from .env.example."
+        fi
+        env_set CL_BIND "$ts_ip"
+        echo "Set CL_BIND=$ts_ip in .env. Re-creating the $CONTAINER container (docker compose up -d)..."
+        if docker compose up -d; then
+            echo "Re-created the $CONTAINER container: the page is published on $ts_ip, and the web server has the new certificate."
+        else
+            echo "docker compose up -d failed. .env says CL_BIND=$ts_ip now; run docker compose up -d again to publish the page there (it also gives the web server the new certificate)." >&2
+            exit 1
+        fi
+    else
+        restart_web
+    fi
+
     echo
     echo "Open https://$fqdn:${port:-7788}/"
-    case ${bind:-127.0.0.1} in
-        127.* | localhost | ::1)
-            ts_ip=$(tailscale ip -4 2>/dev/null | head -n 1 || true)
-            echo "Note: CL_BIND is ${bind:-not set (127.0.0.1)}, so the page answers on this machine's loopback only."
-            echo "  To reach it over the tailnet, set CL_BIND=${ts_ip:-<this machine's tailnet address: tailscale ip -4>} in .env, then docker compose up -d." ;;
-        *)
+    case $note in
+        no-address)
+            echo "Note: the page is published on $bind only, and this machine's tailnet address could not be read (tailscale ip -4), so the tailnet name will not reach it."
+            echo "  Run ./setup cert-tailscale again once tailscale ip -4 shows an address: it offers to publish the page there." ;;
+        declined)
+            echo "Not changed: CL_BIND stays $bind, so the page answers by $fqdn only where $bind is reachable, which the tailnet name ($ts_ip) is not."
+            echo "  Run ./setup cert-tailscale again to be asked again." ;;
+        not-asked)
+            echo "Not changed: there is no terminal to ask in, so CL_BIND stays $bind and the tailnet name will not reach the page."
+            echo "  To publish it on $ts_ip, run: ./setup cert-tailscale --yes" ;;
+        other-address)
             echo "Note: CL_BIND=$bind must be this machine's tailnet address (or an address $fqdn resolves to)."
             echo "  Opened by that address instead of the name, the browser warns: the certificate names $fqdn only." ;;
     esac
     echo "The certificate is good for 90 days: run ./setup cert-tailscale again to renew it (Settings, How it runs, and the server's log say when it is due)."
 }
 
+cert_self_signed() {
+    require_running
+    docker exec "$CONTAINER" rm -f "$TLS/.custom"
+    echo "Removed the .custom marker from the web server's folder."
+    if docker exec "$CONTAINER" docker restart cl-web >/dev/null; then
+        echo "Restarted the web server: it makes its own self-signed certificate again."
+    else
+        echo "The web server (cl-web) could not be restarted; it makes its own certificate at its next start (docker compose restart)." >&2
+        exit 1
+    fi
+}
+
 case ${1-} in
     "") ;;
-    cert-tailscale) cert_tailscale; exit 0 ;;
+    cert-tailscale)
+        shift
+        assume_yes=no
+        for arg in "$@"; do
+            case $arg in
+                --yes | -y) assume_yes=yes ;;
+                *) usage >&2; exit 2 ;;
+            esac
+        done
+        cert_tailscale; exit 0 ;;
+    cert-self-signed)
+        [ $# -eq 1 ] || { usage >&2; exit 2; }
+        cert_self_signed; exit 0 ;;
     -h | --help | help) usage; exit 0 ;;
     *) usage >&2; exit 2 ;;
 esac
 
-if ! runtimes=$(docker info --format '{{json .Runtimes}}' 2>/dev/null); then
-    echo "Docker could not be asked which runtimes it has (docker info failed). Is Docker running, and may you use it?" >&2
-    exit 1
-fi
-case $runtimes in
-    *'"sysbox-runc"'*) sysbox=yes ;;
-    *) sysbox=no ;;
-esac
-
 if [ -e .env ]; then
+    docker_runtimes
     mode=$(sed -n 's/^[[:space:]]*CL_MODE=\([^[:space:]#]*\).*/\1/p' .env | tail -n 1)
     echo ".env exists and is kept; it says CL_MODE=${mode:-<not set: sysbox>}."
     if [ "${mode:-sysbox}" = sysbox ] && [ "$sysbox" = no ]; then
@@ -121,14 +250,5 @@ if [ -e .env ]; then
     exit 0
 fi
 
-if [ "$sysbox" = yes ]; then
-    mode=sysbox
-    echo "Docker has sysbox's runtime (sysbox-runc): CL_MODE=sysbox."
-else
-    mode=privileged
-    echo "Docker has no sysbox runtime (sysbox-runc), so CL_MODE=privileged: the container will be root-equivalent on this machine."
-    echo "To run on sysbox instead, install sysbox and set CL_MODE=sysbox in .env (INSTALL.md says what each gives)."
-fi
-sed "s/^CL_MODE=.*/CL_MODE=$mode/" .env.example > .env.tmp
-mv .env.tmp .env
+create_env
 echo "Wrote .env. Next: docker compose up"

@@ -122,7 +122,6 @@ What it needs:
 - Tailscale running on this machine, which is in the tailnet.
 - HTTPS turned on for the tailnet, in the admin console's DNS settings (https://login.tailscale.com/admin/dns).
 - `tailscale cert` allowed for you: run `./setup cert-tailscale` with sudo, or make yourself tailscaled's operator once with `sudo tailscale up --operator=$USER`.
-- The page published on this machine's tailnet address (`tailscale ip -4`), or on an address the tailnet name resolves to: `CL_BIND=<tailnet address>` in `.env`, then `docker compose up -d`.
 
 Then, with clanker-learn running:
 
@@ -132,7 +131,9 @@ Then, with clanker-learn running:
 
 It asks Tailscale for the certificate, puts it in the web server's folder (the data volume's `web/tls/`) with a `.custom` marker that keeps the web server from replacing it with a self-signed one, restarts the web server and prints the address to open: `https://<host>.<tailnet>.ts.net:7788/`. Open the page by that name, not by the address: the certificate names the tailnet name only, and the tabs follow the name the page was opened by.
 
-The certificate is good for 90 days and is not renewed by itself: run `./setup cert-tailscale` again before it runs out. From 30 days before, the web server's log says it is due at every start, and so does Settings, How it runs. To go back to the self-signed certificate, delete `web/tls/.custom` on the data volume (`docker exec clanker-learn rm /data/web/tls/.custom`) and restart the web server (`docker exec clanker-learn docker restart cl-web`): it makes its own again.
+The tailnet name reaches the page only when the page is published on this machine's tailnet address (`tailscale ip -4`). When it is published on loopback (the default), the command says so and asks `Publish clanker-learn on <tailnet address>? [Y/n]`. On yes it sets `CL_BIND` to that address in `.env` (creating `.env` first, as `./setup` does, when there is none) and re-creates the container with `docker compose up -d`, which also restarts the web server: running sandboxes and lessons are stopped and started again, projects and data stay on the volumes. On no, nothing changes, and the name does not reach the page. Run without a terminal (a script, a pipe), it asks nothing and changes nothing unless it is given `--yes`: `./setup cert-tailscale --yes`.
+
+The certificate is good for 90 days and is not renewed by itself: run `./setup cert-tailscale` again before it runs out. From 30 days before, the web server's log says it is due at every start, and so does Settings, How it runs. To go back to the self-signed certificate, run `./setup cert-self-signed`: it removes the `.custom` marker and restarts the web server, which makes its own certificate again.
 
 ## Settings
 
