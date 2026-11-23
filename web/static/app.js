@@ -205,6 +205,7 @@ const S = {
     renderPending: false,  // a render was asked for during the drag
     wasNarrow: false,      // the window was at phone width at the last render
     mode: null,            // the way clanker-learn runs, "sysbox" or "privileged" (/broker/mode), once read
+    cert: null,            // the certificate in use, {provider, not_after, state} (/broker/cert), once read
     backups: null,         // Settings -> Backup: the broker's rows, as last read
     backupsError: null,
     backupOp: null,        // the op_id of the backup being made, or null
@@ -4717,12 +4718,29 @@ async function pinReset(row, btn) {
 // ---- Settings -> How it runs: the mode (sysbox or privileged) ---------------------------------
 
 async function refreshMode() {
-    const r = await api("GET", "/broker/mode");
+    const [r, c] = await Promise.all([api("GET", "/broker/mode"), api("GET", "/broker/cert")]);
     if (!S.loggedIn) return;
     const m = r.body.ok && r.body.result ? r.body.result.mode : null;
     S.mode = m === "sysbox" || m === "privileged" ? m : null;
+    S.cert = c.body.ok && c.body.result ? c.body.result : null;
     render();
     renderMode();
+}
+
+// One line under How it runs: who made the certificate and when it ends (RS's cert-tailscale).
+function certLine() {
+    const c = S.cert;
+    if (!c) return h("p", { class: "muted" }, "The certificate could not be read.");
+    const until = c.not_after ? new Date(c.not_after).toLocaleDateString() : "an unreadable date";
+    if (c.provider === "self-signed") {
+        return h("p", { class: "muted" }, `Certificate: clanker-learn's own, self-signed, until ${until}. ` +
+            "The editor's previews (Markdown, notebooks) need a certificate the browser trusts; INSTALL.md says how to get one from Tailscale.");
+    }
+    const due = c.state === "expired" || c.state === "renew-due";
+    const when = c.state === "expired" ? `expired on ${until}` : `until ${until}`;
+    const renew = c.provider.startsWith("tailscale:") ? "run ./setup cert-tailscale on the machine" : "replace it in the web server's folder";
+    return h("p", { class: due ? "tutor-state" : "muted" }, due ? h("span", { class: "dot inline warn" }) : null,
+        `${due ? " " : ""}Certificate: ${c.provider}, ${when}.` + (due ? ` Renew it: ${renew}.` : ""));
 }
 
 function renderMode() {
@@ -4738,7 +4756,7 @@ function renderMode() {
                 h("p", {}, "Root inside it is not root on this machine: on top of the sandboxes' own container boundary and clanker-learn's guard rules, " +
                     "the whole of clanker-learn lives in a user namespace of its own.")]
             : [h("p", { class: "muted" }, "The mode could not be read.")];
-    box.replaceChildren(head, h("div", { class: "form" }, said));
+    box.replaceChildren(head, h("div", { class: "form" }, said, certLine()));
 }
 
 // ---- Settings -> Backup: make one (an operation of its own lane), list, download, remove ------

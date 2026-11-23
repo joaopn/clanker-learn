@@ -89,7 +89,7 @@ Each of these is true today. They are stated once, here.
 - **Raw TCP ports you name by hand have no login in front of them.** Anything that can reach that port on your machine reaches the sandbox's port.
 - **The tool server is the one thing of clanker-learn's own that a sandbox reaches**, and it runs in the tutor service, the process that holds the keys into every sandbox and the Claude token. A flaw in it would be reachable from any sandbox.
 - **The proof the browser sends is the same at every login.** To clanker-learn it is as good as the password; it travels only inside the page's HTTPS.
-- **The certificate is clanker-learn's own**, accepted by you at the first visit. The browser cannot tell it from another self-made one later.
+- **The certificate is clanker-learn's own**, accepted by you at the first visit, unless you gave it one from Tailscale (`./setup cert-tailscale`, INSTALL.md). The browser cannot tell a self-made one from another self-made one later.
 - **Sysbox has not been run.** The sysbox mode is written and tested only as far as its configuration goes; nothing here has been checked on a real sysbox machine.
 - **arm64 has not been run.**
 - **No real model has answered through pi.** pi was run here only against a stand-in for a model that speaks the same API: its login inside a project, a real provider's answers and its tool calls against a real model have not been seen. The first real pi lesson may show faults.

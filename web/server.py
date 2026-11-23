@@ -2161,22 +2161,78 @@ def generate_self_signed(cert_path: Path, key_path: Path, bind: str) -> None:
     key_path.chmod(0o600)
 
 
+def _custom_provider(tls_dir: Path) -> str | None:
+    """Who supplied the certificate, from the `.custom` marker beside it (`./setup
+    cert-tailscale` writes `tailscale:<name>`), or None when there is no marker: the
+    certificate is then the self-signed one this server makes."""
+    marker = tls_dir / ".custom"
+    if not marker.exists():
+        return None
+    try:
+        return marker.read_text().strip() or "user-supplied"
+    except OSError:
+        return "user-supplied"
+
+
 def ensure_tls(cert_path: Path, key_path: Path, bind: str) -> ssl.SSLContext:
-    """The TLS context, with the self-signed certificate made, or made again when it is
-    missing, expired, due for renewal, unreadable, or does not cover `bind`. (RS also takes a
-    certificate from a tailnet or one supplied by hand; this server is published on the
-    machine's loopback only, where neither applies.)"""
+    """The TLS context. Without a `.custom` marker beside the certificate, the self-signed
+    certificate is made, or made again when it is missing, expired, due for renewal,
+    unreadable, or does not cover `bind`. With the marker (RS's: `./setup cert-tailscale`
+    stages a Tailscale certificate for the machine's tailnet name with it), the certificate
+    is never replaced, even expired: it may name no address of `bind`, which is right when
+    the browser opens the page by the tailnet name, and falling back would swap a trusted
+    certificate for an untrusted one. It is renewed on the machine; the log says when that
+    is due. Only a marker whose files are missing falls back to a self-signed certificate."""
     present = cert_path.exists() and key_path.exists()
     expiry = services.cert_expiry_state(
         cert_not_after(cert_path) if present else None, datetime.now(UTC))
-    reason = services.self_signed_regen_reason(
-        present, present and cert_covers_bind(cert_path, bind), expiry)
-    if reason:
-        log.info(f"regenerating the self-signed certificate: {reason}")
-        generate_self_signed(cert_path, key_path, bind)
+    provider = _custom_provider(cert_path.parent)
+    if provider is not None:
+        log.info(f"using the {provider} certificate (no self-signed one is made)")
+        if not present:
+            log.error(f".custom marker present but the certificate or its key is missing in "
+                      f"{cert_path.parent}: falling back to a self-signed certificate")
+            generate_self_signed(cert_path, key_path, bind)
+        elif expiry in ("expired", "renew-due"):
+            after = cert_not_after(cert_path)
+            when = after.strftime("%Y-%m-%d %H:%M UTC") if after else "unknown"
+            remedy = ("run ./setup cert-tailscale on the machine"
+                      if provider.startswith("tailscale:")
+                      else "replace the certificate in the web server's folder")
+            if expiry == "expired":
+                log.error(f"the {provider} certificate EXPIRED on {when}; browsers refuse it: {remedy}")
+            else:
+                log.warning(f"the {provider} certificate expires on {when}, "
+                            f"within {services.CERT_RENEW_BEFORE.days} days: {remedy}")
+    else:
+        reason = services.self_signed_regen_reason(
+            present, present and cert_covers_bind(cert_path, bind), expiry)
+        if reason:
+            log.info(f"regenerating the self-signed certificate: {reason}")
+            generate_self_signed(cert_path, key_path, bind)
     ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
     ctx.load_cert_chain(certfile=str(cert_path), keyfile=str(key_path))
     return ctx
+
+
+def cert_info(tls_dir: Path) -> dict:
+    """The certificate in `tls_dir`, read now from its files: {provider: "self-signed" or the
+    marker's text, not_after: ISO time or None, state: ok | renew-due | expired | unknown}."""
+    cert_path = tls_dir / "cert.pem"
+    after = cert_not_after(cert_path) if cert_path.exists() else None
+    if after is not None and after.tzinfo is None:
+        after = after.replace(tzinfo=UTC)
+    return {"provider": _custom_provider(tls_dir) or "self-signed",
+            "not_after": after.isoformat() if after else None,
+            "state": services.cert_expiry_state(after, datetime.now(UTC))}
+
+
+async def cert_handler(request: web.Request) -> web.Response:
+    """GET /broker/cert — the certificate this server uses, for Settings → How it runs
+    (gated read, answered here: the broker has no part in it)."""
+    if _broker_session(request) is None:
+        return _unauthorized()
+    return web.json_response({"ok": True, "result": cert_info(TLS_DIR)})
 
 
 def build_app() -> web.Application:
@@ -2198,6 +2254,7 @@ def build_app() -> web.Application:
     app.router.add_post("/broker/software/refresh-check", broker_refresh_check_handler)
     app.router.add_post("/broker/software/pin-reset", broker_pin_reset_handler)
     app.router.add_get("/broker/mode", broker_mode_handler)
+    app.router.add_get("/broker/cert", cert_handler)
     app.router.add_get("/broker/backups", broker_backups_handler)
     app.router.add_post("/broker/backups", broker_backup_make_handler)
     app.router.add_get("/broker/backups/active", broker_backup_active_handler)

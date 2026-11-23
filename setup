@@ -1,8 +1,107 @@
 #!/bin/sh
-# Creates .env from .env.example, with CL_MODE set to sysbox when Docker has sysbox's runtime
-# and to privileged when it does not. An existing .env is never overwritten.
+# ./setup                 Creates .env from .env.example, with CL_MODE set to sysbox when Docker
+#                         has sysbox's runtime and to privileged when it does not. An existing
+#                         .env is never overwritten.
+# ./setup cert-tailscale  Gets a certificate for this machine's tailnet name from Tailscale (Let's
+#                         Encrypt) and gives it to the running clanker-learn's web server in place
+#                         of its self-signed one (RS's `research webui cert-tailscale`). Run it
+#                         again to renew, before the certificate's 90 days run out.
 set -eu
 cd "$(dirname "$0")"
+
+CONTAINER=clanker-learn
+TLS=/data/web/tls   # cl-web's /data/tls, in the outer container
+
+usage() {
+    echo "usage: ./setup                 create .env (an existing one is kept)"
+    echo "       ./setup cert-tailscale  give clanker-learn a trusted certificate for this machine's tailnet name"
+}
+
+# A setting of .env (the last line that sets it), or "" when .env or the setting is not there.
+env_value() {
+    [ -e .env ] || return 0
+    sed -n "s/^[[:space:]]*$1=\([^[:space:]#]*\).*/\1/p" .env | tail -n 1
+}
+
+cert_tailscale() {
+    if ! command -v tailscale >/dev/null 2>&1; then
+        echo "The tailscale command is not on PATH. Install Tailscale on this machine first: https://tailscale.com/download" >&2
+        exit 1
+    fi
+    running=$(docker inspect --format '{{.State.Running}}' "$CONTAINER" 2>/dev/null || true)
+    if [ "$running" != true ]; then
+        echo "The $CONTAINER container is not running, so there is no web server to give the certificate to. Start it (docker compose up -d), then run this again." >&2
+        exit 1
+    fi
+    # The machine's tailnet name: Self.DNSName of `tailscale status --json`, its trailing dot
+    # dropped (RS's _detect_tailscale_fqdn). The JSON is cut at its commas so that the first
+    # DNSName after "Self" is Self's, however the JSON is laid out.
+    fqdn=$(tailscale status --json 2>/dev/null | tr ',' '\n' | sed -n '/"Self"/,$p' \
+        | sed -n 's/.*"DNSName"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)
+    fqdn=${fqdn%.}
+    if [ -z "$fqdn" ]; then
+        echo "This machine's tailnet name could not be read. Check with \`tailscale status\` that Tailscale runs and this machine is in a tailnet." >&2
+        exit 1
+    fi
+
+    tmp=$(mktemp -d)
+    trap 'rm -rf "$tmp"' EXIT
+    trap 'exit 1' HUP INT TERM
+    echo "Asking Tailscale for a certificate for $fqdn..."
+    if ! out=$(tailscale cert --cert-file "$tmp/cert.pem" --key-file "$tmp/key.pem" "$fqdn" 2>&1); then
+        low=$(printf '%s' "$out" | tr '[:upper:]' '[:lower:]')
+        case $low in
+            *https*'not enabled'* | *https*'not configured'*)
+                echo "HTTPS is not enabled for your tailnet. Turn it on at https://login.tailscale.com/admin/dns, then run this again." >&2 ;;
+            *operator* | *permission* | *denied*)
+                echo "\`tailscale cert\` needs sudo unless you are tailscaled's operator. Once: sudo tailscale up --operator=\$USER (or run this with sudo)." >&2 ;;
+            *)
+                echo "tailscale cert failed." >&2 ;;
+        esac
+        echo "  tailscale: $out" >&2
+        exit 1
+    fi
+
+    # Staged under new names, given the owner and modes the web server's own certificate has
+    # (cl-web runs as root: certificate 644, key 600), then moved into place, the marker first:
+    # a web server started in between keeps the new certificate instead of making a self-signed one.
+    docker exec "$CONTAINER" mkdir -p "$TLS"
+    docker exec -i "$CONTAINER" sh -c "umask 077 && cat > $TLS/key.pem.new" < "$tmp/key.pem"
+    docker exec -i "$CONTAINER" sh -c "cat > $TLS/cert.pem.new" < "$tmp/cert.pem"
+    printf 'tailscale:%s\n' "$fqdn" | docker exec -i "$CONTAINER" sh -c "cat > $TLS/.custom.new"
+    docker exec "$CONTAINER" sh -c "cd $TLS && chown 0:0 key.pem.new cert.pem.new .custom.new \
+        && chmod 600 key.pem.new && chmod 644 cert.pem.new .custom.new \
+        && mv -f .custom.new .custom && mv -f key.pem.new key.pem && mv -f cert.pem.new cert.pem"
+    echo "Staged the certificate for $fqdn in the web server's folder."
+
+    if docker exec "$CONTAINER" docker restart cl-web >/dev/null; then
+        echo "Restarted the web server."
+    else
+        echo "The web server (cl-web) could not be restarted; it takes the certificate at its next start (docker compose restart)." >&2
+    fi
+
+    port=$(env_value CL_WEB_PORT)
+    bind=$(env_value CL_BIND)
+    echo
+    echo "Open https://$fqdn:${port:-7788}/"
+    case ${bind:-127.0.0.1} in
+        127.* | localhost | ::1)
+            ts_ip=$(tailscale ip -4 2>/dev/null | head -n 1 || true)
+            echo "Note: CL_BIND is ${bind:-not set (127.0.0.1)}, so the page answers on this machine's loopback only."
+            echo "  To reach it over the tailnet, set CL_BIND=${ts_ip:-<this machine's tailnet address: tailscale ip -4>} in .env, then docker compose up -d." ;;
+        *)
+            echo "Note: CL_BIND=$bind must be this machine's tailnet address (or an address $fqdn resolves to)."
+            echo "  Opened by that address instead of the name, the browser warns: the certificate names $fqdn only." ;;
+    esac
+    echo "The certificate is good for 90 days: run ./setup cert-tailscale again to renew it (Settings, How it runs, and the server's log say when it is due)."
+}
+
+case ${1-} in
+    "") ;;
+    cert-tailscale) cert_tailscale; exit 0 ;;
+    -h | --help | help) usage; exit 0 ;;
+    *) usage >&2; exit 2 ;;
+esac
 
 if ! runtimes=$(docker info --format '{{json .Runtimes}}' 2>/dev/null); then
     echo "Docker could not be asked which runtimes it has (docker info failed). Is Docker running, and may you use it?" >&2

@@ -113,6 +113,27 @@ printf '%s' 'the new password' | docker exec -i clanker-learn cl passwd
 
 `cl passwd` also changes a password that is set, and ends every session: log in again. What is stored is a hash, on the data volume. There is one password and no user accounts: clanker-learn is for one learner.
 
+## A trusted certificate (Tailscale)
+
+The editor's previews (Markdown, notebooks and other webviews) run a service worker, and browsers refuse service workers under a certificate they do not trust, even after you accepted the warning. With the self-signed certificate the editor says `Could not register service worker: SecurityError`. If the machine is in a Tailscale tailnet, Tailscale gives it a trusted certificate (from Let's Encrypt) for its tailnet name, `<host>.<tailnet>.ts.net`.
+
+What it needs:
+
+- Tailscale running on this machine, which is in the tailnet.
+- HTTPS turned on for the tailnet, in the admin console's DNS settings (https://login.tailscale.com/admin/dns).
+- `tailscale cert` allowed for you: run `./setup cert-tailscale` with sudo, or make yourself tailscaled's operator once with `sudo tailscale up --operator=$USER`.
+- The page published on this machine's tailnet address (`tailscale ip -4`), or on an address the tailnet name resolves to: `CL_BIND=<tailnet address>` in `.env`, then `docker compose up -d`.
+
+Then, with clanker-learn running:
+
+```
+./setup cert-tailscale
+```
+
+It asks Tailscale for the certificate, puts it in the web server's folder (the data volume's `web/tls/`) with a `.custom` marker that keeps the web server from replacing it with a self-signed one, restarts the web server and prints the address to open: `https://<host>.<tailnet>.ts.net:7788/`. Open the page by that name, not by the address: the certificate names the tailnet name only, and the tabs follow the name the page was opened by.
+
+The certificate is good for 90 days and is not renewed by itself: run `./setup cert-tailscale` again before it runs out. From 30 days before, the web server's log says it is due at every start, and so does Settings, How it runs. To go back to the self-signed certificate, delete `web/tls/.custom` on the data volume (`docker exec clanker-learn rm /data/web/tls/.custom`) and restart the web server (`docker exec clanker-learn docker restart cl-web`): it makes its own again.
+
 ## Settings
 
 The settings are in `.env`, in the copy of the repository; `compose.yaml` holds their defaults and `.env.example` lists them, each with its default. Change one in `.env` and run `docker compose up -d`: the container is made again with it, on the same volumes. A setting given in the shell's environment (`CL_WEB=off docker compose up -d`) wins over `.env`.
