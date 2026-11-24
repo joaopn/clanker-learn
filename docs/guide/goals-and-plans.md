@@ -35,7 +35,7 @@ Each lesson in the sidebar shows its state: ○ not started, ▸ in progress, �
 | Add a lesson by hand, outside the plan | **+ New lesson** at the end of the list: a title and an optional objective. |
 | Rename a lesson or change its objective | The **⋯** beside it, then **Save**. |
 | Delete a lesson and its conversation | The **⋯** beside it, then **Delete**. The files the tutor made in the sandbox stay. |
-| Show or hide a project's lessons | The ▸ / ▾ beside the project. |
+| Show or hide a project's lessons | Click the project you are in, or the ▸ / ▾ beside the project. |
 
 Goals keeps its name and its place: it has no ⋯.
 

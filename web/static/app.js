@@ -540,9 +540,10 @@ function renderRail() {
     renderKbFoot();
 }
 
+// A click on the project you are in shows or hides its lessons; on another one, opens it with them shown.
 function selectProject(name) {
+    if (S.current === name && !S.page) { toggleLessons(name); return; }
     if (!S.expanded.has(name)) { S.expanded.add(name); refreshLessons(name); }
-    if (S.current === name && !S.page) { saveLayout(); renderRail(); return; }
     collapseRailAfterUse();
     S.page = null;
     S.current = name;
