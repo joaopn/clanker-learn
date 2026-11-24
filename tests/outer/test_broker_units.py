@@ -75,10 +75,10 @@ def read(path):
 def test_a_verb_that_is_not_in_the_table_is_unknown_and_nothing_passes_through(world):
     for verb in ("docker", "exec", "update", "passwd", "", None, 7, "__run-op"):
         assert kind(world.call(verb)) == "unknown_verb"
-    assert sorted(broker.FIELDS) == ["agent_pull", "agent_refresh", "agent_refresh_check", "agents_add", "agents_model", "agents_update", "attach",
+    assert sorted(broker.FIELDS) == ["agent_pull", "agent_refresh", "agent_refresh_check", "agents_add", "agents_model", "agents_update", "archive", "attach",
                                      "backup", "backup_active", "backup_fetch", "backup_list", "backup_rm", "build_active", "build_alive", "create", "destroy", "editor_pull", "editor_refresh", "editor_refresh_check",
                                      "first_password", "lifecycle_active", "limits", "list", "mode", "models", "op", "pin_reset", "port_add", "port_detect",
-                                     "port_list", "port_remove", "project_export", "project_import", "recreate", "setup_needed", "software_status", "start", "status", "stop"]
+                                     "port_list", "port_remove", "project_export", "project_import", "recreate", "setup_needed", "software_status", "start", "status", "stop", "unarchive"]
 
 
 def test_arguments_that_are_not_an_object_are_a_bad_request(world):

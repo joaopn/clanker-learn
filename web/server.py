@@ -123,7 +123,7 @@ BROKER_FIELDS = {
 }
 BROKER_FIELDS["project_import"] = (*BROKER_FIELDS["create"], "upload")
 # agents_update is RS's action name: an operation, like start (RS runs it on its lifecycle lane).
-PROJECT_ACTIONS = ("start", "stop", "recreate", "destroy", "agents_update")
+PROJECT_ACTIONS = ("start", "stop", "archive", "unarchive", "recreate", "destroy", "agents_update")
 
 LOGIN_MAX_FAILURES = 10
 LOGIN_WINDOW_SECONDS = 60
@@ -534,7 +534,7 @@ async def broker_project_limits_handler(request: web.Request) -> web.Response:
 
 
 async def broker_project_action_handler(request: web.Request) -> web.Response:
-    """POST /broker/project/{name}/{action} — start|stop|recreate|destroy (gated,
+    """POST /broker/project/{name}/{action} — start|stop|archive|unarchive|recreate|destroy (gated,
     origin-checked). Returns {op_id} at once; the browser follows the operation. A refusal
     (busy, validation, the password needed again) comes back in this response, before any
     operation exists. `destroy` carries a step-up `proof` (the client-side login derivation

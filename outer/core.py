@@ -296,7 +296,7 @@ def new_record(name, limits=None, agents=(), editor=False, claude_model="", clau
     pi_model, pi_thinking = checked_pi_pair(pi_model, pi_thinking, agents)
     return {"name": valid_name(name), "created": datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds"),
             "wanted": "running", "limits": checked_limits(limits), "agents": agents, "editor": checked_editor(editor),
-            "claude_model": model, "claude_effort": effort, "pi_model": pi_model, "pi_thinking": pi_thinking}
+            "claude_model": model, "claude_effort": effort, "pi_model": pi_model, "pi_thinking": pi_thinking, "archived": False}
 
 
 def model_catalog():
@@ -413,6 +413,9 @@ def read_record(name):
         record["editor"] = checked_editor(record.get("editor", True))
         record["claude_model"], record["claude_effort"] = checked_claude_pair(record.get("claude_model", ""), record.get("claude_effort", ""))
         record["pi_model"], record["pi_thinking"] = checked_pi_pair(record.get("pi_model", ""), record.get("pi_thinking", ""))
+        # A record made before projects could be archived: not archived. Anything but a true
+        # bool reads as not archived, so the page never hides a project on a stray value.
+        record["archived"] = record.get("archived", False) is True
         return record
     except FileNotFoundError as exc:
         raise CoreError(f"There is no project named {name}.") from exc
@@ -1745,7 +1748,7 @@ def status(name):
     container = inspect_container(p["container"])
     out = {"name": name, "created": record["created"], "wanted": record["wanted"], "limits": record["limits"],
            "agents": record["agents"], "editor": record["editor"], "claude_model": record["claude_model"], "claude_effort": record["claude_effort"],
-           "pi_model": record["pi_model"], "pi_thinking": record["pi_thinking"], "state": "missing", "address": "", "image": "", "container": "", "setup": ""}
+           "pi_model": record["pi_model"], "pi_thinking": record["pi_thinking"], "archived": record["archived"], "state": "missing", "address": "", "image": "", "container": "", "setup": ""}
     if container:
         out["state"] = "running" if container["State"].get("Running") else "stopped"
         out["address"] = container["NetworkSettings"]["Networks"].get(p["network"], {}).get("IPAddress", "")
@@ -1768,7 +1771,7 @@ def list_projects():
         except CoreError as exc:  # the record is fine; the daemon could not say how the sandbox is
             out.append({"name": name, "created": record["created"], "wanted": record["wanted"], "limits": record["limits"],
                         "agents": record["agents"], "editor": record["editor"], "claude_model": record["claude_model"],
-                        "claude_effort": record["claude_effort"], "pi_model": record["pi_model"], "pi_thinking": record["pi_thinking"], "state": "unknown", "address": "", "image": "", "container": "", "setup": "", "problem": str(exc)})
+                        "claude_effort": record["claude_effort"], "pi_model": record["pi_model"], "pi_thinking": record["pi_thinking"], "archived": record["archived"], "state": "unknown", "address": "", "image": "", "container": "", "setup": "", "problem": str(exc)})
     return out
 
 
@@ -2043,6 +2046,29 @@ def stop(name):
         if there_is("container", container):
             docker("stop", "-t", str(STOP_GRACE_S), container, timeout=STOP_GRACE_S + 120)
         record["wanted"] = "stopped"
+        write_record(record)
+        return status(name)
+
+
+def archive(name):
+    """Out of the sidebar: stopped as `stop` stops it, and marked archived. Wanted stays
+    "stopped", so the init's start_wanted leaves it down at the next start of the outer container."""
+    with locked(name):
+        record = not_being_destroyed(read_record(name))
+        container = paths(name)["container"]
+        if there_is("container", container):
+            docker("stop", "-t", str(STOP_GRACE_S), container, timeout=STOP_GRACE_S + 120)
+        record["wanted"] = "stopped"
+        record["archived"] = True
+        write_record(record)
+        return status(name)
+
+
+def unarchive(name):
+    """Back in the sidebar, stopped: it starts nothing (the learner starts it when they want it)."""
+    with locked(name):
+        record = not_being_destroyed(read_record(name))
+        record["archived"] = False
         write_record(record)
         return status(name)
 

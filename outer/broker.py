@@ -55,7 +55,7 @@ Settings -> Software (RS's verbs): `software_status` and `models` are reads,
 core), `pin_reset` is answered at once. A project's agents: `agents_model` is answered at
 once under the project's lock, like `limits`.
 
-The verbs that can take long (create, start, stop, recreate, destroy, agents_add,
+The verbs that can take long (create, start, stop, archive, unarchive, recreate, destroy, agents_add,
 agents_update, project_export, project_import) run as operations: a child of this process, a fresh interpreter given only the
 verb, the checked name, limits and choices and the caller's op_id, which calls the core and
 writes RS's progress log,
@@ -142,7 +142,7 @@ OPEN_VERBS = frozenset({"list", "status", "op"})
 STEP_UP_VERBS = frozenset({"destroy", "backup_rm", "backup_fetch"})
 # Operations on a project: a child holds the project's lock (agents_add and agents_update run
 # here as RS runs its `update` and `agents_update`: on its lifecycle lane, with a log).
-OP_VERBS = frozenset({"create", "start", "stop", "recreate", "destroy", "agents_add", "agents_update", "project_export", "project_import"})
+OP_VERBS = frozenset({"create", "start", "stop", "archive", "unarchive", "recreate", "destroy", "agents_add", "agents_update", "project_export", "project_import"})
 # Operations that belong to no project (RS's build lane): a child holds the core's build lane
 # instead. Their log records carry `project: null`, as RS's do (its build ops have no name).
 BUILD_VERBS = frozenset({"agent_pull", "agent_refresh", "editor_pull", "editor_refresh"})
@@ -178,6 +178,8 @@ FIELDS = {
     "project_import": frozenset({"name", *LIMITS, *CREATE_SOFTWARE, "upload"}),
     "start": frozenset({"name"}),
     "stop": frozenset({"name"}),
+    "archive": frozenset({"name"}),
+    "unarchive": frozenset({"name"}),
     "recreate": frozenset({"name"}),
     "limits": frozenset({"name", *LIMITS}),
     "destroy": frozenset({"name"}),
@@ -411,6 +413,10 @@ def what_was_done(verb, name, out):
             line = str(said.get(agent) or "").removeprefix(f"deploy {agent}: ")
             parts.append(f"{label}: {line}" if line else f"{label} {version}")
         return f"Deployed into {name}: {'; '.join(parts) or 'nothing'}."
+    if verb == "archive":
+        return f"{name} is archived."
+    if verb == "unarchive":
+        return f"{name} is back in the sidebar, stopped."
     notes = " ".join(out.get("notes", []))
     return f"{name} is {out.get('state', 'done')}." + (f" {notes}" if notes else "")
 
@@ -473,6 +479,10 @@ def run_operation(spec):
             out = core.start(name, say)
         elif verb == "stop":
             out = core.stop(name)
+        elif verb == "archive":
+            out = core.archive(name)
+        elif verb == "unarchive":
+            out = core.unarchive(name)
         elif verb == "recreate":
             out = core.recreate(name, say)
         else:
