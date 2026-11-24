@@ -389,6 +389,8 @@ async def get_brief(request):
     return ok({"text": text, "cut": cut, "open_proposals": knowledge.open_global_count(db),
                "set": knowledge.brief_set_out(db, knowledge.brief_set(db, set_id)),
                "parts": {"goals": [knowledge.record_out(r) for r in parts["goals"]],
+                         "archived_goals": [knowledge.record_out(r) for r in knowledge.records(db, "goal", include_retired=True, set_id=set_id)
+                                            if r["state"] == "archived"],
                          "preferences": [knowledge.record_out(r) for r in parts["preferences"]],
                          "background": knowledge.record_out(parts["background"]) if parts["background"] else None,
                          "global_insights": [knowledge.record_out(r) for r in parts["global_insights"]],
@@ -424,10 +426,15 @@ async def get_record(request):
 
 async def edit_record(request):
     body = await body_of(request)
-    text, kind = text_in(body, required=False), text_in(body, "insight_kind", required=False)
-    if text is None and kind is None:
-        raise Refusal("validation", "Give a `text`, an `insight_kind`, or both.")
-    row = knowledge.edit(request.app["db"], record_number(request), knowledge.LEARNER, text, kind)
+    text, kind, archived = text_in(body, required=False), text_in(body, "insight_kind", required=False), body.get("archived")
+    if archived is not None and not isinstance(archived, bool):
+        raise Refusal("validation", "`archived` is true or false.")
+    if text is None and kind is None and archived is None:
+        raise Refusal("validation", "Give a `text`, an `insight_kind`, `archived` (a goal's), or more than one.")
+    db, record_id = request.app["db"], record_number(request)
+    row = knowledge.edit(db, record_id, knowledge.LEARNER, text, kind) if text is not None or kind is not None else None
+    if archived is not None:   # a goal put aside or brought back: its own change in the History
+        row = (knowledge.archive if archived else knowledge.restore)(db, record_id)
     return ok({"record": knowledge.record_out(row)})
 
 

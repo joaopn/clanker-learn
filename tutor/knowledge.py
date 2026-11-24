@@ -304,6 +304,28 @@ def retire(db, record_id, by, reason, note=""):
     return record(db, record_id)
 
 
+def set_goal_state(db, record_id, action, was, now):
+    """A goal put aside (`archived`: out of the brief and the search, kept on the Knowledge page)
+    or brought back, by the learner only; one change, undone as any other."""
+    with atomic(db):
+        old = record_or_refuse(db, record_id)
+        if old["kind"] != "goal":
+            raise KnowledgeError("Only a goal can be archived or restored.")
+        if old["state"] != was:
+            raise KnowledgeError(f"This goal is {old['state']}, not {was}: there is nothing to {action}.")
+        db.execute(f"UPDATE records SET state = ?, updated_at = {store.NOW} WHERE id = ?", (now, record_id))
+        log_change(db, action, LEARNER, [(record_id, snapshot(old), snapshot(record(db, record_id)))])
+    return record(db, record_id)
+
+
+def archive(db, record_id):
+    return set_goal_state(db, record_id, "archive", "active", "archived")
+
+
+def restore(db, record_id):
+    return set_goal_state(db, record_id, "restore", "archived", "active")
+
+
 def own_insight(db, turn, insight_id):
     """An insight a tutor may change: of the token's project, and in force."""
     row = record(db, insight_id)

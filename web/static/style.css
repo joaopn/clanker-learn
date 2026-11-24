@@ -650,6 +650,7 @@ button.qopt:disabled { opacity: 1; cursor: default; }
 .ins:last-child { border-bottom: 0; }
 .ins.proposed { background: color-mix(in srgb, var(--warn-fg) 7%, transparent); }
 .ins.retired .ins-text { text-decoration: line-through; color: var(--fg-faint); }
+.ins.archived .ins-text { color: var(--fg-faint); }
 .ins-main { flex: 1; min-width: 0; }
 .ins-text { line-height: 1.45; overflow-wrap: anywhere; }
 .ins-ev { color: var(--fg-faint); font-size: 12.5px; margin-top: 3px; overflow-wrap: break-word; }

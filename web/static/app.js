@@ -183,7 +183,7 @@ const S = {
     timers: [],
     shell: null,           // the app's fixed elements once logged in
     page: null,            // "settings" or "knowledge" while that page is shown in place of a project
-    kb: { view: "brief", raw: false, showRetired: false, q: "", seq: 0, changes: null, next: null, navData: null },   // the Knowledge page
+    kb: { view: "brief", raw: false, showRetired: false, showArchived: false, q: "", seq: 0, changes: null, next: null, navData: null },   // the Knowledge page
     kbOpen: 0,             // global insights proposed by a tutor that wait for the learner (the dot)
     software: null,        // Settings -> Software: the broker's rows, as last read
     softwareError: null,
@@ -429,7 +429,7 @@ function teardownApp() {
                        expanded: new Set(), lessons: {}, lessonOf: {}, activity: new Set(), tutorError: null,
                        tutorSettings: null, tutorSettingsError: null, filesOrigins: new Map(), editorFile: {},
                        cols: {}, tabLayout: null, dragging: false, renderPending: false,
-                       kb: { view: "brief", raw: false, showRetired: false, q: "", seq: 0, changes: null, next: null, navData: null }, kbOpen: 0,
+                       kb: { view: "brief", raw: false, showRetired: false, showArchived: false, q: "", seq: 0, changes: null, next: null, navData: null }, kbOpen: 0,
                        mode: null, backups: null, backupsError: null, backupOp: null, ctxWindow: {} });
     // RS's lock: the sidebar comes back as pinned or hidden, never left floating.
     S.railExpanded = S.railPinned;
@@ -3857,7 +3857,7 @@ function makeLessonPane(name, id) {
 const INSIGHT_KINDS = { misconception: "misconception", strength: "strength", worked: "what worked", did_not_work: "what did not work" };
 const INSIGHT_CLASS = { misconception: "k-bad", strength: "k-good", worked: "k-good", did_not_work: "k-warn" };
 const RECORD_WORDS = { goal: "a goal", preference: "a preference", background: "your background", insight: "an insight", global: "a global insight" };
-const CHANGE_WORDS = { add: "added", edit: "edited", delete: "deleted", replace: "replaced", retire: "retired", approve: "approved", undo: "undid a change to" };
+const CHANGE_WORDS = { add: "added", edit: "edited", delete: "deleted", replace: "replaced", retire: "retired", archive: "archived", restore: "restored", approve: "approved", undo: "undid a change to" };
 const KB_VIEWS = new Set(["brief", "global", "lessons", "history"]);
 
 const kbKey = (project, created) => `p:${project}|${created}`;
@@ -3924,11 +3924,12 @@ function restsOn(rec, open) {
     return d;
 }
 
-// One record, to read, edit in place (its text; an insight's kind too) and delete. Every change
-// is in the History, where it can be undone.
+// One record, to read, edit in place (its text; an insight's kind too) and delete; a goal also
+// archived (out of the brief, kept here) and restored. Every change is in the History, where it
+// can be undone.
 function recordRow(rec, opts) {
     const o = opts || {};
-    const el = h("div", { class: "ins" + (rec.state === "retired" ? " retired" : "") });
+    const el = h("div", { class: "ins" + (rec.state === "retired" ? " retired" : rec.state === "archived" ? " archived" : "") });
     const said = h("div", { class: "bad small", hidden: true });
     const bad = (text) => { said.textContent = text; said.hidden = false; };
     const kindEl = () => (rec.kind === "insight" || rec.insight_kind) && rec.insight_kind
@@ -3937,18 +3938,24 @@ function recordRow(rec, opts) {
     const meta = () => [rec.by && rec.by.who === "tutor" ? `recorded by ${byWords(rec.by)}` : approved ? `approved by you, proposed in ${whereWords(rec)}` : "written by you",
         o.withProject && rec.project && !approved && !(rec.by && rec.by.who === "tutor" && rec.by.project === rec.project && !rec.project_removed) ? `from ${whereWords(rec)}`
             : rec.project_removed ? "from a removed project" : null,
-        dayOf(rec.updated_at || rec.created_at),
+        rec.state === "archived" ? `archived ${dayOf(rec.updated_at)}` : dayOf(rec.updated_at || rec.created_at),
         rec.state === "retired" ? (rec.replaced_by ? "replaced" : `retired${rec.reason ? `: ${rec.reason}` : ""}`) : null].filter(Boolean).join(" · ");
+    // A button that sends one change and says so (Delete; a goal's Archive and Restore).
+    const change = (label, method, body, said) => h("button", { onclick: async (ev) => {
+        ev.target.disabled = true;
+        const r = await tutorApi(method, `/knowledge/records/${enc(rec.id)}`, body);
+        if (!r.body.ok) { ev.target.disabled = false; bad(errText(r.body)); return; }
+        toast(said);
+        if (o.onChanged) o.onChanged();
+    } }, label);
+    const del = () => change("Delete", "DELETE", undefined, "Deleted. The History can undo it.");
+    const goal = rec.kind === "goal";
     const show = () => {
         const act = rec.state === "active" ? h("div", { class: "ins-act" },
             h("button", { onclick: edit }, "Edit"),
-            h("button", { onclick: async (ev) => {
-                ev.target.disabled = true;
-                const r = await tutorApi("DELETE", `/knowledge/records/${enc(rec.id)}`);
-                if (!r.body.ok) { ev.target.disabled = false; bad(errText(r.body)); return; }
-                toast("Deleted. The History can undo it.");
-                if (o.onChanged) o.onChanged();
-            } }, "Delete")) : null;
+            goal ? change("Archive", "PATCH", { archived: true }, "Archived. The History can undo it.") : null,
+            del())
+            : goal && rec.state === "archived" ? h("div", { class: "ins-act" }, change("Restore", "PATCH", { archived: false }, "Restored: back in the brief."), del()) : null;
         fill(el, kindEl(), h("div", { class: "ins-main" }, h("div", { class: "ins-text" }, String(rec.text)), h("div", { class: "ins-ev" }, meta()),
             restsOn(rec, o.openRests), said), act);
     };
@@ -4243,6 +4250,11 @@ async function briefView(again) {
     const lines = (rows, kind, empty, placeholder) => [
         rows.length ? rows.map((x) => recordRow(x, { onChanged: again, openRests: true, withProject: true })) : h("div", { class: "none" }, empty),
         addRow(kind, placeholder, again, setId)];
+    // Archived goals (out of the brief, kept here) behind a switch, as a project's retired insights.
+    const archived = Array.isArray(parts.archived_goals) ? parts.archived_goals : [];
+    const archivedSw = archived.length ? h("label", { class: "switch" },
+        h("input", { type: "checkbox", checked: !!S.kb.showArchived, onchange: (ev) => { S.kb.showArchived = ev.target.checked; again(); } }),
+        ` show archived (${archived.length})`) : null;
     const recently = Array.isArray(parts.recently) ? parts.recently : [];
     const globalsIn = Array.isArray(parts.global_insights) ? parts.global_insights : [];
     return [
@@ -4253,8 +4265,8 @@ async function briefView(again) {
             h("div", { class: "form" }, h("p", { class: "note" }, "What you know already and what you work with. Every tutor of this set's projects reads it as you wrote it."), bg,
                 h("div", { class: "row-btns kb-btns" }, bgSaid, bgSave))),
         h("div", { class: "two" },
-            h("div", { class: "card" }, h("div", { class: "card-head" }, "Your goals"),
-                lines(parts.goals || [], "goal", "None yet.", "Add a goal in your own words…")),
+            h("div", { class: "card" }, h("div", { class: "card-head" }, "Your goals", archivedSw ? h("span", { class: "grow" }) : null, archivedSw),
+                lines(S.kb.showArchived ? [...(parts.goals || []), ...archived] : parts.goals || [], "goal", "None yet.", "Add a goal in your own words…")),
             h("div", { class: "card" }, h("div", { class: "card-head" }, "How you want to be taught"),
                 lines(parts.preferences || [], "preference", "None yet.", "Add a preference in your own words…"))),
         h("div", { class: "two" },
@@ -4382,7 +4394,7 @@ function changeRow(c) {
     } }, "Undo");
     const ba = items.filter((it) => it.before && it.after && (it.before.text !== it.after.text || it.before.insight_kind !== it.after.insight_kind
         || it.before.state !== it.after.state));
-    const textOf = (x) => `${x.insight_kind ? `(${INSIGHT_KINDS[x.insight_kind] || x.insight_kind}) ` : ""}${x.text}${x.state === "retired" ? " [retired]" : ""}`;
+    const textOf = (x) => `${x.insight_kind ? `(${INSIGHT_KINDS[x.insight_kind] || x.insight_kind}) ` : ""}${x.text}${x.state && x.state !== "active" ? ` [${x.state}]` : ""}`;
     const added = c.action === "replace" ? items.filter((it) => !it.before && it.after) : [];
     return h("div", { class: "hist" + (c.undone ? " undone" : "") },
         h("span", { class: "when" }, shortWhen(c.at)),
