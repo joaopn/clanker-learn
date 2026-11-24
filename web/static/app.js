@@ -29,6 +29,7 @@ const MIN_PASSWORD_LENGTH = 8;
 const PROJECTS_EVERY_MS = 4000;
 const SERVICES_EVERY_MS = 5000;
 const OP_EVERY_MS = 1000;
+const BUILD_ALL_EVERY_MS = 3000;   // the plan read again while Build all runs and its card is shown
 const LAYOUT_KEY = "cl-layout";   // browser storage: which project, tabs, columns and lessons were shown, nothing else
 const LESSON_ID_RE = /^[A-Za-z0-9][A-Za-z0-9-]{0,63}$/;   // what the tutor service makes ids of
 
@@ -2131,12 +2132,13 @@ const AGENT_NAMES = { claude: "Claude Code", pi: "pi" };
 
 // The tutor service numbers its lessons, runs and messages; the page keeps every id as text
 // (a tab's name, the layout in browser storage), so the ids of an answer become text here.
-const TUTOR_ID_KEYS = new Set(["id", "lesson_id", "run_id", "running", "deleted"]);
+const TUTOR_ID_KEYS = new Set(["id", "lesson_id", "run_id", "running", "deleted", "current", "lesson_ids"]);
+const idText = (x) => (Number.isInteger(x) ? String(x) : x);
 function idsAsText(v) {
     if (Array.isArray(v)) return v.map(idsAsText);
     if (!v || typeof v !== "object") return v;
     const out = {};
-    for (const [k, x] of Object.entries(v)) out[k] = TUTOR_ID_KEYS.has(k) && Number.isInteger(x) ? String(x) : idsAsText(x);
+    for (const [k, x] of Object.entries(v)) out[k] = !TUTOR_ID_KEYS.has(k) ? idsAsText(x) : Array.isArray(x) ? x.map(idText) : idText(x);
     return out;
 }
 async function tutorApi(method, tail, body) {
@@ -2184,7 +2186,9 @@ function setPlan(name, plan) {
     const dropped = (Array.isArray(plan.dropped) ? plan.dropped : []).filter(isLesson);
     const goals = isLesson(plan.goals) ? plan.goals : null;
     const list = [goals, ...modules.flatMap((m) => m.lessons), ...other, ...dropped].filter(Boolean);
-    S.lessons[name] = { list, goals, modules, other, dropped, error: null };
+    // Build all, while it runs: {lesson_ids, done, current}.
+    const buildAll = plan.build_all && typeof plan.build_all === "object" ? plan.build_all : null;
+    S.lessons[name] = { list, goals, modules, other, dropped, buildAll, error: null };
     // A project shown for the first time opens on Goals (not once its lesson tab was closed).
     if (goals && !(name in S.lessonOf)) S.lessonOf[name] = goals.id;
     // The conversations where a card waits for the learner (an open plan or change).
@@ -2242,8 +2246,13 @@ async function refreshTutor() {
 const LESSON_MARKS = { not_started: "○", in_progress: "▸", done: "✓", dropped: "×" };
 const LESSON_STATES = { not_started: "not started", in_progress: "in progress", done: "done", dropped: "dropped" };
 const lessonState = (l) => (l && LESSON_STATES[l.state] ? l.state : "not_started");
+// A lesson the tutor built and the learner has not begun: "not started · built".
+const lessonStateWords = (l) => LESSON_STATES[lessonState(l)] + (lessonState(l) === "not_started" && l && l.built === true ? " · built" : "");
 const lessonTip = (l) => [String(l.title || ""), l.kind === "goals" ? GOALS_LINE : l.objective ? String(l.objective) : null,
-    LESSON_STATES[lessonState(l)]].filter(Boolean).join("\n");
+    lessonStateWords(l)].filter(Boolean).join("\n");
+// A lesson the tutor can still build: not Goals, not begun, not built, not dropped, no build running.
+const canBuild = (l) => isLesson(l) && l.kind !== "goals" && l.state === "not_started" && l.built !== true
+    && !(l.build && l.build.status === "running");
 const GOALS_LINE = "What you want to learn, and the study plan";
 
 function lessonRows(name) {
@@ -3135,7 +3144,7 @@ function proposalCard(name, p) {
         const num = h("span", { class: "pnum" }, `${mi + 1}.${li + 1}`);
         const isNew = isChange() && !l.id;
         const mark = isChange() ? (isNew ? h("span", { class: "pnew", title: "A new lesson" }, "new")
-            : h("span", { class: `lst ${lessonState(l)}`, title: LESSON_STATES[lessonState(l)] }, LESSON_MARKS[lessonState(l)])) : null;
+            : h("span", { class: `lst ${lessonState(l)}`, title: lessonStateWords(l) }, LESSON_MARKS[lessonState(l)])) : null;
         if (!editing) {
             return h("div", { class: "plan-les" + (isNew ? " is-new" : "") }, num,
                 h("span", { class: "ptitle" }, mark, mark ? " " : null, l.title),
@@ -3237,7 +3246,8 @@ function proposalCard(name, p) {
             const changes = (Array.isArray(p.changes) ? p.changes : []).filter((c) => typeof c === "string" && c);
             foot = [h("div", { class: "grow" },
                 h("div", { class: "okc" }, changes.length ? "Approved, with your changes:" : "Approved as proposed."),
-                changes.length ? h("ul", { class: "plan-changes" }, changes.map((c) => h("li", {}, `You ${c}${/[.!?]$/.test(c) ? "" : "."}`))) : null)];
+                changes.length ? h("ul", { class: "plan-changes" }, changes.map((c) => h("li", {}, `You ${c}${/[.!?]$/.test(c) ? "" : "."}`))) : null),
+                isChange() ? null : buildAllEl()];
         } else {
             foot = [h("span", { class: "grow" }, "Dismissed. Nothing was changed.")];
         }
@@ -3253,7 +3263,46 @@ function proposalCard(name, p) {
             h("div", { class: "blk-foot" }, foot),
             decided ? h("div", { class: "plan-told" }, "The tutor is told with your next message in this conversation.") : null);
         if (focusNext) { const f = el.querySelector(focusNext); if (f) f.focus(); focusNext = null; }
+        // While Build all runs and the card is shown, the plan is read again (which draws the card again).
+        const L = S.lessons[name];
+        if (decided === "approved" && !isChange() && L && L.buildAll && !card.poll) {
+            card.poll = setTimeout(() => { card.poll = null; if (el.isConnected && el.getClientRects().length) refreshLessons(name); }, BUILD_ALL_EVERY_MS);
+        }
     }
+
+    // Build all, on the approved plan: the lessons not begun, built nor dropped, one at a time in plan order.
+    function buildAllEl() {
+        const L = S.lessons[name];
+        if (!L || !L.goals) return null;
+        const q = L.buildAll;
+        if (q) {
+            const n = Array.isArray(q.lesson_ids) ? q.lesson_ids.length : 0;
+            const cur = typeof q.current === "string" ? lessonRow(name, q.current) : null;
+            return h("div", { class: "build-all" },
+                h("span", { class: "grow" }, `Building ${Math.min((Number.isInteger(q.done) ? q.done : 0) + 1, n)} of ${n}`, cur ? `: “${String(cur.title || "")}”` : ""),
+                h("button", { type: "button", disabled: card.building, onclick: () => buildAll("build-all/stop") }, "Stop"));
+        }
+        if (![...L.modules.flatMap((m) => m.lessons), ...L.other].some(canBuild)) return null;
+        return h("div", { class: "build-all" },
+            h("span", { class: "grow" }, "Builds the lessons not started yet, one at a time, in plan order"),
+            h("button", { type: "button", class: "primary", disabled: card.building, onclick: () => buildAll("build-all") }, card.building ? "Sending…" : "Build all"));
+    }
+    async function buildAll(tail) {
+        const L = S.lessons[name];
+        if (card.building || !L || !L.goals) return;
+        card.building = true;
+        card.said = "";
+        draw();
+        const r = await tutorApi("POST", `/lessons/${enc(L.goals.id)}/${tail}`);
+        card.building = false;
+        const res = r.body.ok && r.body.result;
+        if (!res || typeof res !== "object" || !("build_all" in res)) card.said = errText(r.body);
+        else if (S.lessons[name]) S.lessons[name].buildAll = res.build_all && typeof res.build_all === "object" ? res.build_all : null;
+        draw();
+        refreshLessons(name);
+    }
+    // The plan read again (the lessons, Build all): an approved plan's foot follows it.
+    card.planChanged = () => { if (card.p.state === "approved" && !isChange()) draw(); };
 
     // A newer state of the proposal: an open card keeps the learner's edits.
     card.update = (np) => {
@@ -3445,9 +3494,10 @@ function makeLessonPane(name, id) {
         objEl.title = objEl.textContent;
         const st = lessonState(l);
         markEl.className = `lstate ${st}`;
-        markEl.textContent = (st === "done" ? "✓ " : "") + LESSON_STATES[st];
+        markEl.textContent = (st === "done" ? "✓ " : "") + lessonStateWords(l);
         summaryBtn.hidden = !(st === "done" && (l.summary || l.one_line));
         ta.placeholder = goals ? "Tell the tutor what you want to learn…" : "Write to the tutor…";
+        if (goals) for (const c of cards.values()) c.planChanged();
         pane.drawAgent();
     };
     // The choices: "the default (…)" and the agents the project has (the tutor service does not
@@ -3698,16 +3748,20 @@ function makeLessonPane(name, id) {
                 break;
             }
             case "usage": setUsage(d.usage); break;
-            case "completed": setUsage(d.usage); endTurn(turn, true); break;
-            case "error": endTurn(turn, true); sysline(typeof d.message === "string" && d.message ? d.message : "The tutor's answer failed.", "bad"); break;
-            case "cancelled": endTurn(turn, true); sysline("stopped"); break;
+            case "completed": setUsage(d.usage); endTurn(turn, true); if (turn.build) pane.reload(); break;
+            case "error":
+                endTurn(turn, true);
+                if (turn.build) pane.reload(); else sysline(typeof d.message === "string" && d.message ? d.message : "The tutor's answer failed.", "bad");
+                break;
+            case "cancelled": endTurn(turn, true); if (turn.build) pane.reload(); else sysline("stopped"); break;
             default: break;
         }
     }
 
     // Follow an answer from after `after`: replayed first, then as it is written.
-    function join(runId, after, agent) {
-        const turn = { runId, agent, lastSeq: after, draft: null, paintQueued: false, close: () => {} };
+    // build: the run builds the lesson; once it ends the lesson is read again, to fold it.
+    function join(runId, after, agent, build) {
+        const turn = { runId, agent, build: !!build, lastSeq: after, draft: null, paintQueued: false, close: () => {} };
         pane.turn = turn;
         setComposer();
         draftOf(turn);
@@ -3756,34 +3810,61 @@ function makeLessonPane(name, id) {
             renderTabbar();
         }
         const run = res.run && res.run.status === "running" ? res.run : null;
+        const msgs = (Array.isArray(res.messages) ? res.messages : []).filter((m) => m && typeof m === "object");
+        const ended = (Array.isArray(res.ended) ? res.ended : []).filter((e) => e && typeof e === "object");
+        const l = pane.lesson;
+        // A build that ended is one block: its messages, by run, folded there (a running one is
+        // shown as any answer, and folded once it ends).
+        const builds = new Map();
+        for (const m of msgs) {
+            if (m.build !== true || m.run_id === undefined || m.run_id === null || (run && m.run_id === run.id)) continue;
+            const k = String(m.run_id);
+            if (!builds.has(k)) builds.set(k, []);
+            builds.get(k).push(m);
+        }
         tools.clear();
         inner.replaceChildren();
+        let others = false;   // a message outside the builds is shown
         // A running answer is rebuilt from its first event: what it stored so far is left out here.
-        for (const m of (Array.isArray(res.messages) ? res.messages : [])) {
-            if (!m || typeof m !== "object") continue;
+        for (const m of msgs) {
             if (run && m.role === "assistant" && m.run_id === run.id) continue;
+            const k = m.run_id === undefined || m.run_id === null ? null : String(m.run_id);
+            if (k !== null && builds.has(k)) {
+                if (builds.get(k)[0] === m) {
+                    const e = ended.find((x) => String(x.id) === k);
+                    const status = l && l.build && l.build.run_id === k ? l.build.status : e ? e.status : "ok";
+                    inner.append(buildEl(builds.get(k), status, e && e.status === "failed" ? e.error : null));
+                }
+                continue;
+            }
+            others = true;
             inner.append(messageEl(m, null, true).el);
         }
         // An answer that did not end well says so after its last part, as it did while it was written.
-        for (const e of (Array.isArray(res.ended) ? res.ended : [])) {
-            if (!e || typeof e !== "object") continue;
+        for (const e of ended) {
+            if (builds.has(String(e.id))) continue;   // said in its build's block
             const parts = inner.querySelectorAll(`.msg[data-run="${CSS.escape(String(e.id))}"]`);
             if (!parts.length) continue;
             parts[parts.length - 1].after(e.status === "cancelled" ? syslineEl("stopped")
                 : syslineEl(typeof e.error === "string" && e.error ? e.error : "The tutor's answer failed.", "bad"));
         }
         if (!inner.childElementCount && !run) {
-            const l = pane.lesson;
             inner.append(h("div", { class: "empty" }, l && l.kind === "goals"
                 ? [h("p", {}, "Tell the tutor what you want to learn."),
                    h("p", { class: "note" }, "It asks what you want to be able to do, what you know already and how much time you have, then proposes a study plan.")]
-                : [l && l.objective ? h("p", {}, String(l.objective)) : null, h("p", { class: "note" }, "Write to the tutor to begin.")]));
+                : [l && l.objective ? h("p", {}, String(l.objective)) : null, h("p", { class: "note" }, "Write to the tutor to begin."), buildOffer()]));
+        } else if (builds.size && !others && !run && l && l.state === "not_started") {
+            // Built, not begun: the learner's first message continues the build's session.
+            inner.append(h("div", { class: "empty after-build" }, h("p", { class: "note" }, "Write to the tutor to begin."), buildOffer()));
         }
         ctx.hidden = true;
         setUsage(res.usage);
         follow = true;
         markWho();
-        if (run) { S.activity.add(id); join(run.id, 0, run.agent); } else setComposer();
+        if (run) {
+            S.activity.add(id);
+            join(run.id, 0, run.agent, msgs.some((m) => m.run_id === run.id && m.build === true) || !!(l && l.build && l.build.run_id === run.id));
+        } else setComposer();
         renderRail();
         // At once as well: the scroll the emptying above made would otherwise end the following.
         toBottom();
@@ -3818,9 +3899,51 @@ function makeLessonPane(name, id) {
         if (res.message) inner.append(messageEl(res.message).el);
         follow = true;
         S.activity.add(id);
-        join(res.run.id, 0, res.run.agent);
+        join(res.run.id, 0, res.run.agent, !!(res.message && res.message.build === true));
         renderRail();
         toBottom();
+    }
+
+    // Build: the tutor sets the lesson up before the learner begins (no teaching); it stays not started.
+    function buildOffer() {
+        if (!canBuild(pane.lesson)) return null;
+        const b = h("button", { class: "primary", onclick: () => build(b) }, "Build");
+        return h("div", { class: "build-offer" }, b, h("p", { class: "note" }, "The tutor sets up what this lesson needs before you start."));
+    }
+    async function build(b) {
+        if (pane.turn || pane.sending || pane.loading) return;
+        pane.sending = true;
+        b.disabled = btn.disabled = true;
+        tell("");
+        const r = await tutorApi("POST", `/lessons/${enc(id)}/build`);
+        pane.sending = false;
+        b.disabled = btn.disabled = false;
+        const res = r.body.ok && r.body.result;
+        if (!res || !res.run || typeof res.run.id !== "string") {
+            tell(errText(r.body));
+            if (r.body.error && r.body.error.kind === "busy" && !pane.turn) load();
+            return;
+        }
+        begun(res);
+    }
+
+    // A build that ended, folded: its outcome, its last text in full, and its steps behind a line that opens.
+    function buildEl(msgs, status, error) {
+        const last = [...msgs].reverse().find((m) => m.role === "assistant" && String(m.text || "").trim());
+        const has = (m, k) => Array.isArray(m[k]) && m[k].length;
+        const steps = h("details", { class: "build-steps" }, h("summary", {}, "the build's steps"));
+        for (const m of msgs) {
+            // The last text is shown above; its tools and cards stay here, in their place.
+            if (m === last && !has(m, "tools") && !has(m, "proposals") && !has(m, "cards")) continue;
+            steps.append(messageEl(m === last ? { ...m, text: "" } : m, null, true).el);
+        }
+        const ok = status === "ok";
+        const label = ok ? "✓ Built" : status === "failed" ? "Build failed" : "Build stopped";
+        return h("div", { class: "blk build-fold" },
+            h("div", { class: "blk-head" }, h("span", { class: ok ? "okc" : "badc" }, label)),
+            h("div", { class: "build-text body md" }, last ? mdRender(String(last.text), { project: name, blocks: null }) : h("span", { class: "note" }, "The tutor wrote nothing.")),
+            typeof error === "string" && error ? h("div", { class: "build-err badc" }, error) : null,
+            steps);
     }
 
     async function stop() {
