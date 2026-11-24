@@ -20,7 +20,7 @@ import sqlite3
 import unicodedata
 import uuid
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 SCHEMA_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "schema.sql")
 NOW = "strftime('%Y-%m-%dT%H:%M:%fZ','now')"
 LESSONS_DIR = "/workspace/.learn/lessons"
@@ -203,7 +203,15 @@ CREATE TABLE project_sets (
 PRAGMA user_version = 6;
 COMMIT;
 """
-MIGRATIONS = {1: MIGRATE_1_TO_2, 2: MIGRATE_2_TO_3, 3: MIGRATE_3_TO_4, 4: MIGRATE_4_TO_5, 5: MIGRATE_5_TO_6}
+# Version 6 to 7 (lessons built before the learner arrives): a run is marked when it is a build,
+# the tutor setting a lesson up with no learner there.
+MIGRATE_6_TO_7 = """
+BEGIN;
+ALTER TABLE runs ADD COLUMN build INTEGER NOT NULL DEFAULT 0;
+PRAGMA user_version = 7;
+COMMIT;
+"""
+MIGRATIONS = {1: MIGRATE_1_TO_2, 2: MIGRATE_2_TO_3, 3: MIGRATE_3_TO_4, 4: MIGRATE_4_TO_5, 5: MIGRATE_5_TO_6, 6: MIGRATE_6_TO_7}
 AGENTS = ("claude", "pi")
 AGENT_NAMES = {"claude": "Claude Code", "pi": "pi"}
 DEFAULT_AGENT = "claude"
@@ -379,6 +387,12 @@ def has_messages(db, lesson_id):
     return db.one("SELECT 1 FROM messages WHERE lesson_id = ? LIMIT 1", (lesson_id,)) is not None
 
 
+def has_turns(db, lesson_id):
+    """Whether the learner has started the lesson: a message outside its builds."""
+    return db.one("SELECT 1 FROM messages LEFT JOIN runs ON runs.id = messages.run_id WHERE messages.lesson_id = ? AND COALESCE(runs.build, 0) = 0 LIMIT 1",
+                  (lesson_id,)) is not None
+
+
 def set_lesson_agent(db, lesson_id, agent):
     """The lesson's own agent; None for the default one. A lesson under way that is set back to
     the default is given the default agent in force by name, since it no longer follows it."""
@@ -548,12 +562,14 @@ def link_proposals(db, proposal_ids, message_id):
 
 # --- messages -------------------------------------------------------------------------------
 
-# A message with the agent of its run: the one that wrote an assistant's message.
-MESSAGE_ROWS = "SELECT messages.*, runs.agent AS agent FROM messages LEFT JOIN runs ON runs.id = messages.run_id"
+# A message with the agent of its run (the one that wrote an assistant's message) and whether that
+# run was a build.
+MESSAGE_ROWS = "SELECT messages.*, runs.agent AS agent, runs.build AS build FROM messages LEFT JOIN runs ON runs.id = messages.run_id"
 
 
 def message_out(row, proposals=(), cards=()):
-    out = {"id": row["id"], "role": row["role"], "text": row["text"], "run_id": row["run_id"], "created_at": row["created_at"]}
+    out = {"id": row["id"], "role": row["role"], "text": row["text"], "run_id": row["run_id"], "created_at": row["created_at"],
+           "build": bool(row["build"])}
     if row["role"] == "assistant":
         out["agent"] = row["agent"]
         out["tools"] = json.loads(row["tools_json"] or "[]")
@@ -677,8 +693,8 @@ def run(db, run_id):
     return db.one("SELECT * FROM runs WHERE id = ?", (run_id,))
 
 
-def start_run(db, lesson_id, agent):
-    cursor = db.execute("INSERT INTO runs (lesson_id, agent) VALUES (?, ?)", (lesson_id, agent))
+def start_run(db, lesson_id, agent, build=False):
+    cursor = db.execute("INSERT INTO runs (lesson_id, agent, build) VALUES (?, ?, ?)", (lesson_id, agent, 1 if build else 0))
     return run(db, cursor.lastrowid)
 
 
@@ -686,6 +702,18 @@ def finish_run(db, run_id, status, error="", usage=None):
     db.execute(f"UPDATE runs SET status = ?, error = ?, usage_json = ?, finished_at = {NOW} WHERE id = ?",
                (status, error, json.dumps(usage) if usage else None, run_id))
     return run(db, run_id)
+
+
+def last_build(db, lesson_id):
+    """The lesson's last build run, {run_id, status}, or None when it was never built."""
+    row = db.one("SELECT id, status FROM runs WHERE lesson_id = ? AND build = 1 ORDER BY id DESC LIMIT 1", (lesson_id,))
+    return {"run_id": row["id"], "status": row["status"]} if row else None
+
+
+def built(db, lesson_id):
+    """Its last build ended well: what it needs is set up."""
+    build = last_build(db, lesson_id)
+    return build is not None and build["status"] == "ok"
 
 
 def latest_usage(db, lesson_id):

@@ -147,9 +147,13 @@ def lesson_or_404(request):
 def lesson_view(request, row):
     """A lesson with the agent in effect, and why (`agent_source`: "lesson", its own choice;
     "begun", the agent that answered it last, which it keeps when the default agent changes;
-    "default", before its first answer)."""
-    agent, source = store.agent_choice(request.app["db"], row)
-    return dict(store.lesson_out(row, request.app["runner"].running_run(row["id"])), agent_in_effect=agent, agent_source=source)
+    "default", before its first answer), and its last build (`build`: {run_id, status}, or null;
+    `built`: that build ended well)."""
+    db = request.app["db"]
+    agent, source = store.agent_choice(db, row)
+    build = store.last_build(db, row["id"])
+    return dict(store.lesson_out(row, request.app["runner"].running_run(row["id"])), agent_in_effect=agent, agent_source=source,
+                build=build, built=bool(build and build["status"] == "ok"))
 
 
 def agent_in(body, key):
@@ -230,6 +234,44 @@ async def post_message(request):
     return ok({"run": run, "message": message})
 
 
+async def build_lesson(request):
+    """The tutor sent in to set up what the lesson needs before the learner arrives."""
+    db = request.app["db"]
+    row = lesson_or_404(request)
+    if row["kind"] == "goals":
+        raise Refusal("validation", "Goals is where the plan is made: there is nothing to build in it.")
+    if row["state"] != "not_started":
+        raise Refusal("validation", "Only a lesson not started yet is built: this one is started, done or dropped.")
+    if store.built(db, row["id"]):
+        raise Refusal("validation", "This lesson is built already: write to the tutor to begin it.")
+    started = request.app["runner"].start(row, None, build=True)
+    if started is None:
+        raise Refusal("busy", "The tutor is working in this lesson already: wait for it, or stop it.")
+    run, message = started
+    return ok({"run": run, "message": message})
+
+
+async def build_all(request):
+    """Every lesson of the project not started, not built and not dropped, built one at a time
+    in plan order. Any lesson of the project names it (the page sends Goals)."""
+    db, runner = request.app["db"], request.app["runner"]
+    row = lesson_or_404(request)
+    project, created = row["project"], row["created"]
+    if runner.build_all_state(project, created) is not None:
+        raise Refusal("busy", "Build all is already running in this project: wait for it, or stop it.")
+    lesson_ids = [r["id"] for r in store.lessons(db, project, created)
+                  if r["kind"] != "goals" and r["state"] == "not_started" and not store.built(db, r["id"])]
+    if not lesson_ids:
+        raise Refusal("validation", "There is nothing left to build: every lesson not started yet is built already.")
+    return ok({"build_all": runner.build_all(project, created, lesson_ids)})
+
+
+async def stop_build_all(request):
+    row = lesson_or_404(request)
+    await request.app["runner"].stop_build_all(row["project"], row["created"])
+    return ok({"build_all": None})
+
+
 async def stream(request):
     runner = request.app["runner"]
     run_id = number(request, "id")
@@ -249,9 +291,15 @@ async def cancel(request):
     return ok({"run": run})
 
 
+def plan_view(request, project, created):
+    """The project's plan, with its build-all queue (`build_all`: null when none runs)."""
+    return dict(store.plan_out(request.app["db"], project, created, lambda row: lesson_view(request, row)),
+                build_all=request.app["runner"].build_all_state(project, created))
+
+
 async def get_plan(request):
     project, created = project_pair(request.query)
-    return ok(store.plan_out(request.app["db"], project, created, lambda row: lesson_view(request, row)))
+    return ok(plan_view(request, project, created))
 
 
 def proposal_or_404(request):
@@ -295,7 +343,7 @@ async def approve_proposal(request):
     seen = store.plan_seen(db, row["lesson_id"])
     if seen is not None:
         store.set_plan_seen(db, row["lesson_id"], plans.fold_seen(seen, before, plans.plan_snapshot(db, project, created)))
-    return ok({"proposal": store.proposal_out(decided), "plan": store.plan_out(db, project, created, lambda r: lesson_view(request, r))})
+    return ok({"proposal": store.proposal_out(decided), "plan": plan_view(request, project, created)})
 
 
 async def dismiss_proposal(request):
@@ -705,7 +753,8 @@ def build_app(db, secret):
         web.get("/health", health),
         web.get("/lessons", list_lessons), web.post("/lessons", add_lesson),
         web.get("/lessons/{id}", get_lesson), web.patch("/lessons/{id}", edit_lesson), web.delete("/lessons/{id}", delete_lesson),
-        web.post("/lessons/{id}/messages", post_message),
+        web.post("/lessons/{id}/messages", post_message), web.post("/lessons/{id}/build", build_lesson),
+        web.post("/lessons/{id}/build-all", build_all), web.post("/lessons/{id}/build-all/stop", stop_build_all),
         web.get("/runs/{id}/stream", stream), web.post("/runs/{id}/cancel", cancel),
         web.get("/plan", get_plan),
         web.get("/proposals/{id}", get_proposal), web.post("/proposals/{id}/approve", approve_proposal),

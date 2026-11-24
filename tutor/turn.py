@@ -33,6 +33,7 @@ tagged CL_CHECK_ID (its time limit and Stop end it by that tag) and, during a tu
 """
 import asyncio
 import contextlib
+import itertools
 import json
 import logging
 import os
@@ -72,6 +73,13 @@ SESSION_GONE_NOTE = ("*The tutor's earlier turns of this lesson are gone from th
 SESSION_GONE = "your earlier session of it is gone from the project"
 TEXT_CHANGED = "the tutor's instructions changed since your earlier session of it"
 TAKEN_OVER = "until now another agent taught this lesson"
+# A build: the tutor sets the lesson up before the learner arrives. The message stands for the
+# learner's (composed by the system); the note, after the usual context, says what to do.
+BUILD_TEXT = "Build this lesson."
+BUILD_NOTE = ("[clanker-learn: this is a build turn. The learner is not here and will not read this turn until later. Set up in the "
+              "sandbox everything this lesson needs (code, data, services, files under the lesson's folder), and add what must run at "
+              "every start to /workspace/.learn/services. Do not teach, do not propose anything, do not record anything about the "
+              "learner. End with a short note for the learner: what is ready, where it is, and how to open it.]")
 
 # The run's processes, found as the sandbox user and ended as root. Root in a sandbox has no
 # CAP_SYS_PTRACE, so it cannot read the environment of the learner's processes, while the
@@ -262,6 +270,7 @@ class Turn:
         self.notes = []             # the outcomes of proposals it is told, before the learner's text
         self.fresh = None           # why its session is a fresh one taken up from the files, if it is
         self.missed = None          # the learner's messages its resumed session did not see: (first, last, who answered)
+        self.build = False          # a build: the lesson set up before the learner arrives
         self.seq = 0
         self.proc = None
         self.reader = None          # the reader of the agent's output, while it runs
@@ -285,6 +294,9 @@ class Runner:
         self.by_run = {}
         self.tokens = {}   # the hash of a running turn's token: the turn
         self.checks = {}   # a run's id: {the CL_CHECK_ID of a check its tutor is running: the project}
+        # Build all, one queue per project (name, created): kept here only, a restart ends it.
+        self.queues = {}
+        self.queue_ids = itertools.count(1)
 
     # --- what the routes ask ---
 
@@ -305,12 +317,16 @@ class Runner:
         return [{"project": t.project, "created": t.created, "lesson_id": t.lesson_id, "run_id": t.run_id, "agent": t.agent}
                 for t in self.by_lesson.values()]
 
-    def start(self, lesson, text, composed=False):
+    def start(self, lesson, text, composed=False, build=False):
         """The learner's message stored and its turn started, or None when a turn of this
         lesson is running. Nothing awaits between the check and the claim. A `composed` message
-        is one the system wrote for the learner (a card's answer sent as a message)."""
+        is one the system wrote for the learner (a card's answer sent as a message). A `build`
+        sets the lesson up with no learner there: its own message and note, and the lesson stays
+        not started, so that the learner's first message goes on in the same session."""
         if lesson["id"] in self.by_lesson:
             return None
+        if build:
+            text, composed = BUILD_TEXT, True
         db = self.db
         instructions = store.instructions(db)["text"]
         agent = store.agent_of(db, lesson)
@@ -323,10 +339,10 @@ class Runner:
             store.set_session(db, lesson["id"], agent, str(uuid.uuid4()), False)
         elif session["started"]:
             missed = self.missed(lesson["id"], agent, session["seen_message"])
-        run = store.start_run(db, lesson["id"], agent)
+        run = store.start_run(db, lesson["id"], agent, build)
         token = secrets.token_urlsafe(32)
         turn = Turn(lesson, run["id"], token, instructions, agent)
-        turn.fresh, turn.missed = fresh, missed
+        turn.fresh, turn.missed, turn.build = fresh, missed, build
         # What the learner decided or did since the last message, outside the conversation: the
         # proposals, the global insights proposed here, the cards they answered or checked.
         outcomes = store.untold_outcomes(db, lesson["id"])
@@ -344,7 +360,8 @@ class Runner:
         knowledge.mark_global_told(db, [row["id"] for row in globals_])
         store.mark_cards_told(db, [row["id"] for row in acted])
         turn.message_id = store.add_message(db, lesson["id"], run["id"], "user", text, context=self.context(turn, lesson), composed=composed)
-        store.mark_started(db, lesson["id"])
+        if not build:
+            store.mark_started(db, lesson["id"])
         store.touch_lesson(db, lesson["id"])
         self.by_lesson[lesson["id"]] = self.by_run[run["id"]] = turn
         self.tokens[mcp.token_key(token)] = turn
@@ -366,7 +383,8 @@ class Runner:
     def context(self, turn, lesson):
         """What goes before the learner's text: the opening context on a new session (naming the
         files and the turns it did not see, when it replaces one or takes the lesson up from
-        the other agent), a note of the turns a resumed session missed, the outcomes of proposals."""
+        the other agent), a note of the turns a resumed session missed, the outcomes of proposals;
+        on a build, the build's note after all of it."""
         parts = []
         session = store.session(self.db, lesson["id"], turn.agent)
         if not session["started"]:
@@ -383,7 +401,7 @@ class Runner:
                 parts.append(plans.opening_context(self.db, lesson, "your earlier session of it did not start", len(earlier)))
         elif turn.missed:
             parts.append(plans.missed_note(lesson, *turn.missed))
-        return "\n\n".join(parts + turn.notes)
+        return "\n\n".join(parts + turn.notes + ([BUILD_NOTE] if turn.build else []))
 
     async def write_transcript(self, lesson_id):
         """The lesson's conversation into its transcript.md in the workspace, rewritten whole:
@@ -412,6 +430,47 @@ class Runner:
 
     def busy_in(self, project, created):
         return any((t.project, t.created) == (project, created) for t in self.by_lesson.values())
+
+    # --- build all: a project's lessons built one at a time, in plan order ---
+
+    def build_all_state(self, project, created):
+        queue = self.queues.get((project, created))
+        if queue is None:
+            return None
+        return {"lesson_ids": list(queue["lesson_ids"]), "done": queue["done"], "current": queue["current"]}
+
+    def build_all(self, project, created, lesson_ids):
+        """A queue of builds started for the project (the caller found none running)."""
+        key = (project, created)
+        queue = self.queues[key] = {"lesson_ids": lesson_ids, "done": 0, "current": None, "run_id": None}
+        # Numbered: a queue just stopped may still be ending when the next one starts.
+        queue["task"] = self.tasks.spawn(f"build-all-{next(self.queue_ids)}", self._build_all(key, queue))
+        return self.build_all_state(project, created)
+
+    async def stop_build_all(self, project, created):
+        """No further lesson of the queue starts, and the build it runs now is stopped."""
+        queue = self.queues.pop((project, created), None)
+        if queue is None:
+            return
+        queue["task"].cancel()
+        if queue["run_id"] is not None:
+            await self.cancel(queue["run_id"])
+
+    async def _build_all(self, key, queue):
+        try:
+            for lesson_id in queue["lesson_ids"]:
+                # Looked at again when its turn comes: the learner may have started it, built it
+                # or a plan change dropped or removed it meanwhile.
+                row = store.lesson(self.db, lesson_id)
+                if (row is not None and row["state"] == "not_started" and not store.built(self.db, lesson_id)
+                        and (started := self.start(row, None, build=True)) is not None):
+                    queue["current"], queue["run_id"] = lesson_id, started[0]["id"]
+                    await self.by_run[started[0]["id"]].done.wait()
+                    queue["current"] = queue["run_id"] = None
+                queue["done"] += 1
+        finally:
+            if self.queues.get(key) is queue:
+                del self.queues[key]
 
     async def run_check(self, project, command, run_id=None):
         """A check, kept by its run while it runs, so that Stop ends it too (the interrupt ends the
@@ -458,7 +517,11 @@ class Runner:
         processes in the sandbox (the agent, its commands, a check) ended as root by their tag,
         within SHUTDOWN_KILL_S, its SSH child ended, and the turn marked interrupted. A turn
         whose processes could not be ended in time stays `running`, for the clean-up at the
-        next start."""
+        next start. The build-all queues end first, so that none starts a build as its current
+        one ends."""
+        for queue in self.queues.values():
+            queue["task"].cancel()
+        self.queues.clear()
         turns = list(self.by_run.values())
         if not turns:
             return

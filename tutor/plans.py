@@ -122,7 +122,7 @@ def apply_change(db, project, created, modules):
             if item.get("id"):
                 state = store.lesson(db, item["id"])["state"]
                 if state == "dropped":
-                    state = "in_progress" if store.has_messages(db, item["id"]) else "not_started"
+                    state = "in_progress" if store.has_turns(db, item["id"]) else "not_started"
                 db.execute(f"UPDATE lessons SET title = ?, objective = ?, module_id = ?, position = ?, state = ?, updated_at = {store.NOW} "
                            "WHERE id = ?", (item["title"], item["objective"], module_id, position, state, item["id"]))
             else:

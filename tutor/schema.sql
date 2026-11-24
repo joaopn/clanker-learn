@@ -1,5 +1,5 @@
--- The tutor service's database: one file, /data/tutor/tutor.db, at user_version 6. A file at
--- version 1 to 5 is brought to 6 in place at start (store.MIGRATIONS); any other version is
+-- The tutor service's database: one file, /data/tutor/tutor.db, at user_version 7. A file at
+-- version 1 to 6 is brought to 7 in place at start (store.MIGRATIONS); any other version is
 -- refused.
 
 -- A lesson belongs to a project as the pair (name, created): a new project with an old name
@@ -61,7 +61,8 @@ CREATE TABLE sessions (
     PRIMARY KEY (lesson_id, agent)
 );
 
--- One turn: the learner's message and what the tutor did with it; `agent` answered it.
+-- One turn: the learner's message and what the tutor did with it; `agent` answered it. `build`:
+-- a build, the tutor setting the lesson up before the learner arrives.
 CREATE TABLE runs (
     id          INTEGER PRIMARY KEY,
     lesson_id   INTEGER NOT NULL REFERENCES lessons (id) ON DELETE CASCADE,
@@ -69,6 +70,7 @@ CREATE TABLE runs (
     error       TEXT NOT NULL DEFAULT '',
     usage_json  TEXT,
     agent       TEXT NOT NULL DEFAULT 'claude',
+    build       INTEGER NOT NULL DEFAULT 0,
     started_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     finished_at TEXT
 );
@@ -269,4 +271,4 @@ CREATE TABLE settings (
     value TEXT NOT NULL
 );
 
-PRAGMA user_version = 6;
+PRAGMA user_version = 7;
