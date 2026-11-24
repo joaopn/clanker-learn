@@ -504,11 +504,11 @@ button.mini.wide { padding: 2px 10px; }
 .build-fold .build-text { padding: 10px 14px 6px; line-height: 1.6; font-size: 14.5px; overflow-wrap: anywhere; }
 .build-fold .build-err { padding: 0 14px 6px; font-size: 12.5px; }
 .build-steps { padding: 0 14px 10px; font-size: 12.5px; color: var(--fg-faint); }
-.build-steps summary { cursor: pointer; list-style: none; display: inline-block; }
-.build-steps summary::-webkit-details-marker { display: none; }
-.build-steps summary::before { content: "▸ "; font-size: 10px; }
-.build-steps[open] summary::before { content: "▾ "; }
-.build-steps summary:hover { color: var(--fg-muted); }
+.build-steps > summary { cursor: pointer; list-style: none; display: inline-block; }
+.build-steps > summary::-webkit-details-marker { display: none; }
+.build-steps > summary::before { content: "▸ "; font-size: 10px; }
+.build-steps[open] > summary::before { content: "▾ "; }
+.build-steps > summary:hover { color: var(--fg-muted); }
 .build-steps .msg { margin: 12px 0 0; color: var(--fg-base); }
 .empty.after-build { margin-top: 18px; }
 .build-offer { line-height: 1.5; }

@@ -79,7 +79,8 @@ BUILD_TEXT = "Build this lesson."
 BUILD_NOTE = ("[clanker-learn: this is a build turn. The learner is not here and will not read this turn until later. Set up in the "
               "sandbox everything this lesson needs (code, data, services, files under the lesson's folder), and add what must run at "
               "every start to /workspace/.learn/services. Do not teach, do not propose anything, do not record anything about the "
-              "learner. End with a short note for the learner: what is ready, where it is, and how to open it.]")
+              "learner. End with a short note written to the learner: what is ready, where it is, and how to open it; nothing about what "
+              "you did not do yet, and the lesson named by its title, not its folder's number.]")
 
 # The run's processes, found as the sandbox user and ended as root. Root in a sandbox has no
 # CAP_SYS_PTRACE, so it cannot read the environment of the learner's processes, while the
