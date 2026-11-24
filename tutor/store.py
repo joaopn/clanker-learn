@@ -841,7 +841,8 @@ def project_export(db, project, created, conversations):
     of_project = "lesson_id IN (SELECT id FROM lessons WHERE project = ? AND created = ?)"
     pair = (project, created)
     out["runs"] = [{"key": r["id"], "lesson": r["lesson_id"], "status": r["status"], "error": r["error"], "agent": r["agent"],
-                    "usage": json.loads(r["usage_json"]) if r["usage_json"] else None, "started_at": r["started_at"], "finished_at": r["finished_at"]}
+                    "usage": json.loads(r["usage_json"]) if r["usage_json"] else None, "started_at": r["started_at"], "finished_at": r["finished_at"],
+                    "build": bool(r["build"])}
                    for r in db.all(f"SELECT * FROM runs WHERE {of_project} ORDER BY id", pair)]
     out["messages"] = [{"key": r["id"], "lesson": r["lesson_id"], "run": r["run_id"], "role": r["role"], "text": r["text"],
                         "tools": json.loads(r["tools_json"] or "[]"), "composed": bool(r["composed"]), "created_at": r["created_at"]}
@@ -966,10 +967,10 @@ def project_import(db, project, created, data):
                 status = item.get("status") if item.get("status") in ("ok", "cancelled", "failed", "interrupted") else "interrupted"
                 usage = item.get("usage") if isinstance(item.get("usage"), dict) else None
                 run_ids[item["key"]] = db.execute(
-                    f"INSERT INTO runs (lesson_id, status, error, usage_json, agent, started_at, finished_at) VALUES (?, ?, ?, ?, ?, coalesce(?, {NOW}), ?)",
+                    f"INSERT INTO runs (lesson_id, status, error, usage_json, agent, started_at, finished_at, build) VALUES (?, ?, ?, ?, ?, coalesce(?, {NOW}), ?, ?)",
                     (_ref(item, "lesson", lesson_ids, "a run", False), status, _text(item, "error", what="a run"),
                      json.dumps(usage) if usage else None, item.get("agent") if item.get("agent") in AGENTS else DEFAULT_AGENT,
-                     _time(item, "started_at"), _time(item, "finished_at"))).lastrowid
+                     _time(item, "started_at"), _time(item, "finished_at"), 1 if item.get("build") is True else 0)).lastrowid
             for item in _keyed(_items(data, "messages"), "a message"):
                 tools = item.get("tools", [])
                 if item.get("role") not in ("user", "assistant") or not isinstance(tools, list) or not all(
