@@ -68,7 +68,7 @@ create_env() {
     else
         mode=privileged
         echo "Docker has no sysbox runtime (sysbox-runc), so CL_MODE=privileged: the container will be root-equivalent on this machine."
-        echo "To run on sysbox instead, install sysbox and set CL_MODE=sysbox in .env (INSTALL.md says what each gives)."
+        echo "To run on sysbox instead, install sysbox and set CL_MODE=sysbox in .env (docs/guide/configuration.md says what each gives)."
     fi
     sed "s/^CL_MODE=.*/CL_MODE=$mode/" .env.example > .env.tmp
     mv .env.tmp .env

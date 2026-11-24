@@ -1,6 +1,11 @@
+---
+title: Security
+parent: User guide
+nav_order: 10
+---
 # Security
 
-What clanker-learn is made of, what each part holds, what is enforced and by what, and what is not protected. It is written for the person who runs it: read "What is not protected" before you put anything you care about into a sandbox.
+What clanker-learn is made of, what each part holds, what is enforced and by what, and what is not protected. It is written for the person who runs it: read [What is not protected](#what-is-not-protected) before you put anything you care about into a sandbox.
 
 ## The stance
 
@@ -8,17 +13,19 @@ clanker-learn runs a language model (Claude Code or pi) with full rights in a sa
 
 - **A sandbox is treated as untrusted.** Whatever runs in it may try to reach your machine, your network, the other projects and clanker-learn's own services. Those are what is defended.
 - **Within a project, nothing is defended from the sandbox.** The tutor of a project works in that project's sandbox and believes what it finds there. What is in a sandbox can steer its tutor.
-- **Your machine is defended only as far as the mode allows.** In privileged mode, clanker-learn's container is root-equivalent on the machine. Settings, under "How it runs", says which mode it was started in, and in privileged mode a line at the bottom of the project list says "privileged mode".
+- **Your machine is defended only as far as the mode allows.** In privileged mode, clanker-learn's container is root-equivalent on the machine. **Settings → How it runs** says which mode it was started in, and in privileged mode a line at the bottom of the sidebar says "privileged mode". See [Sysbox or privileged](configuration.md#sysbox-or-privileged).
 
 ## The parts and what each holds
 
-- **The outer container** (`clanker-learn`): one container on your machine's Docker. It holds a Docker daemon of its own (the inner daemon), which runs everything below; the guard rules; the init, which checks all of it at every start; and both volumes: `/data` with everything that is yours, and the inner daemon's `/var/lib/docker`. Whoever is root in it holds everything.
-- **The broker**: a process of the outer container, the one door the web server has to projects. It listens on a unix socket (mode 0600, its own user only) that no sandbox and no inner container has, apart from the web server, which gets the socket's folder read-only. It knows a closed list of verbs, never the inner daemon itself, and checks the login for every verb but four reads (the project list, a project's status, how an operation stands, whether a first password can be set). It holds the password's hash (`/data/broker/`), the login sessions in memory, and through the core every project's keys.
-- **The web server** (`cl-web`): an inner container with no capability, no way to gain one, no Docker socket and no project folder. It has the broker's socket folder read-only, its own folder (the page's certificate and key, which tab is on which port), and the secret it shares with the tutor service, read-only. It holds the login sessions' cookies and, while a terminal is open, that project's Shell password, in memory. It listens on its address on its own network (`cl-front`) only, where the page's ports are published.
-- **The tutor service** (`cl-tutor`): an inner container with no capability, no way to gain one and no published port. It has its own folder of `/data`: its database (lessons, conversations, plans, what it keeps about you), the Claude token set in Settings (a file of mode 0600, never returned to the page and never logged), and **the SSH key into every project's sandbox**. It is on every project's network, to reach each sandbox's SSH server. It listens twice: its API on its `cl-front` address only (port 7801), answering only requests that carry the secret it shares with the web server; and the tool server, port 7802 on every address, for Claude Code and pi in the sandboxes (below).
-- **A sandbox per project** (`cl-sb-<name>`): a plain container, not privileged, with Docker's default capabilities less `NET_RAW` (no raw sockets; `ping` still works), no published port and no restart policy, on a network of its own. Its user `learner` can become root in it with `sudo`. It has its workspace and its home folder read-write, its provisioning folder (its SSH host key, the tutor's public key, the Shell password's hash) read-only, and the fetched Claude Code, pi and editor read-only. Its home holds that project's Claude Code login and pi login, if you logged in there.
+| Part | What it is | What it holds |
+|---|---|---|
+| **The outer container** (`clanker-learn`) | One container on your machine's Docker. It holds a Docker daemon of its own (the inner daemon), which runs everything below; the guard rules; and the init, which checks all of it at every start. | Both volumes: `/data` with everything that is yours, and the inner daemon's `/var/lib/docker`. Whoever is root in it holds everything. |
+| **The broker** | A process of the outer container, the one door the web server has to projects. It listens on a unix socket (mode 0600, its own user only) that no sandbox and no inner container has, apart from the web server, which gets the socket's folder read-only. It knows a closed list of verbs, never the inner daemon itself, and checks the login for every verb but four reads (the project list, a project's status, how an operation stands, whether a first password can be set). | The password's hash (`/data/broker/`), the login sessions in memory, and through the core every project's keys. |
+| **The web server** (`cl-web`) | An inner container with no capability, no way to gain one, no Docker socket and no project folder. It listens on its address on its own network (`cl-front`) only, where the page's ports are published. | The broker's socket folder read-only; its own folder (the page's certificate and key, which tab is on which port); the secret it shares with the tutor service, read-only. The login sessions' cookies and, while a terminal is open, that project's Shell password, in memory. |
+| **The tutor service** (`cl-tutor`) | An inner container with no capability, no way to gain one and no published port. It is on every project's network, to reach each sandbox's SSH server. It listens twice: its API on its `cl-front` address only (port 7801), answering only requests that carry the secret it shares with the web server; and the tool server, port 7802 on every address, for Claude Code and pi in the sandboxes. | Its own folder of `/data`: its database (lessons, conversations, plans, what it keeps about you), the Claude token set in Settings (a file of mode 0600, never returned to the page and never logged), and **the SSH key into every project's sandbox**. |
+| **A sandbox per project** (`cl-sb-<name>`) | A plain container, not privileged, with Docker's default capabilities less `NET_RAW` (no raw sockets; `ping` still works), no published port and no restart policy, on a network of its own. Its user `learner` can become root in it with `sudo`. | Its workspace and its home folder read-write; its provisioning folder (its SSH host key, the tutor's public key, the Shell password's hash) read-only; the fetched Claude Code, pi and editor read-only. Its home holds that project's Claude Code login and pi login, if you logged in there. |
 
-## What a sandbox can reach, and what enforces it
+## What a sandbox can reach
 
 | A sandbox | Reaches | Enforced by |
 |---|---|---|
@@ -33,7 +40,7 @@ clanker-learn runs a language model (Claude Code or pi) with full rights in a sa
 | IPv6 anywhere | no | the guard rules drop all IPv6 from an inner bridge |
 | Raw packets, to address a service's other network | no | `NET_RAW` is dropped |
 
-The guard rules are iptables chains in the outer container, keyed on the inner daemon's bridges. They are put in place before the inner daemon starts, so no inner container ever runs without them; they are checked at every start and every few seconds while it runs. Rules that cannot be put back, or an inner daemon that died, make clanker-learn end everything it runs and refuse to go on. RS's version of these rules warns and carries on; this one does not.
+The guard rules are iptables chains in the outer container, keyed on the inner daemon's bridges. They are put in place before the inner daemon starts, so no inner container ever runs without them; they are checked at every start and every few seconds while it runs. Rules that cannot be put back, or an inner daemon that died, make clanker-learn end everything it runs and refuse to go on (see [When it refuses to start](troubleshooting.md)).
 
 The services a sandbox shares a network with (the web server, the tutor service) have no capability, and listen on another network's address, apart from the tool server.
 
@@ -42,7 +49,7 @@ The services a sandbox shares a network with (the web server, the tutor service)
 - **The password never leaves the browser.** The page derives a proof from it (PBKDF2-SHA256, 600,000 rounds, with a fixed salt) and sends that, over the page's HTTPS. The broker stores a scrypt hash of the proof, with a salt of its own, on the data volume.
 - **A session** is a token made by the broker and held in its memory for at most 8 hours; a restart of the broker or a new password ends every session. The web server keeps the token on its side, under a cookie that is `HttpOnly`, `Secure`, `SameSite=Strict` and sent only to the login's own paths.
 - **Wrong passwords**: after 10 within a minute, logins are refused for a minute. The set-up code for the first password has the same limit, works only while no password is set, never replaces one, and is printed only in the container's log.
-- **Step-up**: destroying a project, and removing a backup in Settings, need the password again in the request, beside the session.
+- **Step-up**: destroying a project, and downloading or removing a backup in Settings, need the password again in the request, beside the session.
 - **Origin checks**: every request that changes something, and every terminal connection, is refused unless the browser says it comes from the page's own address.
 - **Web-app tabs** each have a port of their own, behind a session for that project: a cookie made from the login, `HttpOnly`, `Secure`, `SameSite=Strict`, that lasts no longer than the login. The web server takes its own cookies out of a request before passing it to a web app, and out of the app's answer.
 - **The page's content-security policy**: scripts from the page's own files only, none inline; fetches and the terminal's connection to the page's own address only; frames and pictures only from the page's host over HTTPS (the web-app tabs, and the project's files server for a lesson's pictures and pages); no plugins, no form sent by the browser itself, and the page cannot be framed by another.
@@ -61,10 +68,10 @@ The tutor's text is decided by what is in its sandbox, so the page treats it as 
 
 Claude Code or pi in a sandbox reaches one thing of clanker-learn's own: the tool server, through which a tutor reads the plan, closes a lesson, proposes a plan or a change, records what it learned about you, sets exercises and questions.
 
-- **The same tools under the same token, whichever agent answers.** pi reaches the tool server through an entry clanker-learn writes into pi's `mcp.json` in the project's home before a pi answer (the learner's own entries there are left alone); its header names a variable of the answer's environment, so the token is not written into the file.
+- **The same tools under the same token, whichever agent answers.** pi reaches the tool server through an entry clanker-learn writes into pi's `mcp.json` in the project's home before a pi answer (your own entries there are left alone); its header names a variable of the answer's environment, so the token is not written into the file.
 - **A token per answer**: each answer being written has a token of its own, made when it starts and gone when it ends, handed to the agent in the sandbox's environment. A request without a token of an answer that is running now is refused before anything else is looked at.
 - **Whose data a call touches comes from the token only**: the project, the lesson and the answer. No argument of a call names them.
-- **Another project's insights reach no tool**: a tutor reads the brief (shared by every project) and its own project's records; evidence or insights of another project are refused when cited.
+- **Another project's insights reach no tool**: a tutor reads the brief (shared by every project that uses its brief set) and its own project's records; evidence or insights of another project are refused when cited.
 - A call is checked against its schema, limited in time, and recorded; one answer may make at most 60 calls, and a result is at most 64 KiB.
 
 ## What the tutor may record about you
@@ -72,12 +79,12 @@ Claude Code or pi in a sandbox reaches one thing of clanker-learn's own: the too
 - A **goal** or a **preference** is recorded only with a sentence you typed in that project, quoted exactly (at least 12 characters), and found by clanker-learn in your own messages. A message the page composed for you (an answer on a card) does not count.
 - An **insight** rests on evidence clanker-learn itself saw (a check that ran, an answer it graded with your typed words, a lesson's summary) or on a sentence you typed. It is changed only by being replaced or retired, and every change is logged with what it was before.
 - A **global insight**, told to every project's tutors, exists only after you approve it on the Knowledge page. A tutor can only propose one.
-- **Everything is yours to change**: the Knowledge page edits or deletes any record, and every change, by you or by a tutor, is in its History and can be undone.
+- **Everything is yours to change**: the [Knowledge page](knowledge.md) edits or deletes any record, and every change, by you or by a tutor, is in its History and can be undone.
 - **Destroying a project** tells the tutor service, which keeps the project's lesson summaries, insights and your sentences there marked as from a removed project, or forgets them if you ticked that. Its conversations go either way.
 
 ## What is not protected
 
-Each of these is true today. They are stated once, here.
+Each of these is true today.
 
 - **In privileged mode, the outer container is root-equivalent on your machine.** What stands between a sandbox and the machine is the sandbox's own container boundary and the guard rules. A way out of a sandbox (a kernel or container-runtime flaw) is a way to the machine.
 - **Code the tutor runs in a sandbox can read the Claude token** set in Settings, which reaches each answer through its environment, **and the project's own Claude Code and pi logins** in its home folder. Treat each as exposed to anything that runs in a sandbox; if one may have leaked, revoke it with Claude or with pi's provider and set a new one.
@@ -89,13 +96,15 @@ Each of these is true today. They are stated once, here.
 - **Raw TCP ports you name by hand have no login in front of them.** Anything that can reach that port on your machine reaches the sandbox's port.
 - **The tool server is the one thing of clanker-learn's own that a sandbox reaches**, and it runs in the tutor service, the process that holds the keys into every sandbox and the Claude token. A flaw in it would be reachable from any sandbox.
 - **The proof the browser sends is the same at every login.** To clanker-learn it is as good as the password; it travels only inside the page's HTTPS.
-- **The certificate is clanker-learn's own**, accepted by you at the first visit, unless you gave it one from Tailscale (`./setup cert-tailscale`, INSTALL.md). The browser cannot tell a self-made one from another self-made one later.
-- **Sysbox has not been run.** The sysbox mode is written and tested only as far as its configuration goes; nothing here has been checked on a real sysbox machine.
+- **The certificate is clanker-learn's own**, accepted by you at the first visit, unless you gave it one from Tailscale (see [A trusted certificate](configuration.md#a-trusted-certificate)). The browser cannot tell a self-made one from another self-made one later.
+- **Sysbox has been run on a real machine only as far as a first start.** Beyond that, the sysbox mode is tested only as far as its configuration goes.
 - **arm64 has not been run.**
-- **No real model has answered through pi.** pi was run here only against a stand-in for a model that speaks the same API: its login inside a project, a real provider's answers and its tool calls against a real model have not been seen. The first real pi lesson may show faults.
+- **No real model has answered through pi.** pi was run only against a stand-in for a model that speaks the same API: its login inside a project, a real provider's answers and its tool calls against a real model have not been seen. The first real pi lesson may show faults.
 - **pi's login is the project's own.** There is no pi credential in Settings: each project's pi is logged in in its Shell, and that login lives in the project's home folder (`~/.local/share/pi-agent/agent/`), where everything in that sandbox can read it.
 - **One learner per installation.** There are no user accounts: whoever has the password has everything, and whoever can run `docker exec` on the machine has everything without it.
 
 ## Reporting a problem
 
-Open an issue on the repository you got clanker-learn from. There is no other address for reports.
+[Open an issue](https://github.com/joaopn/clanker-learn/issues) on the repository. There is no other address for reports.
+
+How it works: [System overview](../architecture/system.md)

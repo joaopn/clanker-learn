@@ -1,6 +1,6 @@
 # clanker-learn: one container, with a Docker daemon of its own for the sandboxes.
 # The defaults are here; your settings go in .env (./setup creates it from .env.example).
-# Start: docker compose up (-d for the background). INSTALL.md says the rest.
+# Start: docker compose up (-d for the background). docs/guide/getting-started.md says the rest.
 
 # One install per machine (the container's name is fixed), whatever the folder is called.
 name: clanker-learn

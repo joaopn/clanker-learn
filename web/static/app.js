@@ -4992,7 +4992,7 @@ function certLine() {
     const until = c.not_after ? new Date(c.not_after).toLocaleDateString() : "an unreadable date";
     if (c.provider === "self-signed") {
         return h("p", { class: "muted" }, `Certificate: clanker-learn's own, self-signed, until ${until}. ` +
-            "The editor's previews (Markdown, notebooks) need a certificate the browser trusts; INSTALL.md says how to get one from Tailscale.");
+            "The editor's previews (Markdown, notebooks) need a certificate the browser trusts; https://joaopn.github.io/clanker-learn/guide/configuration.html#a-trusted-certificate says how to get one from Tailscale.");
     }
     const due = c.state === "expired" || c.state === "renew-due";
     const when = c.state === "expired" ? `expired on ${until}` : `until ${until}`;
