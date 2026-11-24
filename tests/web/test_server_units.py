@@ -213,7 +213,7 @@ def test_a_minted_op_id_is_one_the_broker_takes_for_the_longest_name(action):
 def test_the_fields_forwarded_are_the_brokers():
     for verb in server.BROKER_FIELDS:
         assert set(server.BROKER_FIELDS[verb]) | {"name"} == broker.FIELDS[verb]
-    assert set(server.BROKER_FIELDS) == {"create", "limits", "port_add", "port_remove", "agents_add", "agents_model"}
+    assert set(server.BROKER_FIELDS) == {"create", "limits", "port_add", "port_remove", "agents_add", "agents_model", "project_import"}
     assert set(server.PROJECT_ACTIONS) <= broker.OP_VERBS and set(server.PROJECT_ACTIONS) <= set(broker.FIELDS)
     body = {"name": "p1", "pids": 100, "memory": "1g", "cpus": "2", "proof": "x", "token": "t", "op_id": "o"}
     assert server._forward(body, "create") == {"name": "p1", "pids": 100, "memory": "1g", "cpus": "2"}

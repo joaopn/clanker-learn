@@ -78,7 +78,7 @@ def test_a_verb_that_is_not_in_the_table_is_unknown_and_nothing_passes_through(w
     assert sorted(broker.FIELDS) == ["agent_pull", "agent_refresh", "agent_refresh_check", "agents_add", "agents_model", "agents_update", "attach",
                                      "backup", "backup_active", "backup_fetch", "backup_list", "backup_rm", "build_active", "build_alive", "create", "destroy", "editor_pull", "editor_refresh", "editor_refresh_check",
                                      "first_password", "lifecycle_active", "limits", "list", "mode", "models", "op", "pin_reset", "port_add", "port_detect",
-                                     "port_list", "port_remove", "recreate", "setup_needed", "software_status", "start", "status", "stop"]
+                                     "port_list", "port_remove", "project_export", "project_import", "recreate", "setup_needed", "software_status", "start", "status", "stop"]
 
 
 def test_arguments_that_are_not_an_object_are_a_bad_request(world):
@@ -385,13 +385,13 @@ def test_the_project_is_free_before_the_child_says_it_is_done(world, monkeypatch
     free_at_the_last_word = []
     really_record = broker.record
 
-    def record(op_id, project, action, status, step, msg):
+    def record(op_id, project, action, status, step, msg, result=None):
         if status in ("done", "failed"):
             probe = core.try_lock(project)
             free_at_the_last_word.append(probe is not None)
             if probe:
                 probe.close()
-        return really_record(op_id, project, action, status, step, msg)
+        return really_record(op_id, project, action, status, step, msg, result)
     monkeypatch.setattr(broker, "record", record)
     monkeypatch.setattr(core, "HELD", set())
     os.makedirs(broker.OPLOGS)
