@@ -20,6 +20,8 @@ Change anything on the card before you decide: edit titles and objectives, move 
 
 Nothing changes until you approve. The tutor learns what you decided with your next message: you do not need to tell it. A card that waits for you is marked with a dot (●) beside its lesson in the sidebar.
 
+Under an approved plan, **Build all** builds every lesson that is neither started, built nor dropped, one at a time in plan order, so each can use what the lessons before it set up. While it works the card says which one ("Building 3 of 8: …") and has a **Stop**. You can open and work in any lesson meanwhile; one you start before its turn is skipped. See [Building a lesson ahead](lessons.md#building-a-lesson-ahead).
+
 ## Changes to the plan
 
 Later, a lesson's tutor can propose a **change to the plan** the same way: a lesson added to go over something again, another order, a lesson dropped. It is a card too, **Proposed change to the plan**, which marks new lessons as **new** and lists those that **Would be dropped**; **Keep this lesson in the plan** takes one out of the drop. Edit it, then approve or dismiss it.

@@ -17,6 +17,12 @@ The lesson's header shows its title, objective and state, the [agent](#switching
 
 **Stop** ends the answer being written, and whatever the tutor was running for it. Closing the browser does not: the answer goes on and is there when you come back. If clanker-learn's tutor service restarts while an answer is being written, that answer is shown as interrupted, and the lesson takes your next message.
 
+## Building a lesson ahead
+
+A lesson you have not started shows a **Build** button. Press it and the tutor sets up what the lesson needs (code, services, files in the sandbox) while you are away, without teaching yet, so the lesson starts without waiting. The conversation then shows the build folded, as **✓ Built**, with the tutor's note on what is ready and **the build's steps** inside; the lesson stays not started. When you write your first message the tutor carries on from what it built. If a build fails or is stopped, the folded block says so and **Build** comes back.
+
+To build every lesson of a plan, use **Build all** in Goals (see [The plan card](goals-and-plans.md#the-plan-card)). A build uses the agent's model like any answer, also for lessons you may never reach.
+
 ## What the tutor can show
 
 Besides text, tables and code, an answer can hold:
