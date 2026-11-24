@@ -19,7 +19,7 @@ One that you can log in to Claude Code with: each project's tutor is that projec
 
 ### Can I use another model?
 
-Yes, two ways. Claude Code's model and effort are chosen per project, in the New project box or the project's Config box. pi talks to the provider and model you name as `provider/model`. A lesson can switch between the two agents at any point. Note that no real model has answered through pi yet: it was run against a stand-in that speaks the same API. See [Agents and software](agents.md).
+Yes, two ways. Claude Code's model and effort are chosen per project, in the New project box or the project's Config box. pi talks to the provider and model you name as `provider/model`. A lesson can switch between the two agents at any point. See [Agents and software](agents.md).
 
 ### Does it work offline?
 

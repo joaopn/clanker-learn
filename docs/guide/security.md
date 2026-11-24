@@ -97,9 +97,6 @@ Each of these is true today.
 - **The tool server is the one thing of clanker-learn's own that a sandbox reaches**, and it runs in the tutor service, the process that holds the keys into every sandbox and the Claude token. A flaw in it would be reachable from any sandbox.
 - **The proof the browser sends is the same at every login.** To clanker-learn it is as good as the password; it travels only inside the page's HTTPS.
 - **The certificate is clanker-learn's own**, accepted by you at the first visit, unless you gave it one from Tailscale (see [A trusted certificate](configuration.md#a-trusted-certificate)). The browser cannot tell a self-made one from another self-made one later.
-- **Sysbox has been run on a real machine only as far as a first start.** Beyond that, the sysbox mode is tested only as far as its configuration goes.
-- **arm64 has not been run.**
-- **No real model has answered through pi.** pi was run only against a stand-in for a model that speaks the same API: its login inside a project, a real provider's answers and its tool calls against a real model have not been seen. The first real pi lesson may show faults.
 - **pi's login is the project's own.** There is no pi credential in Settings: each project's pi is logged in in its Shell, and that login lives in the project's home folder (`~/.local/share/pi-agent/agent/`), where everything in that sandbox can read it.
 - **One learner per installation.** There are no user accounts: whoever has the password has everything, and whoever can run `docker exec` on the machine has everything without it.
 

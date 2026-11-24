@@ -9,7 +9,7 @@ clanker-learn runs as one Docker container on a Linux machine, started with Dock
 
 ## What it needs
 
-- **A Linux machine with Docker and Docker Compose.** It has been run with Docker 29.5.3 and Compose 5.7.0. Only x86-64 has been run so far; arm64 has not.
+- **A Linux machine with Docker and Docker Compose.**
 - **A Claude subscription**, for Claude Code; or, for pi, an account with a provider pi supports, logged in inside each project that uses it. See [Agents and software](agents.md).
 - **The internet**, for the first start and while you work: the sandboxes reach it.
 - **A few gigabytes of disk.** Each project has its own copy of Claude Code (about 400 MB), of pi if you give it pi (about 270 MB), and of the editor (about 350 MB), besides what you install in it.
@@ -48,7 +48,7 @@ The first start builds and fetches what clanker-learn needs, once:
 3. The sandbox image is built.
 4. Claude Code and the editor (code-server) are fetched, each in a throwaway container, and kept on the data volume.
 
-On a test machine with a fast connection all of it took about five minutes; the page answered after half a minute. A project cannot be given Claude Code or the editor before they are fetched. pi is not fetched at the first start: you fetch it when you want it, with **Pull** on its row in **Settings → Software**.
+With a fast connection it takes about five minutes; the page answers after half a minute. A project cannot be given Claude Code or the editor before they are fetched. pi is not fetched at the first start: you fetch it when you want it, with **Pull** on its row in **Settings → Software**.
 
 To watch the steps, ask the status port:
 

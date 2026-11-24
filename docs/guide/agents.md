@@ -15,7 +15,6 @@ The tutor is an agent running in the project's sandbox: **Claude Code**, on your
 | Given to a new project | Ticked by default in the New project box. | Never ticked by default. |
 | Its model | Model and effort, in the New project box or the project's Config box. Empty means Claude's own defaults. | Model as `provider/model` and thinking level. Empty means pi's own pick. |
 | Its login | The project's own, or one token for every project in Settings → Tutor. | The project's own only. |
-| Run with a real model | Yes. | **No real model has answered through pi yet**: it was run against a stand-in that speaks the same API, so the first real pi lesson may show faults. |
 
 The tools, the cards, the plan, what the tutor knows about you and the context line are the same with either agent. To give a project an agent it does not have, or to change its model, use **Agents** in its [Config box](projects.md#the-config-box).
 

@@ -50,7 +50,6 @@ A Docker daemon inside a container needs more than a plain container gets. clank
 | Root inside it is | not root on the machine | root-equivalent on the machine |
 | Between a sandbox and your machine | a container boundary, the guard rules, then sysbox | a container boundary and the guard rules |
 | Inner containers run on | crun | runc (Docker's default) |
-| Run so far | started on a real machine; not run much beyond that first start | by the test suite |
 
 The container does not guess its mode. A start with no `CL_MODE`, with a value that is neither of the two, with sysbox declared where there is no user namespace, or with neither sysbox nor privilege (no `CAP_SYS_ADMIN`), is refused with the reason.
 
@@ -238,7 +237,6 @@ With one present, containerd's start-up waits ten seconds on a storage probe and
 
 ### Known gaps
 
-- Sysbox mode has been started on a real machine, but not run much beyond that first start; the refusal of `--cgroupns=host` has not been run under sysbox. arm64 has not been run.
 - In privileged mode, sandboxes get Docker's seccomp profile but not its AppArmor profile.
 
 ## Where it lives

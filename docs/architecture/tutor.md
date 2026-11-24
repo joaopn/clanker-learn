@@ -107,8 +107,6 @@ A lesson's state is in files both agents can read, in the lesson's folder `/work
 
 A lesson that has not started follows the default agent set in Settings → Tutor; one that has started stays with the agent that began it until you choose another in its header.
 
-pi has only been run against a stand-in for a model so far; no real model has answered through it.
-
 ## Design decisions
 
 ### The tutor is the project's own agent, inside the sandbox
