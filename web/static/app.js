@@ -382,8 +382,8 @@ function enterApp(projects) {
             rail,
             h("div", { class: "rail-foot" },
                 h("button", { class: "foot", onclick: newProjectDialog }, "+ New project"),
-                h("button", { class: "foot knowledge-btn", onclick: () => showKnowledge() }, h("span", {}, "◆ Knowledge"), h("span", { class: "kdot", hidden: true })),
-                h("button", { class: "foot settings-btn", onclick: showSettings }, "⚙ Settings"),
+                h("button", { class: "foot knowledge-btn", onclick: () => togglePage("knowledge", showKnowledge) }, h("span", {}, "◆ Knowledge"), h("span", { class: "kdot", hidden: true })),
+                h("button", { class: "foot settings-btn", onclick: () => togglePage("settings", showSettings) }, "⚙ Settings"),
                 h("button", { class: "foot", onclick: logout }, "Log out"))),
         h("div", { class: "main" }, tabbar, panes)));
     S.shell = { rail, tabbar, panes, empty, settings, knowledge };
@@ -538,6 +538,16 @@ function renderRail() {
     S.shell.rail.replaceChildren(...rows);
     S.shell.rail.parentNode.querySelector(".settings-btn").classList.toggle("sel", S.page === "settings");
     renderKbFoot();
+}
+
+// Knowledge or Settings in the sidebar: open the page, or, when it is the one shown, go back
+// to the project you were in (its tab as you left it), or the empty page with none.
+function togglePage(page, show) {
+    if (S.page !== page) { show(); return; }
+    collapseRailAfterUse();
+    S.page = null;
+    saveLayout();
+    render();
 }
 
 // A click on the project you are in shows or hides its lessons; on another one, opens it with them shown.

@@ -38,7 +38,7 @@ Drag a tab to the side of the tab area to open a second column, and again for a 
 
 ## The sidebar
 
-The **Projects** tab, first in the strip, shows and hides the sidebar: your projects with their lessons, and **+ New project**, **Knowledge**, **Settings** and **Log out** at the bottom.
+The **Projects** tab, first in the strip, shows and hides the sidebar: your projects with their lessons, and **+ New project**, **Knowledge**, **Settings** and **Log out** at the bottom. Click **Knowledge** or **Settings** again to go back to your project.
 
 - **Floating** (the default): the sidebar opens over the page and closes again once you open something from it (a lesson, a tab, Settings, Knowledge) or click elsewhere.
 - **Pinned**: the pin at the top of the sidebar keeps it open beside the page. The **Projects** tab then hides it and unpins it in one click.
