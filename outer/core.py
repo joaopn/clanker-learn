@@ -94,6 +94,7 @@ import sys
 import tarfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 DATA = "/data"
@@ -1982,11 +1983,14 @@ def port_list(name):
     return {"project": name, "ports": read_ports(name)}
 
 
-def create(name, limits=None, say=say_nothing, agents=(), editor=False, claude_model="", claude_effort="", pi_model="", pi_thinking=""):
+def create(name, limits=None, say=say_nothing, agents=(), editor=False, claude_model="", claude_effort="", pi_model="", pi_thinking="",
+           before_start=None):
     """A new project with the agents and the editor asked for (none by default), each of which
     must be pulled, Claude's model and effort (Claude's own default when empty), and pi's
     starting model and thinking level (pi's own pick when empty): what is asked for is checked
-    before anything is made, as RS does."""
+    before anything is made, as RS does. `before_start(record)`, when given, is called once the
+    project is made and before its container first starts (an import fills the workspace there);
+    it failing undoes the creation as any other failure does."""
     valid_name(name)
     agents, editor = checked_agents(agents), checked_editor(editor)
     checked_claude_pair(claude_model, claude_effort)
@@ -2002,6 +2006,8 @@ def create(name, limits=None, say=say_nothing, agents=(), editor=False, claude_m
         try:
             write_record(record)
             ensure(record, say)
+            if before_start is not None:
+                before_start(record)
             docker("start", paths(name)["container"])
         except Exception:
             mark_destroying(name)  # a clean-up that is cut short is finished by destroy, not by the next start
@@ -2883,13 +2889,14 @@ class Padded:
         return data
 
 
-def add_tree(tar, arc, tally, only_folder=(), leave_out=()):
-    """Add /data/<arc> to the archive, a folder with everything in it, without following a
-    link. Something that vanishes while it is walked (a running project) is counted, not an
-    error. A folder in `only_folder` goes in without its content; `leave_out` is not added."""
+def add_tree(tar, arc, tally, only_folder=(), leave_out=(), source=None):
+    """Add /data/<arc> (or `source`, under the name <arc>) to the archive, a folder with
+    everything in it, without following a link. Something that vanishes while it is walked (a
+    running project) is counted, not an error. A folder in `only_folder` goes in without its
+    content; `leave_out` is not added."""
     if arc in leave_out:
         return
-    path = os.path.join(DATA, arc)
+    path = source or os.path.join(DATA, arc)
     try:
         mode = os.lstat(path).st_mode
         if stat.S_ISREG(mode):
@@ -2909,7 +2916,7 @@ def add_tree(tar, arc, tally, only_folder=(), leave_out=()):
             tally["files"] += 1
             return
         info = tar.gettarinfo(path, arcname=arc)
-        if info is None or info.ischr() or info.isblk():   # a socket, a device: nothing to keep
+        if info is None or info.ischr() or info.isblk() or info.isfifo():   # a socket, a device, a pipe: nothing to keep
             return
         tar.addfile(info)
         if not info.isdir() or arc in only_folder:
@@ -2919,7 +2926,7 @@ def add_tree(tar, arc, tally, only_folder=(), leave_out=()):
         tally["vanished"] += 1
         return
     for name in names:
-        add_tree(tar, f"{arc}/{name}", tally, only_folder, leave_out)
+        add_tree(tar, f"{arc}/{name}", tally, only_folder, leave_out, os.path.join(path, name))
 
 
 def add_bytes(tar, arc, data):
@@ -3118,6 +3125,16 @@ def backup_rm(name):
     return {"backup": name, "removed": True}
 
 
+def clear_downloads():
+    """The web server's folder of downloads made, and the links in it the web server never took
+    (it died, say) removed: each holds its file's space."""
+    os.makedirs(WEB_DOWNLOADS, mode=0o700, exist_ok=True)
+    for left in os.listdir(WEB_DOWNLOADS):
+        with contextlib.suppress(OSError):
+            if time.time() - os.lstat(f"{WEB_DOWNLOADS}/{left}").st_mtime > DOWNLOAD_LINK_S:
+                os.remove(f"{WEB_DOWNLOADS}/{left}")
+
+
 def backup_fetch(name):
     """One backup made readable to the web server for one download: a hard link to it in the
     web server's own folder (the same volume: nothing is copied), under a name nobody can
@@ -3128,34 +3145,53 @@ def backup_fetch(name):
     path = f"{BACKUPS}/{checked_backup_name(name)}"
     if not os.path.isfile(path):
         raise CoreError(f"There is no backup named {name}.")
-    os.makedirs(WEB_DOWNLOADS, mode=0o700, exist_ok=True)
-    for left in os.listdir(WEB_DOWNLOADS):   # links the web server never took (it died, say): each holds its backup's space
-        with contextlib.suppress(OSError):
-            if time.time() - os.lstat(f"{WEB_DOWNLOADS}/{left}").st_mtime > DOWNLOAD_LINK_S:
-                os.remove(f"{WEB_DOWNLOADS}/{left}")
+    clear_downloads()
     link = f"{secrets.token_hex(8)}-{name}"
     os.link(path, f"{WEB_DOWNLOADS}/{link}")
     os.utime(f"{WEB_DOWNLOADS}/{link}", follow_symlinks=False)   # a link shares the file's times: the clearing above goes by when it was made
     return {"backup": name, "size": os.path.getsize(path), "file": link}
 
 
+class TutorAbsent(CoreError):
+    """The tutor service is not there to be asked."""
+
+
+def tutor_request(path, body=None, timeout=5, limit=1024 * 1024):
+    """The `result` of one request to the tutor service, at its address on the front network,
+    with the secret the web server and the tutor service share (as the keeper asks its health).
+    A body is POSTed as JSON. Raises TutorAbsent when it is not running or has no address; a
+    refusal or a failure raise a CoreError that says why."""
+    container = inspect_container(TUTOR_CONTAINER)
+    if container is None or not container["State"].get("Running"):
+        raise TutorAbsent("the tutor service is not running")
+    address = (container["NetworkSettings"]["Networks"].get(FRONT_NET) or {}).get("IPAddress", "")
+    if not address:
+        raise TutorAbsent(f"the tutor service has no address on {FRONT_NET}")
+    data = None if body is None else json.dumps(body).encode()
+    headers = {"X-CL-Secret": read_text(tutor_secret_path()).strip(), **({"Content-Type": "application/json"} if data is not None else {})}
+    request = urllib.request.Request(f"http://{address}:{TUTOR_PORT}{path}", data=data, headers=headers)
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as answer:
+            return json.loads(answer.read(limit))["result"]
+    except urllib.error.HTTPError as exc:
+        message = ""
+        with contextlib.suppress(Exception):
+            message = str(json.loads(exc.read(64 * 1024))["error"]["message"])
+        raise CoreError(f"the tutor service refused it ({message or exc.reason})") from exc
+    except (OSError, urllib.error.URLError, ValueError, KeyError, TypeError) as exc:
+        raise CoreError(f"the tutor service could not be asked ({getattr(exc, 'reason', exc)})") from exc
+
+
 def tutor_activity(timeout=5):
     """The answers being written now, as the tutor service lists them at /activity, or None
-    and why when it cannot be asked (asked as the keeper asks its health, with the secret the
-    web server and the tutor service share)."""
+    and why when it cannot be asked."""
     try:
-        container = inspect_container(TUTOR_CONTAINER)
-        if container is None or not container["State"].get("Running"):
-            return None, "the tutor service is not running"
-        address = (container["NetworkSettings"]["Networks"].get(FRONT_NET) or {}).get("IPAddress", "")
-        if not address:
-            return None, f"the tutor service has no address on {FRONT_NET}"
-        request = urllib.request.Request(f"http://{address}:{TUTOR_PORT}/activity", headers={"X-CL-Secret": read_text(tutor_secret_path()).strip()})
-        with urllib.request.urlopen(request, timeout=timeout) as answer:
-            running = json.loads(answer.read(1024 * 1024))["result"]["running"]
-        return list(running), ""
-    except (CoreError, OSError, urllib.error.URLError, ValueError, KeyError, TypeError) as exc:
-        return None, f"the tutor service could not be asked ({getattr(exc, 'reason', exc)})"
+        return list(tutor_request("/activity", timeout=timeout)["running"]), ""
+    except TutorAbsent as exc:
+        return None, str(exc)
+    except (CoreError, OSError, ValueError, KeyError, TypeError) as exc:
+        message = str(exc)
+        return None, message if message.startswith("the tutor service") else f"the tutor service could not be asked ({exc})"
 
 
 def restore_filter(member, dest):
@@ -3294,6 +3330,223 @@ def restore(source, say=say_nothing):
             "again, and its setup recipe runs once.")
     return {"restored": os.path.basename(path), "made_at": manifest.get("made_at"), "projects": projects, "safety_backup": safety["backup"],
             "notes": notes, "said": said}
+
+
+# --- a project as one file ------------------------------------------------------------------
+#
+# A project file (<project>-<date>.clproject) is a gzipped tar: manifest.json first (what it
+# is, the project's settings that are no secret, whether the conversations are in), then
+# project.json (the plan and lessons as the tutor service gives them, and with the conversations
+# what was said in them), then workspace/, the project's workspace folder (without the lessons'
+# transcript.md and notes.md when the conversations are not in). Never in it: the home folder,
+# the keys, the Shell password, the provisioning folder, the ports, the record itself, the
+# knowledge base. An import makes a new project from it: the workspace unpacked before the
+# container's first start (so the setup recipe runs on it), the plan and lessons put in by the
+# tutor service under new ids.
+
+PROJECT_FILE_FORMAT, PROJECT_FILE_FORMAT_VERSION = "clanker-learn project", 1
+PROJECT_FILE_LINK = re.compile(r"[0-9a-f]{16}-([a-z0-9-]{1,31}-[0-9]{8}\.clproject)")
+WEB_UPLOADS = f"{DATA}/web/uploads"     # cl-web's /data/uploads: a project file the web server took in, <upload id>.clproject
+UPLOAD_ID = re.compile(r"[0-9a-f]{32}")
+IMPORT_STAGING = f"{DATA}/core/imports"  # an upload moved out of the web server's reach while it is imported
+PROJECT_JSON_MAX = 256 * 1024 * 1024
+LESSON_FOLDER = re.compile(r"[0-9]+-[a-z0-9][a-z0-9-]{0,39}")
+LESSON_TALK = ("transcript.md", "notes.md")
+
+
+def project_export(name, conversations=False, say=say_nothing):
+    """One project as a project file, linked into the web server's folder of downloads for one
+    download as a backup is (backup_fetch). Its sandbox may run: what it writes meanwhile may be
+    torn, which the result says."""
+    if not isinstance(conversations, bool):
+        raise CoreError("Whether the conversations go in is true or false.")
+    with locked(name):
+        record = not_being_destroyed(read_record(name))
+        workspace = paths(name)["workspace"]
+        need, free = tree_size(workspace), free_space()
+        if free < need:
+            raise CoreError(f"There is not enough room to export {name}: {human_size(free)} is free on the data volume, and the file needs up "
+                            f"to {human_size(need)} (its workspace, before compression). Make room first; nothing was written.")
+        running = sandbox_running(name)
+        say("reading the plan and the lessons" + (" with their conversations" if conversations else ""))
+        data = tutor_request("/project-export?" + urllib.parse.urlencode({"project": name, "created": record["created"],
+                                                                          "conversations": int(conversations)}),
+                             timeout=120, limit=PROJECT_JSON_MAX)
+        made_at = datetime.datetime.now(datetime.UTC)
+        file_name = f"{name}-{made_at.strftime('%Y%m%d')}.clproject"
+        manifest = {"format": PROJECT_FILE_FORMAT, "format_version": PROJECT_FILE_FORMAT_VERSION, "tutor_db_version": tutor_db_version_supported(),
+                    "made_at": made_at.isoformat(timespec="seconds"), "made_by": image_identity(), "project": name,
+                    "conversations": conversations, "settings": {"limits": record["limits"], "editor": record["editor"]}}
+        leave_out = set()
+        if not conversations:
+            with contextlib.suppress(OSError):
+                for folder in os.listdir(f"{workspace}/.learn/lessons"):
+                    leave_out |= {f"workspace/.learn/lessons/{folder}/{one}" for one in LESSON_TALK}
+        clear_downloads()
+        link = f"{secrets.token_hex(8)}-{file_name}"
+        temporary = f"{DATA}/core/.{link}.part"   # outside the downloads, whose clearing goes by age
+        tally = {"files": 0, "torn": 0, "vanished": 0}
+        say(f"copying the workspace of {name}" + (" (it runs: what it writes meanwhile may be torn)" if running else ""))
+        try:
+            with open(os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb") as fh:
+                with tarfile.open(fileobj=fh, mode="w:gz", compresslevel=BACKUP_GZIP_LEVEL, format=tarfile.PAX_FORMAT) as tar:
+                    add_bytes(tar, "manifest.json", json.dumps(manifest, indent=2).encode())
+                    add_bytes(tar, "project.json", json.dumps(data, ensure_ascii=False).encode())
+                    add_tree(tar, "workspace", tally, leave_out=leave_out, source=workspace)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(temporary, f"{WEB_DOWNLOADS}/{link}")
+        except BaseException as exc:
+            with contextlib.suppress(OSError):
+                os.remove(temporary)
+            if isinstance(exc, OSError):
+                raise CoreError(f"The project file could not be written ({exc.strerror or exc}); nothing was kept.") from exc
+            raise
+    size = os.path.getsize(f"{WEB_DOWNLOADS}/{link}")
+    said = f"{file_name}: {human_size(size)}, " + ("with the conversations." if conversations else "without the conversations.")
+    if running:
+        said += f" Made while {name} was running: files being written at that moment may be torn."
+    if tally["torn"] or tally["vanished"]:
+        said += f" {tally['torn']} file(s) changed while they were copied and {tally['vanished']} vanished."
+    return {"file": link, "name": file_name, "size": size, "conversations": conversations, "said": said}
+
+
+def read_project_file(path):
+    """A project file's manifest and project.json, its first two members, checked."""
+    def refuse(why):
+        return CoreError(f"This is not a clanker-learn project file ({why}); nothing was made.")
+    try:
+        with tarfile.open(path, "r:*") as tar:
+            first, second = tar.next(), tar.next()
+            for member, wanted, limit in ((first, "manifest.json", 1024 * 1024), (second, "project.json", PROJECT_JSON_MAX)):
+                if member is None or member.name != wanted or not member.isreg() or member.size > limit:
+                    raise refuse(f"it does not begin with {wanted}")
+            manifest = json.loads(tar.extractfile(first).read())
+            data = json.loads(tar.extractfile(second).read())
+    except tarfile.ReadError as exc:
+        raise refuse("it is not a tar archive") from exc
+    except (OSError, EOFError, tarfile.TarError, ValueError, UnicodeDecodeError) as exc:
+        raise refuse(str(exc)) from exc
+    if not isinstance(manifest, dict) or manifest.get("format") != PROJECT_FILE_FORMAT:
+        raise refuse("its manifest is another's")
+    version, have = manifest.get("format_version"), tutor_db_version_supported()
+    if not isinstance(version, int) or isinstance(version, bool) or version > PROJECT_FILE_FORMAT_VERSION:
+        raise CoreError(f"This project file is of format {version!r}; this clanker-learn reads format {PROJECT_FILE_FORMAT_VERSION} and older. "
+                        "Import it with a newer clanker-learn; nothing was made.")
+    if isinstance(manifest.get("tutor_db_version"), int) and manifest["tutor_db_version"] > have:
+        raise CoreError(f"This project file was made by a newer clanker-learn: its tutor's database is at version {manifest['tutor_db_version']}, "
+                        f"and this one knows versions up to {have}. Import it with that version or a newer one; nothing was made.")
+    return manifest, data
+
+
+def workspace_members(tar):
+    """The members under workspace/, named as they land in the new workspace; any member that is
+    neither that nor the manifest or project.json refuses the file."""
+    for member in tar:
+        if member.name in ("manifest.json", "project.json", "workspace"):
+            continue
+        if not member.name.startswith("workspace/"):
+            raise CoreError(f"The project file holds {member.name[:200]!r}, which is not part of a project file; the project was not made.")
+        member.name = member.name.removeprefix("workspace/")
+        if member.islnk():
+            if not member.linkname.startswith("workspace/"):
+                raise CoreError(f"The project file holds a hard link out of its workspace ({member.name[:200]!r}); the project was not made.")
+            member.linkname = member.linkname.removeprefix("workspace/")
+        if member.name not in ("", "."):
+            yield member
+
+
+def workspace_filter(member, dest):
+    """The restore's filter (nothing outside the destination, no device, hard links inside), no
+    pipe either, and the archive's owners and set-id bits not trusted: the sandbox user owns
+    what is unpacked."""
+    member = restore_filter(member, dest)
+    if member is None or member.isfifo():
+        return None
+    return member.replace(uid=SANDBOX_UID, gid=SANDBOX_UID, uname="", gname="", mode=member.mode & ~0o6000, deep=False)
+
+
+def rename_lesson_folders(workspace, folders):
+    """The lesson folders unpacked under the file's lesson ids renamed after their new ids (a
+    lesson's folder is <id>-<slug>), before the sandbox first runs: through two steps, since an
+    old name can be a new one."""
+    lessons = f"{workspace}/.learn/lessons"
+    if os.path.realpath(lessons) != os.path.join(os.path.realpath(workspace), ".learn/lessons") or not os.path.isdir(lessons):
+        return 0
+    moves = []
+    for pair in folders:
+        if not (isinstance(pair, list) and len(pair) == 2 and all(isinstance(one, str) and LESSON_FOLDER.fullmatch(one) for one in pair)):
+            continue
+        old = f"{lessons}/{pair[0]}"
+        if pair[0] != pair[1] and os.path.isdir(old) and not os.path.islink(old):
+            moves.append((pair[0], pair[1]))
+    for number, (old, _new) in enumerate(moves):
+        os.rename(f"{lessons}/{old}", f"{lessons}/.import-{number}")
+    done = 0
+    for number, (_old, new) in enumerate(moves):
+        if not os.path.lexists(f"{lessons}/{new}"):
+            os.rename(f"{lessons}/.import-{number}", f"{lessons}/{new}")
+            done += 1
+    return done
+
+
+def project_import(name, upload, say=say_nothing, limits=None, agents=(), editor=False, claude_model="", claude_effort="", pi_model="",
+                   pi_thinking=""):
+    """A new project made from a project file the web server took in (WEB_UPLOADS/<upload>.clproject):
+    made as `create` makes one, its workspace unpacked before its container first starts (the
+    setup recipe then runs on it), its plan and lessons put in by the tutor service."""
+    if not isinstance(upload, str) or not UPLOAD_ID.fullmatch(upload):
+        raise CoreError("An upload is named by 32 hexadecimal characters.")
+    valid_name(name)
+    os.makedirs(IMPORT_STAGING, mode=0o700, exist_ok=True)
+    staged = f"{IMPORT_STAGING}/{upload}.clproject"
+    try:
+        os.rename(f"{WEB_UPLOADS}/{upload}.clproject", staged)   # out of the web server's reach before it is read
+    except FileNotFoundError:
+        raise CoreError("There is no such uploaded file (it was imported already, or never arrived whole).") from None
+    try:
+        if not stat.S_ISREG(os.lstat(staged).st_mode):
+            raise CoreError("The upload is not a file; nothing was made.")
+        say("reading the project file")
+        manifest, data = read_project_file(staged)
+        unpacked, free = unpacked_size(staged), free_space()
+        if free < unpacked:
+            raise CoreError(f"There is not enough room for this project: {human_size(free)} is free on the data volume, and the file unpacked "
+                            f"takes about {human_size(unpacked)}. Make room first; nothing was made.")
+        told = []
+
+        def fill(record):
+            workspace = paths(name)["workspace"]
+            say("unpacking the workspace")
+            try:
+                with tarfile.open(staged, "r:*") as tar:
+                    tar.extractall(workspace, members=workspace_members(tar), numeric_owner=True, filter=workspace_filter)
+            except (OSError, EOFError, tarfile.TarError) as exc:
+                raise CoreError(f"The project file's workspace could not be unpacked ({exc}); the project was not made.") from exc
+            owner = os.stat(workspace)
+            for folder, subfolders, files in os.walk(workspace):   # what tar made without a member of its own (a parent folder)
+                for one in (*subfolders, *files):
+                    os.lchown(os.path.join(folder, one), owner.st_uid, owner.st_gid)
+            say("putting in the plan and the lessons")
+            try:
+                folders = tutor_request("/project-import", {"project": name, "created": record["created"], "data": data}, timeout=120)["folders"]
+            except (CoreError, OSError, KeyError, TypeError) as exc:
+                told.append(f"The plan and the lessons could not be put in ({exc}); the workspace's files are there.")
+                return
+            try:
+                rename_lesson_folders(workspace, folders)
+            except OSError as exc:
+                told.append(f"The lessons' folders could not all be named after the new lessons ({exc.strerror or exc}): "
+                            "their tutors start them without their notes.")
+
+        out = create(name, limits, say, agents, editor, claude_model, claude_effort, pi_model, pi_thinking, before_start=fill)
+    finally:
+        with contextlib.suppress(OSError):
+            os.remove(staged)
+    said = (f"{name} is made from {str(manifest.get('project', 'a project'))[:31]}'s file of {str(manifest.get('made_at', '?'))[:10]}, "
+            + ("with its conversations." if manifest.get("conversations") else "every lesson not started.")
+            + " Its setup recipe runs now, as after a recreate.")
+    return dict(out, said=" ".join([said, *told]))
 
 
 # --- the `cl` command ----------------------------------------------------------------------

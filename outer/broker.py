@@ -56,7 +56,7 @@ core), `pin_reset` is answered at once. A project's agents: `agents_model` is an
 once under the project's lock, like `limits`.
 
 The verbs that can take long (create, start, stop, recreate, destroy, agents_add,
-agents_update) run as operations: a child of this process, a fresh interpreter given only the
+agents_update, project_export, project_import) run as operations: a child of this process, a fresh interpreter given only the
 verb, the checked name, limits and choices and the caller's op_id, which calls the core and
 writes RS's progress log,
 <the socket's folder>/oplogs/<op_id>.view.log: JSON lines {op_id, project, action, step,
@@ -75,6 +75,12 @@ belong to no project, RS's build lane: what is taken without waiting and handed 
 is the core's build lane instead of a project's lock, one build at a time ("busy" with the
 core's sentence while another runs; RS queues builds of other targets). Their records carry
 `project: null`, as RS's; `build_active` lists them, `lifecycle_active` the project ones.
+
+A project as one file: `project_export` {name, conversations} writes it and links it into the
+web server's folder for one download (its last log record carries the link as `result`, which
+`op` passes on); `project_import` takes create's fields and `upload`, the id of a file the web
+server took in, and makes the project `name` from it. Neither has a step-up: the file holds no
+secret by design.
 
 Settings -> Backup: `backup` is an operation that belongs to no project, as a build is, on a
 lane of its own (the core's backup lane: one backup or restore at a time); it does not hold
@@ -136,7 +142,7 @@ OPEN_VERBS = frozenset({"list", "status", "op"})
 STEP_UP_VERBS = frozenset({"destroy", "backup_rm", "backup_fetch"})
 # Operations on a project: a child holds the project's lock (agents_add and agents_update run
 # here as RS runs its `update` and `agents_update`: on its lifecycle lane, with a log).
-OP_VERBS = frozenset({"create", "start", "stop", "recreate", "destroy", "agents_add", "agents_update"})
+OP_VERBS = frozenset({"create", "start", "stop", "recreate", "destroy", "agents_add", "agents_update", "project_export", "project_import"})
 # Operations that belong to no project (RS's build lane): a child holds the core's build lane
 # instead. Their log records carry `project: null`, as RS's do (its build ops have no name).
 BUILD_VERBS = frozenset({"agent_pull", "agent_refresh", "editor_pull", "editor_refresh"})
@@ -168,6 +174,8 @@ FIELDS = {
     "agents_update": frozenset({"name"}),
     "agents_model": frozenset({"name", "model", "effort", "pi_model", "pi_thinking"}),
     "create": frozenset({"name", *LIMITS, *CREATE_SOFTWARE}),
+    "project_export": frozenset({"name", "conversations"}),
+    "project_import": frozenset({"name", *LIMITS, *CREATE_SOFTWARE, "upload"}),
     "start": frozenset({"name"}),
     "stop": frozenset({"name"}),
     "recreate": frozenset({"name"}),
@@ -219,10 +227,14 @@ def marker(op_id):
     return f"{MARKERS}/{op_id}.json"
 
 
-def record(op_id, project, action, status, step, msg):
-    """One line of an operation's progress log, in RS's shape."""
-    return json.dumps({"op_id": op_id, "project": project, "action": action, "step": step, "status": status,
-                       "msg": str(msg)[:MSG_CHARS], "ts": time.time()}) + "\n"
+def record(op_id, project, action, status, step, msg, result=None):
+    """One line of an operation's progress log, in RS's shape; the last line of an operation
+    whose caller needs more than a sentence (project_export: the file to fetch) carries it as
+    `result`."""
+    line = {"op_id": op_id, "project": project, "action": action, "step": step, "status": status, "msg": str(msg)[:MSG_CHARS], "ts": time.time()}
+    if result is not None:
+        line["result"] = result
+    return json.dumps(line) + "\n"
 
 
 def checked_op_id(op_id):
@@ -269,6 +281,8 @@ def op_state(op_id):
     if last is None:
         raise Refuse("validation", f"there is no operation {op_id}")
     out = {"op_id": op_id, "project": last.get("project"), "verb": last.get("action"), "msg": str(last.get("msg", ""))[:MSG_CHARS]}
+    if isinstance(last.get("result"), dict):
+        out["result"] = last["result"]
     if last.get("status") in ("done", "failed"):
         return dict(out, state=last["status"])
     if is_running(op_id):
@@ -380,7 +394,7 @@ def spawn_child(spec, children):
 
 def what_was_done(verb, name, out):
     """The last word of an operation that went well."""
-    if verb == "backup":
+    if verb in ("backup", "project_export", "project_import"):
         return out["said"]
     if verb in BUILD_VERBS:
         label = core.SOFTWARE[out.get("software", "")]["label"] if out.get("software") in core.SOFTWARE else "The software"
@@ -416,8 +430,8 @@ def run_operation(spec):
         core.HELD.add(name)  # handed over by the broker, held through spec["lock_fd"] until let_go(), or this process's end
         handed = [spec["lock_fd"]]
 
-    def emit(status, step, msg=""):
-        os.write(spec["log_fd"], record(op_id, name, verb, status, step, msg).encode())
+    def emit(status, step, msg="", result=None):
+        os.write(spec["log_fd"], record(op_id, name, verb, status, step, msg, result).encode())
 
     def say(message):
         emit("step", "progress", message)
@@ -436,6 +450,11 @@ def run_operation(spec):
         if verb == "create":
             chosen = {key: spec[key] for key in CREATE_SOFTWARE if key in spec}
             out = core.create(name, spec["limits"], say, **chosen)
+        elif verb == "project_import":
+            chosen = {key: spec[key] for key in CREATE_SOFTWARE if key in spec}
+            out = core.project_import(name, spec["upload"], say, spec["limits"], **chosen)
+        elif verb == "project_export":
+            out = core.project_export(name, spec["conversations"], say)
         elif verb == "backup":
             out = core.backup(say)
         elif verb == "agent_pull":
@@ -459,7 +478,7 @@ def run_operation(spec):
         else:
             out = core.destroy(name)
         let_go()
-        emit("done", "done", what_was_done(verb, name, out))
+        emit("done", "done", what_was_done(verb, name, out), out if verb == "project_export" else None)
         code = 0
     except core.CoreError as exc:
         let_go()
@@ -507,14 +526,24 @@ def operation_extra(verb, args):
     """What an operation's child is handed besides the name and the limits: checked values
     only, refused before the operation is accepted where the core can say so (an agent that
     is not pulled is the request's answer, not a failed operation)."""
-    if verb == "create":
+    if verb == "project_export":
+        if not isinstance(args.get("conversations", False), bool):
+            raise Refuse("validation", "conversations must be true or false")
+        return {"conversations": args.get("conversations", False)}
+    if verb in ("create", "project_import"):
+        upload = {}
+        if verb == "project_import":
+            if not isinstance(args.get("upload"), str) or not core.UPLOAD_ID.fullmatch(args["upload"]):
+                raise Refuse("validation", "upload must be the 32 hexadecimal characters of an uploaded file")
+            upload = {"upload": args["upload"]}
         agents = checked(core.checked_agents, args.get("agents", []))
         editor = checked(core.checked_editor, args.get("editor", False))
         model, effort = (("" if args.get(key) is None else args[key]) for key in ("claude_model", "claude_effort"))
         model, effort = checked(lambda pair: core.checked_claude_pair(*pair), (model, effort))
         pi_model, pi_thinking = checked(lambda pair: core.checked_pi_pair(*pair, agents), (args.get("pi_model"), args.get("pi_thinking")))
         checked(lambda chosen: core.refuse_unpulled(*chosen), (agents, editor))
-        return {"agents": agents, "editor": editor, "claude_model": model, "claude_effort": effort, "pi_model": pi_model, "pi_thinking": pi_thinking}
+        return {"agents": agents, "editor": editor, "claude_model": model, "claude_effort": effort, "pi_model": pi_model, "pi_thinking": pi_thinking,
+                **upload}
     if verb == "agents_add":
         agent = checked(core.known_agent, args.get("agent", "claude"))
         checked(lambda one: core.refuse_unpulled([one], False), agent)
@@ -823,7 +852,7 @@ def dispatch(verb, args, token=None, tokens=None, *, op_id=None, audit=None, spa
                 core.HELD.discard(name)
                 held.close()
 
-        limits = limits_named(args) if verb == "create" else None
+        limits = limits_named(args) if verb in ("create", "project_import") else None
         extra = operation_extra(verb, args)
         checked_op_id(op_id)
         if spawn is not None:

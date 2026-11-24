@@ -778,3 +778,207 @@ def reset_instructions(db):
 
 def text_hash(text):
     return hashlib.sha256(text.encode()).hexdigest()[:16]
+
+
+# --- a project to a file and back (the core's project_export / project_import) -----------------
+# What travels: the modules and the lessons, each under a key of the file's own (its id where it
+# was made), used only for the references inside the file; with the conversations, the lessons'
+# states and summaries, their runs (what the conversation shows of them: no session, no token),
+# messages (without the context the tutor was told: it holds the learner's brief), cards and
+# proposals. Never sessions, tool calls, evidence, knowledge records or brief sets.
+
+class ImportRefused(Exception):
+    """The file's plan and lessons cannot be put in; the message says why."""
+
+
+LESSON_STATES = ("not_started", "in_progress", "done", "dropped")
+SLUG = re.compile(r"[a-z0-9][a-z0-9-]{0,39}")
+
+
+def project_export(db, project, created, conversations):
+    """The project's plan and lessons, and with `conversations` what was said in them, as the
+    file's project.json holds them."""
+    rows = [row for row in lessons(db, project, created) if conversations or row["state"] != "dropped"]
+    out = {"conversations": conversations,
+           "modules": [{"key": row["id"], "title": row["title"], "position": row["position"]} for row in modules(db, project, created)],
+           "lessons": []}
+    for row in rows:
+        entry = {"key": row["id"], "kind": row["kind"], "title": row["title"], "objective": row["objective"], "slug": row["slug"],
+                 "position": row["position"], "module": row["module_id"], "agent": row["agent"]}
+        if conversations:
+            entry.update(state=row["state"], summary=row["summary"], one_line=row["one_line"], closed_at=row["closed_at"])
+        out["lessons"].append(entry)
+    if not conversations:
+        return out
+    of_project = "lesson_id IN (SELECT id FROM lessons WHERE project = ? AND created = ?)"
+    pair = (project, created)
+    out["runs"] = [{"key": r["id"], "lesson": r["lesson_id"], "status": r["status"], "error": r["error"], "agent": r["agent"],
+                    "usage": json.loads(r["usage_json"]) if r["usage_json"] else None, "started_at": r["started_at"], "finished_at": r["finished_at"]}
+                   for r in db.all(f"SELECT * FROM runs WHERE {of_project} ORDER BY id", pair)]
+    out["messages"] = [{"key": r["id"], "lesson": r["lesson_id"], "run": r["run_id"], "role": r["role"], "text": r["text"],
+                        "tools": json.loads(r["tools_json"] or "[]"), "composed": bool(r["composed"]), "created_at": r["created_at"]}
+                       for r in db.all(f"SELECT * FROM messages WHERE {of_project} ORDER BY id", pair)]
+    out["cards"] = [{"lesson": r["lesson_id"], "run": r["run_id"], "message": r["message_id"], "kind": r["kind"],
+                     "spec": json.loads(r["spec_json"]), "state": r["state"], "result": json.loads(r["result_json"]) if r["result_json"] else None,
+                     "created_at": r["created_at"], "updated_at": r["updated_at"]}
+                    for r in db.all(f"SELECT * FROM cards WHERE {of_project} ORDER BY id", pair)]
+    out["proposals"] = [{"lesson": r["lesson_id"], "run": r["run_id"], "message": r["message_id"], "kind": r["kind"],
+                         "proposed": json.loads(r["proposed_json"]), "approved": json.loads(r["approved_json"]) if r["approved_json"] else None,
+                         "changes": json.loads(r["changes_json"]), "state": r["state"], "created_at": r["created_at"], "decided_at": r["decided_at"]}
+                        for r in db.all(f"SELECT * FROM proposals WHERE {of_project} ORDER BY id", pair)]
+    return out
+
+
+def _is_int(value):
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _items(data, key, required=True):
+    items = data.get(key, [] if not required else None)
+    if not isinstance(items, list) or not all(isinstance(item, dict) for item in items):
+        raise ImportRefused(f"The file's `{key}` is not a list of objects.")
+    return items
+
+
+def _text(item, key, limit=None, blank=True, what="an item"):
+    value = item.get(key, "")
+    if not isinstance(value, str) or (not blank and not value.strip()) or (limit and len(value) > limit):
+        raise ImportRefused(f"The file has {what} whose `{key}` is not {'a text' if blank else 'a non-empty text'}"
+                            + (f" of at most {limit} characters." if limit else "."))
+    return value
+
+
+def _time(item, key):
+    value = item.get(key)
+    return value if isinstance(value, str) and len(value) <= 64 else None
+
+
+def _ref(item, key, known, what, optional=True):
+    value = item.get(key)
+    if value is None and optional:
+        return None
+    if not _is_int(value) or value not in known:
+        raise ImportRefused(f"The file has {what} that refers to {key} {value!r}, which is not in the file.")
+    return known[value]
+
+
+def _keyed(items, what):
+    keys = set()
+    for item in items:
+        if not _is_int(item.get("key")) or item["key"] in keys:
+            raise ImportRefused(f"The file has {what} without a key of its own (a whole number, given once).")
+        keys.add(item["key"])
+    return sorted(items, key=lambda item: item["key"])
+
+
+def _remap_plan(plan, lesson_ids):
+    """A proposal's plan with the lessons it names (by the file's keys) named by their new ids."""
+    if not isinstance(plan, dict):
+        raise ImportRefused("The file has a proposal whose plan is not an object.")
+    plan = json.loads(json.dumps(plan))
+    places = [item for module in plan.get("modules", []) if isinstance(module, dict) for item in module.get("lessons", [])]
+    places += plan.get("dropped", []) if isinstance(plan.get("dropped"), list) else []
+    for item in places:
+        if isinstance(item, dict) and item.get("id") is not None:
+            item["id"] = lesson_ids.get(item["id"]) if _is_int(item["id"]) else None
+    return plan
+
+
+def project_import(db, project, created, data):
+    """The file's plan and lessons (and conversations, when it has them) put into a new project,
+    in one transaction, with new ids. Goals is the project's own Goals lesson. No session is
+    written: a lesson that comes with its conversation is taken up from its files at its next
+    message. Returns the lesson folders to rename in the workspace: [[the file's, the new]]."""
+    if not isinstance(data, dict) or not isinstance(data.get("conversations"), bool):
+        raise ImportRefused("The file's project.json is not the shape clanker-learn writes.")
+    talk = data["conversations"]
+    there = db.all("SELECT * FROM lessons WHERE project = ? AND created = ?", (project, created))
+    if any(row["kind"] != "goals" or row["state"] != "not_started" or has_messages(db, row["id"]) for row in there) or has_plan(db, project, created):
+        raise ImportRefused("This project has lessons already: a file is put only into a new project.")
+    mods = _keyed(_items(data, "modules"), "a module")
+    rows = _keyed(_items(data, "lessons"), "a lesson")
+    if sum(1 for row in rows if row.get("kind") == "goals") > 1:
+        raise ImportRefused("The file has more than one Goals lesson.")
+    db.execute("BEGIN")
+    try:
+        module_ids, lesson_ids, run_ids, message_ids, folders = {}, {}, {}, {}, []
+        for item in mods:
+            if not _is_int(item.get("position")):
+                raise ImportRefused("The file has a module without a position.")
+            module_ids[item["key"]] = add_module(db, project, created, _text(item, "title", 200, False, "a module"), item["position"])
+        goals = ensure_goals(db, project, created)
+        for item in rows:
+            kind, agent = item.get("kind"), item.get("agent")
+            if kind not in ("lesson", "goals") or not _is_int(item.get("position")):
+                raise ImportRefused("The file has a lesson that is not a lesson or Goals, or has no position.")
+            title, objective = _text(item, "title", 200, False, "a lesson"), _text(item, "objective", 1000, what="a lesson")
+            slug = item.get("slug") if isinstance(item.get("slug"), str) and SLUG.fullmatch(item["slug"]) else slug_of(title)
+            state, summary, one_line, closed_at = "not_started", "", "", None
+            if talk:
+                state = item.get("state")
+                if state not in LESSON_STATES:
+                    raise ImportRefused(f"The file has a lesson whose state is {state!r}.")
+                summary, one_line = _text(item, "summary", what="a lesson"), _text(item, "one_line", what="a lesson")
+                closed_at = _time(item, "closed_at")
+            values = (state, summary, one_line, closed_at, agent if talk and agent in AGENTS else None)   # without the conversations, no sharer's choice
+            if kind == "goals":
+                db.execute("UPDATE lessons SET state = ?, summary = ?, one_line = ?, closed_at = ?, agent = ? WHERE id = ?", (*values, goals["id"]))
+                new, slug = goals["id"], goals["slug"]
+            else:
+                new = db.execute("INSERT INTO lessons (project, created, title, kind, objective, module_id, position, slug, state, summary, "
+                                 "one_line, closed_at, agent) VALUES (?, ?, ?, 'lesson', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                                 (project, created, title, objective, _ref(item, "module", module_ids, "a lesson"), item["position"], slug,
+                                  *values)).lastrowid
+            lesson_ids[item["key"]] = new
+            old_slug = item.get("slug") if isinstance(item.get("slug"), str) and SLUG.fullmatch(item["slug"]) else None
+            if old_slug:
+                folders.append([f"{item['key']}-{old_slug}", f"{new}-{slug}"])
+        if talk:
+            for item in _keyed(_items(data, "runs"), "a run"):
+                status = item.get("status") if item.get("status") in ("ok", "cancelled", "failed", "interrupted") else "interrupted"
+                usage = item.get("usage") if isinstance(item.get("usage"), dict) else None
+                run_ids[item["key"]] = db.execute(
+                    f"INSERT INTO runs (lesson_id, status, error, usage_json, agent, started_at, finished_at) VALUES (?, ?, ?, ?, ?, coalesce(?, {NOW}), ?)",
+                    (_ref(item, "lesson", lesson_ids, "a run", False), status, _text(item, "error", what="a run"),
+                     json.dumps(usage) if usage else None, item.get("agent") if item.get("agent") in AGENTS else DEFAULT_AGENT,
+                     _time(item, "started_at"), _time(item, "finished_at"))).lastrowid
+            for item in _keyed(_items(data, "messages"), "a message"):
+                tools = item.get("tools", [])
+                if item.get("role") not in ("user", "assistant") or not isinstance(tools, list) or not all(
+                        isinstance(t, dict) and all(isinstance(t.get(k), str) for k in ("kind", "label", "detail")) and t.get("ok") in (True, False, None)
+                        for t in tools):
+                    raise ImportRefused("The file has a message that is not the learner's or the tutor's, or whose tools are not a list.")
+                message_ids[item["key"]] = db.execute(
+                    f"INSERT INTO messages (lesson_id, run_id, role, text, tools_json, composed, created_at) VALUES (?, ?, ?, ?, ?, ?, coalesce(?, {NOW}))",
+                    (_ref(item, "lesson", lesson_ids, "a message", False), _ref(item, "run", run_ids, "a message"), item["role"],
+                     _text(item, "text", what="a message"), json.dumps(tools), 1 if item.get("composed") is True else 0,
+                     _time(item, "created_at"))).lastrowid
+            for item in _items(data, "cards"):
+                spec, result, kind = item.get("spec"), item.get("result"), item.get("kind")
+                needs = {"exercise": ("title", "steps", "check"), "question": ("question", "options", "answer", "explanation")}.get(kind)
+                if not needs or not isinstance(spec, dict) or not all(key in spec for key in needs) or not (result is None or isinstance(result, dict)):
+                    raise ImportRefused("The file has a card that is not an exercise or a question as clanker-learn makes them.")
+                if result is not None:
+                    result = dict(result, evidence=None)   # the evidence stays where it was made
+                db.execute(f"INSERT INTO cards (lesson_id, run_id, message_id, kind, spec_json, state, result_json, told, created_at, updated_at) "
+                           f"VALUES (?, ?, ?, ?, ?, ?, ?, 1, coalesce(?, {NOW}), coalesce(?, {NOW}))",
+                           (_ref(item, "lesson", lesson_ids, "a card", False), _ref(item, "run", run_ids, "a card"),
+                            _ref(item, "message", message_ids, "a card"), kind, json.dumps(spec, ensure_ascii=False),
+                            _text(item, "state", 40, False, "a card"), json.dumps(result, ensure_ascii=False) if result is not None else None,
+                            _time(item, "created_at"), _time(item, "updated_at")))
+            for item in _items(data, "proposals"):
+                changes = item.get("changes", [])
+                if item.get("kind") not in ("plan", "change") or item.get("state") not in ("open", "approved", "dismissed") or not isinstance(changes, list):
+                    raise ImportRefused("The file has a proposal that is not a plan or a change as clanker-learn makes them.")
+                approved = item.get("approved")
+                db.execute(f"INSERT INTO proposals (lesson_id, run_id, message_id, kind, proposed_json, approved_json, changes_json, state, told, "
+                           f"created_at, decided_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, coalesce(?, {NOW}), ?)",
+                           (_ref(item, "lesson", lesson_ids, "a proposal", False), _ref(item, "run", run_ids, "a proposal"),
+                            _ref(item, "message", message_ids, "a proposal"), item["kind"], json.dumps(_remap_plan(item.get("proposed"), lesson_ids)),
+                            None if approved is None else json.dumps(_remap_plan(approved, lesson_ids)), json.dumps(changes), item["state"],
+                            _time(item, "created_at"), _time(item, "decided_at")))
+        db.execute("COMMIT")
+    except BaseException:
+        db.execute("ROLLBACK")
+        raise
+    return folders

@@ -573,6 +573,43 @@ async def project_removed(request):
                **knowledge.project_removed(request.app["db"], project, created, forget)})
 
 
+# --- a project to a file and back (called by the core, not the browser) -----------------------------
+
+PROJECT_FILE_MAX = 256 * 1024 * 1024   # project.json with every conversation: far above what a project writes
+
+
+async def project_export(request):
+    """GET /project-export?project=&created=&conversations=0|1 — the project's plan and lessons
+    (and their conversations) as a project file's project.json holds them."""
+    project, created = project_pair(request.query)
+    conversations = request.query.get("conversations", "0")
+    if conversations not in ("0", "1"):
+        raise Refusal("validation", "`conversations` is 0 or 1.")
+    return ok(store.project_export(request.app["db"], project, created, conversations == "1"))
+
+
+async def project_import(request):
+    """POST /project-import {project, created, data} — a project file's project.json put into a
+    new project. Read past the usual size limit: a file's conversations can be large."""
+    raw = bytearray()
+    while chunk := await request.content.read(1024 * 1024):
+        raw += chunk
+        if len(raw) > PROJECT_FILE_MAX:
+            raise Refusal("validation", "The project's plan and conversations are too large to be put in.")
+    try:
+        body = json.loads(raw)
+    except ValueError:
+        raise Refusal("validation", "The body must be JSON.") from None
+    if not isinstance(body, dict):
+        raise Refusal("validation", "The body must be a JSON object.")
+    project, created = project_pair(body)
+    try:
+        folders = store.project_import(request.app["db"], project, created, body.get("data"))
+    except store.ImportRefused as exc:
+        raise Refusal("validation", str(exc)) from None
+    return ok({"project": project, "created": created, "folders": folders})
+
+
 # --- the learner's side of a card (cards.py) -----------------------------------------------------
 
 def card_or_404(request, kind=None):
@@ -692,6 +729,7 @@ def build_app(db, secret):
         web.get("/knowledge/lessons", list_summaries),
         web.get("/knowledge/changes", list_changes), web.post("/knowledge/changes/{id}/undo", undo_change),
         web.post("/projects/removed", project_removed),
+        web.get("/project-export", project_export), web.post("/project-import", project_import),
         web.get("/cards/{id}", get_card), web.post("/cards/{id}/check", check_card), web.post("/cards/{id}/answer", answer_card),
         web.get("/settings", get_settings), web.put("/settings", put_settings),
     ])
