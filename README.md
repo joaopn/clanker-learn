@@ -8,7 +8,6 @@ A tutor you run on your own machine.<br>
 Learn a technical subject by doing it in a real Linux sandbox, with a tutor that works beside you and remembers what you know.
 
 ![Self-hosted](https://img.shields.io/badge/self--hosted-yes-5E81AC)
-![Telemetry: none](https://img.shields.io/badge/telemetry-none-brightgreen)
 ![Agents](https://img.shields.io/badge/agents-Claude%20Code%20%7C%20pi-8A5A2B)
 
 [Getting started](docs/guide/getting-started.md) · [Lessons](docs/guide/lessons.md) · [Knowledge](docs/guide/knowledge.md) · [Agents](docs/guide/agents.md) · [Security](docs/guide/security.md) · [FAQ](docs/guide/faq.md)
