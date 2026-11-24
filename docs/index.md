@@ -7,6 +7,8 @@ permalink: /
 
 clanker-learn is a tutor you run on your own machine. You learn a technical subject by doing it, in a real Linux sandbox, with a tutor that works in that sandbox beside you and remembers what you told it about yourself. The tutor is Claude Code, on your own Claude subscription, or pi, with a provider of your choice. It runs as one Docker container that holds a sandbox for each of your projects, and keeps everything in two Docker volumes on your machine.
 
+![A lesson on SQL: the tutor runs a query in the sandbox, then explains the order of a SELECT with a diagram and a table](assets/hero.png)
+
 New here? Start with **[Getting started](guide/getting-started.md)**: install, the first start and your first password.
 
 ## A subject in six steps
