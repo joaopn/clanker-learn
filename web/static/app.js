@@ -229,6 +229,9 @@ const S = {
 const tabOf = (project) => S.tabs[project] || "shell";
 const paneKey = (project, tab) => `${project}|${tab}`;
 const projectRow = (name) => S.projects.find((p) => p.name === name) || null;
+// The projects the sidebar shows: an archived one is listed only in ▤ All projects.
+const shownProjects = () => S.projects.filter((p) => !p.archived);
+const shownRow = (name) => { const p = projectRow(name); return p && !p.archived ? p : null; };
 const opOf = (name) => S.ops.find((o) => o.project === name) || null;
 
 // ---- start: set-up, login or the projects -----------------------------------------------
@@ -382,6 +385,7 @@ function enterApp(projects) {
             rail,
             h("div", { class: "rail-foot" },
                 h("button", { class: "foot", onclick: newProjectDialog }, "+ New project"),
+                h("button", { class: "foot", onclick: allProjectsDialog }, "▤ All projects"),
                 h("button", { class: "foot knowledge-btn", onclick: () => togglePage("knowledge", showKnowledge) }, h("span", {}, "◆ Knowledge"), h("span", { class: "kdot", hidden: true })),
                 h("button", { class: "foot settings-btn", onclick: () => togglePage("settings", showSettings) }, "⚙ Settings"),
                 h("button", { class: "foot", onclick: logout }, "Log out"))),
@@ -395,14 +399,14 @@ function enterApp(projects) {
     S.cols = layout.columns;
     for (const [p, c] of Object.entries(S.cols)) if (c.focus && p !== layout.project) S.tabs[p] = c.focus;
     S.wasNarrow = narrowScreen();
-    S.expanded = new Set(layout.expanded.filter((n) => projectRow(n)));
-    if (layout.project && projectRow(layout.project)) {
+    S.expanded = new Set(layout.expanded.filter((n) => shownRow(n)));
+    if (layout.project && shownRow(layout.project)) {
         S.current = layout.project;
         if (layout.tab) S.tabs[layout.project] = layout.tab;
         const lid = lessonTabId(layout.tab);
         if (lid) S.lessonOf[layout.project] = lid;
-    } else if (S.projects.length) {
-        S.current = S.projects[0].name;
+    } else if (shownProjects().length) {
+        S.current = shownProjects()[0].name;
     }
     if (S.current) S.expanded.add(S.current);
     S.timers.push(setInterval(refreshProjects, PROJECTS_EVERY_MS));
@@ -452,23 +456,25 @@ async function refreshProjects() {
             S.listError = errText(list.body);
         }
         if (ops.body.ok) S.ops = (ops.body.result && Array.isArray(ops.body.result.ops)) ? ops.body.result.ops : [];
-        // A project the broker no longer lists loses its panes and its lessons.
+        // A project the broker no longer lists, or that is archived, loses its panes and its lessons.
         for (const key of Object.keys(S.panes)) {
-            if (!projectRow(key.split("|")[0])) dropPane(key);
+            if (!shownRow(key.split("|")[0])) dropPane(key);
         }
         if (list.body.ok) {
-            for (const n of [...S.expanded]) if (!projectRow(n) && n !== S.creating) S.expanded.delete(n);
-            for (const n of Object.keys(S.lessons)) if (!projectRow(n)) delete S.lessons[n];
-            for (const n of Object.keys(S.cols)) if (!projectRow(n) && n !== S.creating) delete S.cols[n];
+            for (const n of [...S.expanded]) if (!shownRow(n) && n !== S.creating) S.expanded.delete(n);
+            for (const n of Object.keys(S.lessons)) if (!shownRow(n)) delete S.lessons[n];
+            for (const n of Object.keys(S.cols)) if (!shownRow(n) && n !== S.creating) delete S.cols[n];
         }
         refreshTutor();
         // A lesson's choice of agent offers what its project has now (pi added from the gear).
         for (const pane of Object.values(S.panes)) if (pane.kind === "lesson" && pane.drawAgent) pane.drawAgent();
-        if (S.current && S.current !== S.creating && !projectRow(S.current) && list.body.ok) {
-            S.current = S.projects.length ? S.projects[0].name : null;
+        if (S.current && S.current !== S.creating && !shownRow(S.current) && list.body.ok) {
+            const first = shownProjects()[0];
+            S.current = first ? first.name : null;
             if (S.current) refreshServices(S.current);
         }
         render();
+        if (allProjectsRedraw) allProjectsRedraw();
     } finally {
         refreshProjects.busy = false;
     }
@@ -485,7 +491,7 @@ async function refreshServices(name) {
 
 // What the broker says of a project, in words; and whether its sandbox runs.
 const OP_WORDS = { create: "being made", start: "starting", stop: "stopping", recreate: "being recreated", destroy: "being destroyed",
-                   agents_add: "adding an agent", agents_update: "updating its agents" };
+                   agents_add: "adding an agent", agents_update: "updating its agents", archive: "archiving", unarchive: "unarchiving" };
 
 function stateWords(p) {
     const op = opOf(p.name);
@@ -512,7 +518,7 @@ function render() {
 }
 
 function renderRail() {
-    const rows = S.projects.map((p) => {
+    const rows = shownProjects().map((p) => {
         const st = stateWords(p);
         const op = opOf(p.name);
         const open = S.expanded.has(p.name);
@@ -529,7 +535,7 @@ function renderRail() {
                               onclick: (ev) => { ev.stopPropagation(); toggleLessons(p.name); } }, open ? "▾" : "▸")),
             open ? lessonRows(p.name) : null);
     });
-    if (!rows.length) rows.push(h("div", { class: "none" }, "No project yet."));
+    if (!rows.length) rows.push(h("div", { class: "none" }, S.projects.length ? "Every project is archived: ▤ All projects lists them." : "No project yet."));
     if (S.listError) rows.push(h("div", { class: "none bad" }, S.listError));
     // In privileged mode, a quiet line at the bottom of the list, leading to what that means.
     if (S.mode === "privileged") {
@@ -705,7 +711,9 @@ function showPane() {
         shown.push({ el: S.shell.knowledge.el, col: 0 });
     } else if (!name) {
         empty.replaceChildren(h("div", { class: "page-inner" }, h("h1", {}, "No project shown"),
-            h("p", { class: "sub" }, S.projects.length ? "Pick a project on the left." : "Make one with “+ New project” on the left.")));
+            h("p", { class: "sub" }, shownProjects().length ? "Pick a project on the left."
+                : S.projects.length ? "Every project is archived: “▤ All projects” on the left brings one back."
+                : "Make one with “+ New project” on the left.")));
         shown.push({ el: empty, col: 0 });
     } else {
         const ids = multi ? L.columns.map((_, i) => columnActive(name, i)) : [tabOf(name)];
@@ -5183,6 +5191,7 @@ function removeBackupDialog(name) {
 // ---- dialogs: a new project, a project's actions, an operation's progress -------------------
 
 let modal = null;
+let allProjectsRedraw = null;   // while ▤ All projects is open: redraws its rows
 
 function openModal(title, body, buttons) {
     closeModal();
@@ -5197,6 +5206,7 @@ function openModal(title, body, buttons) {
 function closeModal() {
     if (modal) modal.remove();
     modal = null;
+    allProjectsRedraw = null;
 }
 
 document.addEventListener("keydown", (ev) => { if (ev.key === "Escape" && modal) closeModal(); });
@@ -5582,6 +5592,51 @@ function agentsUpdateDialog(name, agents, rows) {
     ], [h("button", { onclick: closeModal }, "Cancel"), go]);
 }
 
+// ▤ All projects: every project with its state, archived ones with Unarchive. The box stays
+// open while one comes back (its operation followed without a dialog), and redraws its rows
+// whenever the projects are read again.
+function allProjectsDialog() {
+    const list = h("div", { class: "allp" });
+    const errors = new Map();   // project -> what its Unarchive was told
+    const pending = new Set();  // asked, the operation not yet seen
+    const unarchive = async (name) => {
+        pending.add(name);
+        errors.delete(name);
+        draw();
+        const r = await api("POST", projectPath(name, "/unarchive"));
+        if (!r.body.ok || !r.body.op_id) {
+            pending.delete(name);
+            errors.set(name, errText(r.body));
+            draw();
+            return;
+        }
+        refreshProjects();
+        // Followed without a dialog (it would replace this box); its end reads the projects again.
+        followOp(r.body.op_id, `${name}: ${OP_WORDS.unarchive}`, { background: true, onEnd: () => { pending.delete(name); } });
+    };
+    const draw = () => {
+        const rows = S.projects.map((p) => {
+            const op = opOf(p.name);
+            const st = pending.has(p.name) && !op ? { text: OP_WORDS.unarchive, cls: "busy" } : stateWords(p);
+            const err = errors.get(p.name);
+            return h("div", { class: "allp-row" },
+                h("span", { class: `dot inline ${st.cls}` }),
+                h("span", { class: "grow" }, h("span", { class: "allp-name" }, p.name),
+                    h("span", { class: "note" }, " · ", st.text, p.archived ? " · archived" : "")),
+                p.archived ? h("button", { disabled: !!op || pending.has(p.name), onclick: () => unarchive(p.name) }, "Unarchive") : null,
+                err ? h("p", { class: "bad allp-err" }, err) : null);
+        });
+        if (!rows.length) rows.push(h("p", { class: "muted" }, "No project yet."));
+        list.replaceChildren(...rows);
+    };
+    draw();
+    openModal("All projects", [
+        h("p", { class: "note" }, "Unarchive brings a project back to the sidebar, stopped: start it from its ⚙."),
+        list,
+    ], [h("button", { onclick: closeModal }, "Close")]);
+    allProjectsRedraw = draw;
+}
+
 // RS's words (agentsUpdateHint, for a project whose own terminal has the agents).
 const AGENTS_UPDATE_HINT = "Applied live — nothing is recreated, and logins, sessions and settings are kept. " +
     "The project's Shell gets these versions, including over an agent you updated yourself. " +
@@ -5637,8 +5692,9 @@ function projectDialog(name) {
                 op ? h("button", { class: "link", onclick: () => followOp(op.op_id, `${name}: ${OP_WORDS[op.verb] || op.verb}`) }, "show the log") : null)),
         h("div", { class: "kv" }, h("span", { class: "k" }, ""),
             h("span", { class: "row-btns" }, running ? action("stop", "Stop") : action("start", "Start", "primary"),
-                action("recreate", "Recreate"))),
-        h("p", { class: "note" }, "Recreate makes a new sandbox from the current image, with the same workspace and home folder; its setup recipe runs again."),
+                action("recreate", "Recreate"), action("archive", "Archive"))),
+        h("p", { class: "note" }, "Recreate makes a new sandbox from the current image, with the same workspace and home folder; its setup recipe runs again. " +
+            "Archive stops the project and hides it from the sidebar; ▤ All projects brings it back."),
         p.problem ? h("p", { class: "bad" }, String(p.problem)) : null,
         agentsBox,
         briefBox,

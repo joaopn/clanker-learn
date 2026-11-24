@@ -293,6 +293,10 @@ body.col-dragging iframe { pointer-events: none; }
 .modal .kv .k { color: var(--fg-muted); }
 .modal .row-btns { display: flex; gap: 8px; }
 .modal p { margin: 8px 0; line-height: 1.45; }
+.allp-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding: 7px 0; border-top: 1px solid var(--border); }
+.allp-row:first-child { border-top: none; }
+.allp-name { overflow-wrap: anywhere; }
+.modal .allp-err { flex-basis: 100%; margin: 0; }
 .more { margin-top: 12px; border-top: 1px solid var(--line); padding-top: 10px; }
 .more summary { cursor: pointer; color: var(--fg-muted); }
 .more[open] summary { color: var(--fg-base); margin-bottom: 4px; }

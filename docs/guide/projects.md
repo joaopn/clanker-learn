@@ -33,11 +33,18 @@ The ⚙ beside a project in the sidebar opens its Config box. The box shows whet
 
 - **Start** and **Stop.** What you installed is still there after a stop and a start, and after clanker-learn itself is stopped and started. The projects that were running when clanker-learn stopped are started again when it starts.
 - **Recreate** gives the project a new container from the current sandbox image. The workspace and the home folder stay, with Claude Code's login and sessions; what was installed elsewhere is gone, and the [setup recipe](#what-a-sandbox-brings-back-by-itself) brings it back. A stopped project is running afterwards.
+- **Archive** stops the project if it runs and hides it from the sidebar: see [Archiving a project](#archiving-a-project).
 - **Agents**: what the project has. **Add** Claude Code or pi to a project that does not have it; change Claude's model and effort, or pi's model and thinking level, with **Apply**; **Update** both agents to the versions fetched in Settings. These work while the project runs, without a restart (Add on a stopped project asks you to start it first). A model and level applied are written into the agent's settings in the project's home folder, and a session started from then on uses them. A project whose sandbox was made before something here was possible is recreated first, then given it: the box says so.
 - **Brief**: the brief set the project's tutors are told. A lesson takes a new one at its next start.
 - **Limits**: change them with **Change the limits**. They apply at once, with two exceptions the box tells you about: a memory limit is removed only when the project is next recreated, and on sysbox a processor limit is removed only at its next start.
 - **Export** makes the project one file, `<project>-<date>.clproject`, and downloads it: to give to someone, or to move the project to another clanker-learn. It always holds the workspace (the setup recipe and the lessons' folders included), the study plan and its lessons, the limits and whether the project has the editor. Tick **Include my conversations** to add what was said in each lesson, the lessons' states, transcripts and notes; without it every lesson arrives not started. It never holds the home folder (the agents' logins and sessions), the project's keys and Shell password, or what clanker-learn knows about you. Everything in the workspace goes in as it is, a `.env` with a key in it too.
 - **Destroy** asks for your password again, then removes the sandbox, its workspace, its home folder and its ports for good, and its conversations with them: a new project of the same name starts empty. Tick **also forget what I learned here** to remove the rest too. Left unticked, the lessons' summaries and the goals and preferences you stated there stay for your other projects' tutors, and the project's insights stay on the [Knowledge page](knowledge.md) for you, told to no tutor; all marked as from a removed project. If a destroy is cut short, run it again: a project being destroyed is never started.
+
+## Archiving a project
+
+**Archive**, in a project's Config box, stops the project if it runs and hides it from the sidebar. Nothing is deleted: the workspace, the home folder, the lessons, their conversations and what you learned there all stay. An archived project is not started when clanker-learn restarts.
+
+**▤ All projects**, at the bottom of the sidebar, lists every project with its state, archived ones marked as such. **Unarchive** brings one back to the sidebar, stopped: start it from its ⚙.
 
 ## What a sandbox brings back by itself
 
