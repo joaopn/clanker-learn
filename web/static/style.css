@@ -745,3 +745,6 @@ button.qopt:disabled { opacity: 1; cursor: default; }
     .if-row { grid-template-columns: minmax(0, 1fr); gap: 4px; }
     .page { padding: 18px 16px 40px; }
 }
+
+/* The New project box's Empty / From a file choice */
+.np-mode { width: max-content; margin: 4px 0 8px; }

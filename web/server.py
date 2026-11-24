@@ -44,6 +44,7 @@ import secrets
 import signal
 import ssl
 import struct
+import tarfile
 import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -120,6 +121,7 @@ BROKER_FIELDS = {
     "agents_add": ("agent",),
     "agents_model": ("model", "effort", "pi_model", "pi_thinking"),
 }
+BROKER_FIELDS["project_import"] = (*BROKER_FIELDS["create"], "upload")
 # agents_update is RS's action name: an operation, like start (RS runs it on its lifecycle lane).
 PROJECT_ACTIONS = ("start", "stop", "recreate", "destroy", "agents_update")
 
@@ -440,15 +442,17 @@ def _mint_op_id(name: str, action: str) -> str:
 
 
 async def _lane_relay(request: web.Request, verb: str, args: dict,
-                      seed: str, started=None) -> web.Response:
+                      seed: str, started=None, action: str | None = None) -> web.Response:
     """Kick a broker verb that runs as an operation in a child and answers at once:
     mint an op_id, one synchronous broker call carrying it, return {ok, op_id}
     or the broker's refusal. The operation then lives in the broker's progress
-    log; the browser follows it there (the log, /alive, and the op's state)."""
+    log; the browser follows it there (the log, /alive, and the op's state).
+    `action` names the operation in its op_id where the verb is too long for a
+    31-character project name to fit in 64 characters."""
     s = _broker_session(request)
     if s is None:
         return _unauthorized()
-    op_id = _mint_op_id(seed, verb)
+    op_id = _mint_op_id(seed, action or verb)
     # A name the op_id rule rejects would hand the browser a handle it cannot
     # follow — answer it as a normal validation error.
     if not _OP_ID_RE.fullmatch(op_id):
@@ -487,6 +491,33 @@ async def broker_create_handler(request: web.Request) -> web.Response:
     if body is None or not isinstance(body.get("name"), str):
         return _bad_request() if _broker_session(request) else _unauthorized()
     return await _lane_relay(request, "create", _forward(body, "create"), body["name"])
+
+
+async def broker_project_import_handler(request: web.Request) -> web.Response:
+    """POST /broker/project-import {create's fields, upload} — a new project made from a project
+    file taken in by POST /broker/project-file (gated, origin-checked), relayed as create is."""
+    if not origin_ok(request):
+        return web.Response(status=403, text="origin rejected")
+    body = await _json_body(request)
+    if body is None or not isinstance(body.get("name"), str):
+        return _bad_request() if _broker_session(request) else _unauthorized()
+    return await _lane_relay(request, "project_import", _forward(body, "project_import"), body["name"], action="import")
+
+
+async def broker_project_export_handler(request: web.Request) -> web.Response:
+    """POST /broker/project/{name}/export {conversations?} — write the project as one file
+    (gated, origin-checked): an operation, as start is; its file is then asked for with
+    export-download."""
+    if not origin_ok(request):
+        return web.Response(status=403, text="origin rejected")
+    body = await _json_body(request)
+    if body is None:
+        return _bad_request() if _broker_session(request) else _unauthorized()
+    name = request.match_info.get("name", "")
+    args = {"name": name}
+    if isinstance(body.get("conversations"), bool):
+        args["conversations"] = body["conversations"]
+    return await _lane_relay(request, "project_export", args, name, action="export")
 
 
 async def broker_project_limits_handler(request: web.Request) -> web.Response:
@@ -668,6 +699,8 @@ _BACKUP_NAME_RE = re.compile(r"cl-backup-[0-9]{8}T[0-9]{6}Z\.tar\.gz")
 _DOWNLOAD_LINK_RE = re.compile(r"[0-9a-f]{16}-(cl-backup-[0-9]{8}T[0-9]{6}Z\.tar\.gz)")
 DOWNLOADS_DIR = DATA_DIR / "downloads"   # the broker links a backup here for one download
 DOWNLOAD_CHUNK = 256 * 1024
+# A project file the core made for one download (outer/core.py's PROJECT_FILE_LINK).
+_PROJECT_FILE_LINK_RE = re.compile(r"[0-9a-f]{16}-([a-z0-9-]{1,31}-[0-9]{8}\.clproject)")
 
 
 async def broker_backups_handler(request: web.Request) -> web.Response:
@@ -750,21 +783,54 @@ async def broker_backup_download_handler(request: web.Request) -> web.Response:
     found = _DOWNLOAD_LINK_RE.fullmatch(link)
     if not found or found.group(1) != name:
         return web.json_response({"ok": False, "error": {"kind": "failed", "message": "the broker named no file to send"}}, status=500)
+    _hand_out(request, link)
+    return web.json_response({"ok": True, "url": f"/broker/backups/file/{link}", "size": reply["result"].get("size")})
+
+
+def _hand_out(request: web.Request, link: str) -> None:
+    """Register a link the broker made as one download for this login, lapsed ones dropped."""
     now = time.time()
     for old in [k for k, (_, until) in _DOWNLOADS.items() if until < now]:
         _DOWNLOADS.pop(old, None)
     _DOWNLOADS[link] = (request.cookies.get(BROKER_COOKIE, ""), now + DOWNLOAD_LINK_S)
-    return web.json_response({"ok": True, "url": f"/broker/backups/file/{link}", "size": reply["result"].get("size")})
+
+
+async def broker_project_export_download_handler(request: web.Request) -> web.Response:
+    """POST /broker/project/{name}/export-download {op_id} — the file a finished export of this
+    project made, as a one-time address of this login's (gated, origin-checked). The file is
+    the one the broker's record of that operation names, matched against the core's rule."""
+    if not origin_ok(request):
+        return web.Response(status=403, text="origin rejected")
+    body = await _json_body(request)
+    if body is None or _broker_session(request) is None:
+        return _bad_request() if _broker_session(request) else _unauthorized()
+    name = request.match_info.get("name", "")
+    op_id = body.get("op_id")
+    if not isinstance(op_id, str) or not _OP_ID_RE.fullmatch(op_id):
+        return _bad_request()
+    status, reply = await _relay(request, "op", {"op_id": op_id})
+    if status != 200 or not reply.get("ok"):
+        return web.json_response(reply, status=status)
+    op = reply.get("result") if isinstance(reply.get("result"), dict) else {}
+    made = op.get("result") if isinstance(op.get("result"), dict) else {}
+    link = made.get("file")
+    if (op.get("state") != "done" or op.get("verb") != "project_export" or op.get("project") != name
+            or not isinstance(link, str) or not _PROJECT_FILE_LINK_RE.fullmatch(link)):
+        return web.json_response({"ok": False, "error": {"kind": "validation", "message": f"That operation made no project file of {name} to download."}},
+                                 status=400)
+    _hand_out(request, link)
+    return web.json_response({"ok": True, "url": f"/broker/project-file/file/{link}", "size": made.get("size")})
 
 
 async def broker_backup_file_handler(request: web.Request) -> web.StreamResponse:
-    """GET /broker/backups/file/{link} — the archive, as a file to save (gated): the one-time
-    address the POST above gave this login. Its file is opened and its link removed at once,
-    so a second request finds nothing."""
+    """GET /broker/backups/file/{link} and /broker/project-file/file/{link} — the archive or
+    the project file, as a file to save (gated): the one-time address a download POST gave
+    this login. Its file is opened and its link removed at once, so a second request finds
+    nothing."""
     link = request.match_info.get("link", "")
     if _broker_session(request) is None:
         return _unauthorized()
-    found = _DOWNLOAD_LINK_RE.fullmatch(link)
+    found = _DOWNLOAD_LINK_RE.fullmatch(link) or _PROJECT_FILE_LINK_RE.fullmatch(link)
     given = _DOWNLOADS.pop(link, None) if found else None
     if given is None or given[1] < time.time() or not secrets.compare_digest(given[0], request.cookies.get(BROKER_COOKIE, "")):
         return web.json_response({"ok": False, "error": {"kind": "not_found", "message": "That download link is used or lapsed: ask for the download again."}},
@@ -784,6 +850,71 @@ async def broker_backup_file_handler(request: web.Request) -> web.StreamResponse
         return response
     finally:
         fh.close()
+
+
+# ---- a project file taken in, for an import -------------------------------------------
+
+UPLOADS_DIR = DATA_DIR / "uploads"   # the core takes <upload>.clproject from here (the outer container's /data/web/uploads)
+UPLOAD_KEEP_S = 3600                 # an upload never imported is removed at a later upload
+MANIFEST_MAX = 1024 * 1024
+PROJECT_FILE_FORMAT = "clanker-learn project"
+NOT_A_PROJECT_FILE = "This is not a clanker-learn project file: pick a .clproject file that a project's Export made."
+
+
+def _uploads_ready() -> None:
+    """The folder of uploads made, and the uploads older than UPLOAD_KEEP_S removed. Blocking."""
+    UPLOADS_DIR.mkdir(mode=0o700, exist_ok=True)
+    now = time.time()
+    for left in UPLOADS_DIR.iterdir():
+        with contextlib.suppress(OSError):
+            if now - left.lstat().st_mtime > UPLOAD_KEEP_S:
+                left.unlink()
+
+
+def _upload_manifest(path: Path) -> dict | None:
+    """The project file's manifest, its first member, read without reading further; None when
+    it is not a clanker-learn project file. Blocking."""
+    try:
+        with tarfile.open(path, "r|gz") as tar:
+            first = tar.next()
+            if first is None or first.name != "manifest.json" or not first.isreg() or first.size > MANIFEST_MAX:
+                return None
+            manifest = json.loads(tar.extractfile(first).read())
+    except (OSError, EOFError, tarfile.TarError, ValueError, UnicodeDecodeError, RecursionError):
+        return None
+    return manifest if isinstance(manifest, dict) and manifest.get("format") == PROJECT_FILE_FORMAT else None
+
+
+async def broker_project_file_handler(request: web.Request) -> web.Response:
+    """POST /broker/project-file — a project file to import, the raw file as the body (gated,
+    origin-checked). Streamed to the folder of uploads (aiohttp's body limit applies to a
+    body read whole, not to one read as a stream), its manifest checked; the answer is
+    {ok, upload, manifest}, the upload's id being what POST /broker/project-import names."""
+    if not origin_ok(request):
+        return web.Response(status=403, text="origin rejected")
+    if _broker_session(request) is None:
+        return _unauthorized()
+    await asyncio.to_thread(_uploads_ready)
+    upload = secrets.token_hex(16)
+    part, path = UPLOADS_DIR / f".{upload}.part", UPLOADS_DIR / f"{upload}.clproject"
+    fh = await asyncio.to_thread(open, part, "xb")
+    try:
+        try:
+            while chunk := await request.content.read(DOWNLOAD_CHUNK):
+                await asyncio.to_thread(fh.write, chunk)
+        finally:
+            fh.close()
+        await asyncio.to_thread(os.rename, part, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            part.unlink()
+        raise
+    manifest = await asyncio.to_thread(_upload_manifest, path)
+    if manifest is None:
+        with contextlib.suppress(OSError):
+            path.unlink()
+        return web.json_response({"ok": False, "error": {"kind": "validation", "message": NOT_A_PROJECT_FILE}}, status=400)
+    return web.json_response({"ok": True, "upload": upload, "manifest": manifest})
 
 
 def _read_from(path: Path, frm: int) -> tuple[bytes, int]:
@@ -2237,7 +2368,7 @@ async def cert_handler(request: web.Request) -> web.Response:
 
 def build_app() -> web.Application:
     """The application and its routes. Request bodies keep aiohttp's default size limit:
-    nothing here takes a large one."""
+    the one large body, a project file, is read as a stream, which the limit does not cover."""
     app = web.Application()
     app.router.add_get("/", index_handler)
     app.router.add_get("/static/{path:.*}", static_handler)
@@ -2261,6 +2392,9 @@ def build_app() -> web.Application:
     app.router.add_post("/broker/backups/remove", broker_backup_remove_handler)
     app.router.add_post("/broker/backups/{backup}/download", broker_backup_download_handler)
     app.router.add_get("/broker/backups/file/{link}", broker_backup_file_handler)
+    app.router.add_post("/broker/project-file", broker_project_file_handler)
+    app.router.add_get("/broker/project-file/file/{link}", broker_backup_file_handler)
+    app.router.add_post("/broker/project-import", broker_project_import_handler)
     app.router.add_post("/broker/project", broker_create_handler)
     app.router.add_get("/broker/project/{name}", broker_project_status_handler)
     app.router.add_get("/broker/project/{name}/terminal", ws_handler)
@@ -2274,6 +2408,8 @@ def build_app() -> web.Application:
     app.router.add_post("/broker/project/{name}/ports", broker_port_add_handler)
     app.router.add_post("/broker/project/{name}/agents", broker_project_agents_handler)
     app.router.add_post("/broker/project/{name}/model", broker_project_model_handler)
+    app.router.add_post("/broker/project/{name}/export", broker_project_export_handler)
+    app.router.add_post("/broker/project/{name}/export-download", broker_project_export_download_handler)
     app.router.add_post("/broker/project/{name}/{action}", broker_project_action_handler)
     app.router.add_get("/broker/op/{op_id}/log", broker_op_log_handler)
     app.router.add_get("/broker/op/{op_id}/alive", broker_op_alive_handler)

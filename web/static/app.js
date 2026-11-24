@@ -128,7 +128,10 @@ function saveLayout() {
 // that needs the login ends the page's login.
 async function api(method, path, body) {
     const opts = { method, credentials: "same-origin", cache: "no-store", headers: {} };
-    if (body !== undefined) {
+    if (body instanceof Blob) {   // a file, sent as it is (a project file to import)
+        opts.headers["Content-Type"] = "application/octet-stream";
+        opts.body = body;
+    } else if (body !== undefined) {
         opts.headers["Content-Type"] = "application/json";
         opts.body = JSON.stringify(body);
     }
@@ -5088,7 +5091,14 @@ function limitsInputs(current) {
         }
         return out;
     };
-    return { rows, values };
+    // Filled from a project file's settings: a value it has, or "none" for no limit.
+    const set = (lim) => {
+        for (const [k, input] of Object.entries(inputs)) {
+            if (!lim || !(k in lim)) continue;
+            input.value = lim[k] === null ? "none" : k === "memory" ? fmtMemory(lim[k]) : String(lim[k]);
+        }
+    };
+    return { rows, values, set };
 }
 
 // ---- agents and the editor in a project (RS's create dialog and Config box, Agents) ------
@@ -5167,11 +5177,12 @@ function piModelControls(cat, init) {
 function optCard(label, on, why) {
     const card = h("button", { type: "button", class: "opt-card" + (on ? " on" : ""), "aria-pressed": on ? "true" : "false",
                                disabled: !!why, title: why || null }, label);
-    card.addEventListener("click", () => {
-        card.classList.toggle("on");
-        card.setAttribute("aria-pressed", card.classList.contains("on") ? "true" : "false");
-    });
-    return { card, on: () => card.classList.contains("on") && !card.disabled };
+    const set = (v) => {
+        card.classList.toggle("on", v);
+        card.setAttribute("aria-pressed", v ? "true" : "false");
+    };
+    card.addEventListener("click", () => set(!card.classList.contains("on")));
+    return { card, on: () => card.classList.contains("on") && !card.disabled, set };
 }
 
 const softwareRow = (rows, id) => (rows || []).find((r) => r && r.id === id) || null;
@@ -5179,8 +5190,54 @@ const softwareRow = (rows, id) => (rows || []).find((r) => r && r.id === id) || 
 function newProjectDialog() {
     const name = h("input", { type: "text", autocomplete: "off", spellcheck: "false", maxlength: 31, placeholder: "rust-ownership" });
     const limits = limitsInputs(null);
+    const limitsBox = h("details", { class: "more" }, h("summary", {}, "Limits (optional)"), limits.rows);
     const said = h("p", { class: "muted" }, NAME_RULE);
     const go = h("button", { class: "primary", type: "submit", disabled: true }, "Create");
+    // Empty (a new project) or From a file (a project file a project's Export made): the file is
+    // uploaded when picked, and what its manifest says fills the name, the limits and the editor.
+    let fromFile = false, upload = null, manifest = null, editorCard = null;
+    const picker = h("input", { type: "file", accept: ".clproject" });
+    const fileSaid = h("p", { class: "note" }, "A .clproject file, made by a project's Export.");
+    const fileBox = h("div", { class: "field", hidden: true }, h("span", {}, "Project file"), picker, fileSaid);
+    const modeEmpty = h("button", { type: "button", class: "on" }, "Empty");
+    const modeFile = h("button", { type: "button" }, "From a file");
+    const setMode = (file) => {
+        fromFile = file;
+        modeEmpty.className = file ? "" : "on";
+        modeFile.className = file ? "on" : "";
+        fileBox.hidden = !file;
+    };
+    modeEmpty.addEventListener("click", () => setMode(false));
+    modeFile.addEventListener("click", () => setMode(true));
+    const fromManifest = () => {
+        if (!manifest) return;
+        const st = manifest.settings && typeof manifest.settings === "object" ? manifest.settings : {};
+        if (editorCard && typeof st.editor === "boolean") editorCard.set(st.editor);
+    };
+    picker.addEventListener("change", async () => {
+        const file = picker.files && picker.files[0];
+        upload = manifest = null;
+        if (!file) { fileSaid.className = "note"; fileSaid.textContent = "A .clproject file, made by a project's Export."; return; }
+        fileSaid.className = "note";
+        fileSaid.textContent = "Uploading…";
+        picker.disabled = true;
+        const r = await api("POST", "/broker/project-file", file);
+        picker.disabled = false;
+        if (!r.body.ok || typeof r.body.upload !== "string" || !r.body.manifest || typeof r.body.manifest !== "object") {
+            fileSaid.className = "bad";
+            fileSaid.textContent = errText(r.body);
+            return;
+        }
+        upload = r.body.upload;
+        manifest = r.body.manifest;
+        const from = typeof manifest.project === "string" ? manifest.project : "a project";
+        fileSaid.className = "note";
+        fileSaid.textContent = `From ${from}'s file of ${dayOf(manifest.made_at) || "an unknown day"}, ${manifest.conversations ? "with" : "without"} its conversations.`;
+        if (typeof manifest.project === "string") name.value = manifest.project;
+        const st = manifest.settings && typeof manifest.settings === "object" ? manifest.settings : {};
+        if (st.limits && typeof st.limits === "object") { limits.set(st.limits); limitsBox.open = true; }
+        fromManifest();
+    });
     // The Agents box (RS's: open by default) and the editor's card, filled once the broker
     // said what is pulled.
     const agentsBody = h("div", {}, h("p", { class: "note" }, "Asking which software is pulled…"));
@@ -5227,7 +5284,8 @@ function newProjectDialog() {
             h("div", { class: "opt-cards" }, claudeCard.card, piCard.card),
             pi && !pi.pulled ? h("p", { class: "note" }, "pi is not pulled yet: pull it under Settings → Software to offer it here.") : null,
             controls.node, piControls.node, hint);
-        const editorCard = optCard("Editor (code-server)", !!(editor && editor.pulled), editor && editor.pulled ? null : notPulled);
+        editorCard = optCard("Editor (code-server)", !!(editor && editor.pulled), editor && editor.pulled ? null : notPulled);
+        fromManifest();
         fill(editorBody, h("div", { class: "opt-cards" }, editorCard.card),
             editor && editor.pulled ? null : h("p", { class: "note" }, "The editor is not pulled yet: pull it under Settings → Software."));
         chosen = () => {
@@ -5241,8 +5299,11 @@ function newProjectDialog() {
     })();
     const form = h("form", { method: "post", action: "#", onsubmit: async (ev) => {
         ev.preventDefault();
+        if (fromFile && !upload) { said.className = "bad"; said.textContent = "Pick a project file first, or choose Empty."; return; }
         go.disabled = true;
-        const r = await api("POST", "/broker/project", { name: name.value.trim(), ...limits.values(), ...chosen() });
+        const fields = { name: name.value.trim(), ...limits.values(), ...chosen() };
+        const r = fromFile ? await api("POST", "/broker/project-import", { ...fields, upload })
+            : await api("POST", "/broker/project", fields);
         go.disabled = false;
         if (!r.body.ok) {
             said.className = "bad";
@@ -5261,7 +5322,7 @@ function newProjectDialog() {
         render();
         refreshProjects();
         let made = false;
-        await followOp(r.body.op_id, `Creating ${project}`, { onEnd: (ok) => { made = ok; } });
+        await followOp(r.body.op_id, `${fromFile ? "Importing" : "Creating"} ${project}`, { onEnd: (ok) => { made = ok; } });
         if (S.creating === project) S.creating = null;
         // Its brief set, through the tutor service; without it the project uses Default.
         if (made && S.loggedIn) {
@@ -5270,11 +5331,12 @@ function newProjectDialog() {
         }
         // A new project opens on Goals: the conversation that agrees a study plan.
         if (made && S.loggedIn && projectRow(project) && S.current === project) openGoals(project);
-    } }, formRow("Name", name),
+    } }, h("div", { class: "seg-toggle np-mode" }, modeEmpty, modeFile), fileBox,
+    formRow("Name", name),
     h("details", { class: "more", open: true }, h("summary", {}, "Agents"), agentsBody),
     h("div", { class: "field" }, h("span", {}, "Editor"), editorBody),
     h("div", { class: "field" }, h("span", {}, "Brief"), briefBody),
-    h("details", { class: "more" }, h("summary", {}, "Limits (optional)"), limits.rows), said,
+    limitsBox, said,
     h("div", { class: "btns" }, h("button", { type: "button", onclick: closeModal }, "Cancel"), go));
     openModal("New project", form, []);
     name.focus();
@@ -5433,6 +5495,8 @@ function projectDialog(name) {
     agentsSection(name, p, agentsBox);
     const briefBox = h("details", { class: "more", open: true }, h("summary", {}, "Brief"));
     briefSection(name, briefBox);
+    const exportBox = h("details", { class: "more" }, h("summary", {}, "Export"));
+    exportSection(name, exportBox, !!op);
     openModal(name, [
         h("div", { class: "kv" }, h("span", { class: "k" }, "Sandbox"),
             h("span", {}, h("span", { class: `dot inline ${st.cls}` }), " ", st.text, " ",
@@ -5445,6 +5509,7 @@ function projectDialog(name) {
         agentsBox,
         briefBox,
         h("details", { class: "more" }, h("summary", {}, "Limits"), limitsForm),
+        exportBox,
         h("details", { class: "more danger-zone" }, h("summary", {}, "Destroy"), destroyForm),
         said,
     ], [h("button", { onclick: closeModal }, "Close")]);
@@ -5472,6 +5537,44 @@ function briefSection(name, box) {
         });
         fill(body, h("div", { class: "field" }, h("span", {}, "Brief set"), pick), said);
     })();
+}
+
+// The Config box's Export: the project as one file, made by an operation and then downloaded
+// as a backup is (a one-time address of this login's, opened as a plain download).
+function exportSection(name, box, busy) {
+    const conversations = h("input", { type: "checkbox" });
+    const said = h("p", { class: "muted" });
+    const go = h("button", { class: "primary", disabled: busy, onclick: async () => {
+        go.disabled = true;
+        said.className = "muted";
+        said.textContent = "";
+        const r = await api("POST", projectPath(name, "/export"), { conversations: conversations.checked });
+        go.disabled = false;
+        if (!r.body.ok || !r.body.op_id) { said.className = "bad"; said.textContent = errText(r.body); return; }
+        refreshProjects();
+        let made = null;
+        await followOp(r.body.op_id, `Exporting ${name}`, { onEnd: (ok, result) => { made = ok ? result : null; } });
+        if (!made || !S.loggedIn) return;
+        const d = await api("POST", projectPath(name, "/export-download"), { op_id: r.body.op_id });
+        if (!d.body.ok || typeof d.body.url !== "string" || !d.body.url.startsWith("/broker/project-file/file/")) {
+            toast(`The project file of ${name} could not be downloaded: ${errText(d.body)}`, true);
+            return;
+        }
+        const file = made.result && typeof made.result.name === "string" ? made.result.name : `${name}.clproject`;
+        const a = h("a", { href: d.body.url, download: file, hidden: true });
+        document.body.append(a);
+        a.click();
+        a.remove();
+        const words = made.result && typeof made.result.said === "string" ? made.result.said : file;
+        toast(`${words} Your browser's downloads show how far it is.`);
+    } }, "Download project file");
+    box.append(
+        h("p", { class: "note" }, "Always in: the workspace folder, the study plan and its lessons, the project's limits and editor. " +
+            "With your conversations: what was said in each lesson, the lessons' states, each lesson's transcript and notes; without them every lesson arrives not started. " +
+            "Never in: the home folder (the Claude login and the agents' history), the project's keys and Shell password, your knowledge base."),
+        h("p", { class: "note warnc" }, "Everything in the workspace folder goes in as it is, a .env with a key included."),
+        h("label", { class: "checkrow" }, conversations, " Include my conversations"),
+        h("div", { class: "btns" }, go), said);
 }
 
 async function runAction(name, verb) {
@@ -5534,7 +5637,7 @@ async function followOp(opId, title, opts) {
     if (kn) state.after(h("p", { class: kn.told ? "note" : "bad" }, knWords));
     if (!scrim || !scrim.isConnected) toast(`${title}: ${ok ? "done" : "failed"}${msg}${kn && !kn.told ? `. ${knWords}` : ""}`, !ok || (kn && !kn.told));
     if (kn && S.page === "knowledge") renderKnowledge();
-    if (opts.onEnd) opts.onEnd(ok);
+    if (opts.onEnd) opts.onEnd(ok, result);
     await refreshProjects();
     if (S.current) refreshServices(S.current);
 }
