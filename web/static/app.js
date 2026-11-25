@@ -2165,6 +2165,16 @@ async function tutorApi(method, tail, body) {
     if (r.body && r.body.ok) r.body.result = idsAsText(r.body.result);
     return r;
 }
+// The tutor's built-in skills (`/quiz`, `/hint`, …) as a lesson's box lists them: asked of the
+// tutor service once per page load, when a learner first types `/`; none when it cannot say.
+let chatSkills = null;
+function loadChatSkills() {
+    if (!chatSkills) chatSkills = tutorApi("GET", "/skills").then((r) => {
+        const list = r.body && r.body.ok && Array.isArray(r.body.result) ? r.body.result : [];
+        return list.filter((s) => s && typeof s.name === "string" && s.name);
+    }, () => []);
+    return chatSkills;
+}
 const lessonTab = (id) => `lesson:${id}`;
 const lessonTabId = (tab) => {
     if (typeof tab !== "string" || !tab.startsWith("lesson:")) return null;
@@ -3458,10 +3468,12 @@ function makeLessonPane(name, id) {
     const said = h("div", { class: "composer-said", hidden: true });
     const ta = h("textarea", { rows: 2, placeholder: "Write to the tutor…", "aria-label": "Your message to the tutor" });
     const btn = h("button", { class: "primary" }, "Send");
+    // The skills list, above the box (see drawSkills).
+    const skillsEl = h("div", { class: "skills", role: "listbox", "aria-label": "Skills", hidden: true });
     const el = h("div", { class: "pane lesson-pane" },
         h("div", { class: "lhead" }, h("div", { class: "lh-main" }, titleEl, objEl), stateEl, agentSel, markEl, filesBtn, summaryBtn),
         conv, ctx,
-        h("div", { class: "composer" }, said, h("div", { class: "composer-inner" }, ta, btn)));
+        h("div", { class: "composer" }, said, h("div", { class: "composer-inner" }, h("div", { class: "composer-box" }, skillsEl, ta), btn)));
     const pane = { kind: "lesson", lessonId: id, el, title: null, lesson: null, turn: null, stale: true, loading: false, sending: false };
     const tools = new Map();   // tool id -> its line, so a result fills the line its call made
     const cards = new Map();   // proposal id -> its card, kept across redraws (with the learner's edits)
@@ -3907,6 +3919,7 @@ function makeLessonPane(name, id) {
             return;
         }
         ta.value = "";
+        closeSkills();
         tell("");
         begun(res);
     }
@@ -3974,9 +3987,63 @@ function makeLessonPane(name, id) {
         if (!r.body.ok) tell(errText(r.body));
     }
 
+    // The skills list: open while the text is `/` and the start of a skill's name (no space yet),
+    // in a lesson only, never in Goals. A choice fills in `/<name> ` for the learner to go on;
+    // the message is then sent as typed.
+    let skillRows = [];   // the skills shown, in order
+    let skillAt = 0;      // the highlighted one
+    let skillAsk = 0;     // the latest drawing; an older one's answer is dropped
+    function closeSkills() { skillAsk++; skillRows = []; skillsEl.hidden = true; }
+    function drawSkills() {
+        const text = ta.value;
+        const l = pane.lesson;
+        if (!text.startsWith("/") || /\s/.test(text) || !l || l.kind === "goals") { closeSkills(); return; }
+        const ask = ++skillAsk;
+        loadChatSkills().then((list) => {
+            if (ask !== skillAsk) return;
+            const word = text.slice(1).toLowerCase();
+            skillRows = list.filter((s) => s.name.toLowerCase().startsWith(word));
+            if (!skillRows.length) { closeSkills(); return; }
+            skillAt = 0;
+            fill(skillsEl, skillRows.map((s) => h("div", {
+                class: "skill", role: "option",
+                onmousedown: (ev) => ev.preventDefault(),   // the box keeps the focus
+                onclick: () => pickSkill(s),
+            }, h("span", { class: "sk-name" }, `/${s.name}`),
+               s.hint ? h("span", { class: "sk-hint" }, String(s.hint)) : null,
+               h("span", { class: "sk-desc", title: String(s.description || "") }, String(s.description || "")))));
+            markSkill();
+            skillsEl.hidden = false;
+        });
+    }
+    function markSkill() {
+        [...skillsEl.children].forEach((r, i) => { r.classList.toggle("on", i === skillAt); r.setAttribute("aria-selected", i === skillAt ? "true" : "false"); });
+        const on = skillsEl.children[skillAt];
+        if (on) on.scrollIntoView({ block: "nearest" });
+    }
+    function pickSkill(s) {
+        ta.value = `/${s.name} `;
+        closeSkills();
+        ta.focus();
+        ta.setSelectionRange(ta.value.length, ta.value.length);
+    }
+    ta.addEventListener("input", (ev) => { if (!ev.isComposing) drawSkills(); });
+    ta.addEventListener("compositionend", drawSkills);
+
     btn.addEventListener("click", () => (pane.turn ? stop() : send()));
     ta.addEventListener("keydown", (ev) => {
-        if (ev.key === "Enter" && !ev.shiftKey && !ev.isComposing) { ev.preventDefault(); if (!pane.turn) send(); }
+        if (ev.isComposing) return;
+        if (!skillsEl.hidden && skillRows.length) {
+            if (ev.key === "ArrowDown" || ev.key === "ArrowUp") {
+                ev.preventDefault();
+                skillAt = (skillAt + (ev.key === "ArrowDown" ? 1 : skillRows.length - 1)) % skillRows.length;
+                markSkill();
+                return;
+            }
+            if ((ev.key === "Tab" || ev.key === "Enter") && !ev.shiftKey) { ev.preventDefault(); pickSkill(skillRows[skillAt]); return; }
+            if (ev.key === "Escape") { ev.preventDefault(); closeSkills(); return; }
+        }
+        if (ev.key === "Enter" && !ev.shiftKey) { ev.preventDefault(); if (!pane.turn) send(); }
     });
 
     pane.reload = () => { pane.stale = true; if (!pane.el.hidden) load(); };

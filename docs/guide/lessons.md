@@ -43,6 +43,22 @@ The tutor can set an exercise as a card in its answer: a title, the steps, and t
 
 The tutor can ask a multiple-choice question as a card. Pick an option and press **Answer**: the card says right or not, shows the right one and the tutor's explanation, and keeps your answer, right or wrong.
 
+## Skills
+
+Some requests come up in every lesson, so the tutor has them built in. Type `/` in a lesson's box and a list of them opens above it; keep typing to narrow it, move with the arrow keys, and press **Tab** or **Enter** (or click one) to put it in the box. Add words after it if you like (`/quiz 3`) and send it as any message. **Escape** closes the list.
+
+| Skill | What the tutor does |
+|---|---|
+| `/quiz [n] [topic]` | n quick-question cards (default 5, at most 10), one at a time, on what this lesson has covered so far (or the named topic); only a one-line correction between them; at the end the score and the weak spots. |
+| `/exercise [topic]` | One hands-on exercise with a check, sized to where you stand; its files go in the lesson's folder. |
+| `/hint` | The next hint on the exercise in progress, one step further each time, never the solution. |
+| `/again [what]` | The last idea (or the named one) explained a different way: an analogy, a smaller example, a picture or a table; it ends with one quick question. |
+| `/recap` | A short "where we are": what was covered, where you stand, what is open, what comes next. |
+| `/cheatsheet` | A one-page reference of the lesson, written to `cheatsheet.md` in the lesson's folder. |
+| `/done` | You think the objective is met: the tutor checks with a question or two, then closes the lesson or says what is missing. |
+
+Skills are only in lessons, not in Goals; anything else starting with `/` is sent as an ordinary message.
+
 ## What the tutor is told, and when
 
 When no answer is being written, a **Check** or an **Answer** goes to the tutor at once as a message of its own, which clanker-learn writes for you ("You ran the check of …", "You answered …"), and the tutor answers it. While an answer is being written, the card changes at once and the tutor is told with your next message; the card says so.
