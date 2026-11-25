@@ -14,6 +14,7 @@ RUN set -eux; \
     rm -rf /var/lib/apt/lists/*
 
 COPY server.py store.py sse.py tasks.py turn.py agents.py claude_stream.py pi_stream.py mcp.py tools.py plans.py knowledge.py cards.py schema.sql tutor.md /opt/cl/tutor/
+COPY skills/ /opt/cl/tutor/skills/
 
 WORKDIR /opt/cl/tutor
 STOPSIGNAL SIGTERM

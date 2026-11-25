@@ -2440,6 +2440,7 @@ def build_app() -> web.Application:
     app.router.add_get("/broker/tutor/instructions", instructions)
     app.router.add_put("/broker/tutor/instructions", instructions)
     app.router.add_post("/broker/tutor/instructions/reset", _tutor_route("/instructions/reset"))
+    app.router.add_get("/broker/tutor/skills", _tutor_route("/skills"))
     # The knowledge base: the brief, the records, the global proposals, the lessons done, the
     # change log with undo; a project's insights; the cards of a conversation. (POST
     # /projects/removed is this server's own call after a destroy, never the browser's.)

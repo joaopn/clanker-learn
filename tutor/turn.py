@@ -37,6 +37,7 @@ import itertools
 import json
 import logging
 import os
+import re
 import secrets
 import shlex
 import uuid
@@ -55,6 +56,7 @@ DATA = os.environ.get("CL_TUTOR_DATA", "/data/tutor")
 KEYS = f"{DATA}/keys"
 TOKEN_FILE = f"{DATA}/claude_token"
 TUTOR_TEXT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tutor.md")
+SKILLS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "skills")
 USER = "learner"
 TRANSCRIPT_S = 30
 IDLE_S = 30 * 60           # no overall limit (installing software takes long), but a line every half hour
@@ -81,6 +83,46 @@ BUILD_NOTE = ("[clanker-learn: this is a build turn. The learner is not here and
               "every start to /workspace/.learn/services. Do not teach, do not propose anything, do not record anything about the "
               "learner. End with a short note written to the learner: what is ready, where it is, and how to open it; nothing about what "
               "you did not do yet, and the lesson named by its title, not its folder's number.]")
+
+# The built-in skills: a lesson's message that opens with /<name> gets that skill's text as the
+# last note of its turn, that message only (nothing is put in the sandbox). In the page's order.
+SKILL_NAMES = ("quiz", "exercise", "hint", "again", "recap", "cheatsheet", "done")
+SKILL_OPENING = re.compile(r"/([a-z]+)(?=\s|$)")
+
+
+def load_skills():
+    """The skills from skills/<name>.md: their front matter (name, description, argument-hint),
+    read by hand since the image has no YAML library, and their body, the tutor's instructions."""
+    skills = {}
+    for name in SKILL_NAMES:
+        with open(os.path.join(SKILLS_DIR, f"{name}.md")) as fh:
+            _before, head, body = fh.read().split("---\n", 2)
+        meta = {}
+        for line in head.splitlines():
+            key, _, value = line.partition(":")
+            value = value.strip()
+            meta[key.strip()] = value[1:-1] if len(value) >= 2 and value[0] == value[-1] == '"' else value
+        skills[name] = {"name": name, "description": meta.get("description", ""), "hint": meta.get("argument-hint", ""),
+                        "body": body.strip()}
+    return skills
+
+
+SKILLS = load_skills()
+
+
+def skill_of(text):
+    """(the skill, the words after it) when the message opens with /<name> of a built-in skill,
+    the name followed by whitespace or the end; None otherwise (a leading space included)."""
+    match = SKILL_OPENING.match(text)
+    if match is None or match.group(1) not in SKILLS:
+        return None
+    return SKILLS[match.group(1)], text[match.end():].strip()
+
+
+def skill_note(skill, words):
+    after = f'with "{words}" after it' if words else "with nothing after it"
+    return f"[clanker-learn: the learner used the skill /{skill['name']}, {after}. Do this: {skill['body']}]"
+
 
 # The run's processes, found as the sandbox user and ended as root. Root in a sandbox has no
 # CAP_SYS_PTRACE, so it cannot read the environment of the learner's processes, while the
@@ -272,6 +314,7 @@ class Turn:
         self.fresh = None           # why its session is a fresh one taken up from the files, if it is
         self.missed = None          # the learner's messages its resumed session did not see: (first, last, who answered)
         self.build = False          # a build: the lesson set up before the learner arrives
+        self.skill = None           # the note of the skill the learner's message opens with, if any
         self.seq = 0
         self.proc = None
         self.reader = None          # the reader of the agent's output, while it runs
@@ -344,6 +387,10 @@ class Runner:
         token = secrets.token_urlsafe(32)
         turn = Turn(lesson, run["id"], token, instructions, agent)
         turn.fresh, turn.missed, turn.build = fresh, missed, build
+        # A skill only in a lesson, never in Goals or a build; its note is kept on the turn, since
+        # the context is built again when the session turns out to be gone.
+        skill = None if build or lesson["kind"] == "goals" else skill_of(text)
+        turn.skill = skill_note(*skill) if skill else None
         # What the learner decided or did since the last message, outside the conversation: the
         # proposals, the global insights proposed here, the cards they answered or checked.
         outcomes = store.untold_outcomes(db, lesson["id"])
@@ -385,7 +432,7 @@ class Runner:
         """What goes before the learner's text: the opening context on a new session (naming the
         files and the turns it did not see, when it replaces one or takes the lesson up from
         the other agent), a note of the turns a resumed session missed, the outcomes of proposals;
-        on a build, the build's note after all of it."""
+        on a build, the build's note after all of it, and the note of a skill in the same place."""
         parts = []
         session = store.session(self.db, lesson["id"], turn.agent)
         if not session["started"]:
@@ -402,7 +449,7 @@ class Runner:
                 parts.append(plans.opening_context(self.db, lesson, "your earlier session of it did not start", len(earlier)))
         elif turn.missed:
             parts.append(plans.missed_note(lesson, *turn.missed))
-        return "\n\n".join(parts + turn.notes + ([BUILD_NOTE] if turn.build else []))
+        return "\n\n".join(parts + turn.notes + ([BUILD_NOTE] if turn.build else []) + ([turn.skill] if turn.skill else []))
 
     async def write_transcript(self, lesson_id):
         """The lesson's conversation into its transcript.md in the workspace, rewritten whole:

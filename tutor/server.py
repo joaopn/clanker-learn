@@ -368,6 +368,11 @@ async def reset_instructions(request):
     return ok(store.reset_instructions(request.app["db"]))
 
 
+async def list_skills(_request):
+    """The built-in skills a lesson's message can open with, for the page's list."""
+    return ok([{key: skill[key] for key in ("name", "description", "hint")} for skill in turn.SKILLS.values()])
+
+
 async def activity(request):
     return ok({"running": request.app["runner"].activity()})
 
@@ -761,6 +766,7 @@ def build_app(db, secret):
         web.post("/proposals/{id}/dismiss", dismiss_proposal),
         web.get("/instructions", get_instructions), web.put("/instructions", put_instructions),
         web.post("/instructions/reset", reset_instructions),
+        web.get("/skills", list_skills),
         web.get("/activity", activity),
         web.get("/knowledge/brief", get_brief),
         web.get("/knowledge/sets", list_sets), web.post("/knowledge/sets", add_set),
