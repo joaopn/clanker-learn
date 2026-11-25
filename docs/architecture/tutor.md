@@ -66,6 +66,21 @@ flowchart LR
 
 A plan is a list of modules, each a list of lessons with a title and an objective. A change of the plan is the whole new arrangement; a lesson it no longer names is dropped (a started one is kept, marked dropped). A lesson is not started, in progress, done or dropped; any can be opened in any order, and one added by hand stands beside the plan's. A lesson's first message carries its opening context before your text: the lesson's objective and place, the plan, one line on each lesson done, your brief, and the project's insights (see [Knowledge](knowledge.md)).
 
+### Building a lesson ahead
+
+A build is a turn of the lesson's own conversation with no learner in it: the service writes the message ("Build this lesson.") and adds a note telling the tutor to set up what the lesson needs in the sandbox, add what must run at every start to the project's services, and end with a short note on what is ready, without teaching, proposing or recording anything about you. The build does not start the lesson: it stays not started, and counts as built once its last build ended well. Your first message goes on in the same session, so the tutor remembers what it built.
+
+Build all is a queue the service keeps for the project: the lessons neither started, built nor dropped, one at a time in plan order, each looked at again when its turn comes (one you started meanwhile is skipped). The queue lives in the service's memory, so a restart of clanker-learn ends it; Build all can be pressed again.
+
+```mermaid
+flowchart LR
+  B["Build, or Build all on the plan card"] --> Q["Service: one build at a time, in plan order"]
+  Q -->|"a written message + the build note"| A["The lesson's agent, in the sandbox"]
+  A --> S["Code, services, files"]
+  A --> N["A note: what is ready, and where"]
+  N --> L["The lesson: not started, built"]
+```
+
 ### Skills
 
 A lesson's message that starts with one of the built-in skills (`/quiz`, `/exercise`, `/hint`, `/again`, `/recap`, `/cheatsheet`, `/done`) is stored and shown as you typed it. The tutor gets that skill's instructions with it, as the last note before your text, for that message only; the other skills cost nothing. The page lists them from the service when you type `/`. In Goals, and for any other `/word`, the message is plain text.
@@ -128,6 +143,10 @@ It trusts the web server's check of your login and a secret only the two hold. A
 ### The instructions are passed with every answer, not a file in the project
 
 A project's own files cannot replace them. They are one text for both agents, shipped with clanker-learn (`tutor/tutor.md`) and editable in Settings → Tutor; a lesson under way follows a new text from its next message, starting again from its files. A project's `CLAUDE.md`, if it has one, is still read, as Claude Code does.
+
+### Builds run one at a time
+
+Each lesson can then use what the lessons before it set up, and the sandbox and the model's usage limit see one build at a time. A build is part of the lesson's conversation, not a hidden step, so the tutor that teaches the lesson is the one that built it, and what it did can be read, folded, in the conversation.
 
 ### Skills are the tutor's notes, not the agents' skill files
 
