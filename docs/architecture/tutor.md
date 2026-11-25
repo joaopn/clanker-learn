@@ -66,6 +66,10 @@ flowchart LR
 
 A plan is a list of modules, each a list of lessons with a title and an objective. A change of the plan is the whole new arrangement; a lesson it no longer names is dropped (a started one is kept, marked dropped). A lesson is not started, in progress, done or dropped; any can be opened in any order, and one added by hand stands beside the plan's. A lesson's first message carries its opening context before your text: the lesson's objective and place, the plan, one line on each lesson done, your brief, and the project's insights (see [Knowledge](knowledge.md)).
 
+### Skills
+
+A lesson's message that starts with one of the built-in skills (`/quiz`, `/exercise`, `/hint`, `/again`, `/recap`, `/cheatsheet`, `/done`) is stored and shown as you typed it. The tutor gets that skill's instructions with it, as the last note before your text, for that message only; the other skills cost nothing. The page lists them from the service when you type `/`. In Goals, and for any other `/word`, the message is plain text.
+
 ### The "learn" tools
 
 The tutor service has a second listener, on port 7802 of every address, which is the one thing of clanker-learn's own a sandbox can reach. It speaks MCP over HTTP, and every call must carry the token of a run that is running now; the token names the project, the lesson and the run, so whose plan and records a call touches is never an argument.
@@ -125,6 +129,10 @@ It trusts the web server's check of your login and a secret only the two hold. A
 
 A project's own files cannot replace them. They are one text for both agents, shipped with clanker-learn (`tutor/tutor.md`) and editable in Settings → Tutor; a lesson under way follows a new text from its next message, starting again from its files. A project's `CLAUDE.md`, if it has one, is still read, as Claude Code does.
 
+### Skills are the tutor's notes, not the agents' skill files
+
+Both agents have skill files of their own, but those would live in the project's home, which the tutor shares with your Shell: the skills would show up in the Shell's agents, where they have no cards or checks. Each agent would also need the command written its own way. Sent as a note by the service, a skill reaches Claude Code and pi as the same text, and a newer clanker-learn brings newer skills to every project at once.
+
 ### Only you apply a proposal
 
 A plan, a change to it and a global insight are the tutor's suggestions. What is applied is your own edited version, and the tutor is told what you decided with your next message; it also learns what changed in the project's plan since its last turn, even from another conversation.
@@ -156,6 +164,7 @@ The store of answers, the stream to the browser with replay, the reading of Clau
 | `tutor/mcp.py`, `tutor/tools.py` | The "learn" tool server and its tools |
 | `tutor/plans.py` | Plans and proposals, the opening context, what a tutor is told, the transcript |
 | `tutor/cards.py` | Exercises and quick questions |
+| `tutor/skills/` | The built-in skills, one file each |
 | `tutor/store.py`, `tutor/schema.sql` | The SQLite store and its versions |
 | `tutor/sse.py`, `tutor/tasks.py` | The event stream with replay, background tasks |
 | `tutor/tutor.md` | The tutor's instructions, as shipped |
