@@ -27,11 +27,15 @@ An agent or the editor that has not been fetched yet cannot be ticked ("Not pull
 
 **From a file**, at the top of the box, makes the project from a `.clproject` file that a project's **Export** made (see [The Config box](#the-config-box)). Picking the file fills the name, the limits and the editor; change what you like, then **Create**. The new project gets the file's workspace, plan and lessons, and its conversations when the file has them; its setup recipe runs at the first start. Its tutors are told about you from your own brief set, and a lesson that came with its conversation is taken up by your tutor from the lesson's transcript and notes.
 
+## Starting and stopping from the sidebar
+
+Each project's row in the sidebar has a small button beside its ⚙: a square (Stop) on a running project, a triangle (Start) on any other. Clicking it does not open the project: the row asks first, "Stop kafka? Running work is interrupted." or "Start kafka?", with **Stop** or **Start** and **Cancel** (Escape cancels too). While the project starts or stops, the button spins and the row says so, with its **log** link; no dialog opens, and a notice in the corner appears only if it fails. A stop from the row closes the project, as Stop in the Config box does.
+
 ## The Config box
 
 The ⚙ beside a project in the sidebar opens its Config box. The box shows whether the sandbox runs and, while something is being done with the project, a **show the log** link; until that is done, its buttons wait.
 
-- **Start** and **Stop.** What you installed is still there after a stop and a start, and after clanker-learn itself is stopped and started. Stop closes the project: its tabs close, and it stays in the sidebar, marked stopped. Click it to open it again: its lessons can be read, and the Shell offers to start the sandbox; or start it from its ⚙. The projects that were running when clanker-learn stopped are started again when it starts.
+- **Start** and **Stop.** What you installed is still there after a stop and a start, and after clanker-learn itself is stopped and started. Stop closes the project: its tabs close, and it stays in the sidebar, marked stopped. Click it to open it again: its lessons can be read, and the Shell offers to start the sandbox; or start it from its row's ▶ or its ⚙. The projects that were running when clanker-learn stopped are started again when it starts.
 - **Recreate** gives the project a new container from the current sandbox image. The workspace and the home folder stay, with Claude Code's login and sessions; what was installed elsewhere is gone, and the [setup recipe](#what-a-sandbox-brings-back-by-itself) brings it back. A stopped project is running afterwards.
 - **Archive** stops the project if it runs and hides it from the sidebar: see [Archiving a project](#archiving-a-project).
 - **Agents**: what the project has. **Add** Claude Code or pi to a project that does not have it; change Claude's model and effort, or pi's model and thinking level, with **Apply**; **Update** both agents to the versions fetched in Settings. These work while the project runs, without a restart (Add on a stopped project asks you to start it first). A model and level applied are written into the agent's settings in the project's home folder, and a session started from then on uses them. A project whose sandbox was made before something here was possible is recreated first, then given it: the box says so.
@@ -44,7 +48,7 @@ The ⚙ beside a project in the sidebar opens its Config box. The box shows whet
 
 **Archive**, in a project's Config box, stops the project if it runs and hides it from the sidebar. Nothing is deleted: the workspace, the home folder, the lessons, their conversations and what you learned there all stay. An archived project is not started when clanker-learn restarts.
 
-**▤ All projects**, at the bottom of the sidebar, lists every project with its state, archived ones marked as such. **Unarchive** brings one back to the sidebar, stopped: start it from its ⚙.
+**▤ All projects**, at the bottom of the sidebar, lists every project with its state, archived ones marked as such. **Unarchive** brings one back to the sidebar, stopped: start it from its row's ▶ or its ⚙.
 
 ## What a sandbox brings back by itself
 

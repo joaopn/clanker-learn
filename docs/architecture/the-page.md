@@ -28,7 +28,7 @@ flowchart LR
 | Part | What it is | What it talks to |
 |---|---|---|
 | Login | on the first visit, the set-up code from the container's log and a new password; afterwards the password | `/broker/setup`, `/broker/login` |
-| Project list | the projects with their state and, under each, its Goals conversation and lessons; `+ New project`; the gear of a project (start, stop, recreate, limits, agents, brief set, destroy); Knowledge, Settings and Log out at the bottom | the broker's `list`, polled every 4 s; the tutor's lessons |
+| Project list | the projects with their state and, under each, its Goals conversation and lessons; `+ New project`; a project's start/stop button, which asks in its row; the gear of a project (start, stop, recreate, limits, agents, brief set, destroy); Knowledge, Settings and Log out at the bottom | the broker's `list`, polled every 4 s; the tutor's lessons |
 | The open lesson's tab | the conversation with the tutor, first in the tab strip | the tutor service, through the web server |
 | Shell | a terminal in the sandbox (xterm.js); it keeps its session when the tab or the browser is closed | a WebSocket to the web server, which logs in to the sandbox's sshd |
 | Editor | code-server on the project's workspace, if the project has it, started at the first visit | a frame on an origin port of its own |
@@ -38,7 +38,7 @@ flowchart LR
 | Settings | Interface (themes, terminal theme, editor zoom, CLI width and font size, kept by the browser), Software, Tutor (the Claude token, the default agent, the tutor's instructions), Backup, How it runs (sysbox or privileged, the certificate) | the broker, the tutor service |
 | Knowledge | what clanker-learn keeps about you (see [Knowledge](knowledge.md)) | the tutor service |
 
-A stop pressed in a project's gear closes that project once the stop has ended well, as research-sandbox does: its tabs go with their terminals and frames, so nothing keeps connecting to a stopped sandbox, and its lessons fold. Its tab arrangement and lesson list are kept, so the tabs come back when it runs again.
+A stop pressed on a project's row or in its gear closes that project once the stop has ended well, as research-sandbox does: its tabs go with their terminals and frames, so nothing keeps connecting to a stopped sandbox, and its lessons fold. Its tab arrangement and lesson list are kept, so the tabs come back when it runs again.
 
 In privileged mode a quiet line at the bottom of the project list says so and leads to Settings → How it runs.
 
@@ -66,7 +66,7 @@ Mermaid and Vega are loaded the first time a conversation needs one, not with th
 
 ### Written for clanker-learn, with two parts of research-sandbox's as they are
 
-research-sandbox's page is built around things clanker-learn does not have, so this one was written new. Two parts are research-sandbox's as they are: the login proof and the terminal. Settings → Software, the agents' boxes, the interface settings, the column layout and the project rail were lifted and adapted to this page's helpers.
+research-sandbox's page is built around things clanker-learn does not have, so this one was written new. Two parts are research-sandbox's as they are: the login proof and the terminal. Settings → Software, the agents' boxes, the interface settings, the column layout, the project rail and its start/stop button were lifted and adapted to this page's helpers.
 
 ### The password never leaves the browser
 

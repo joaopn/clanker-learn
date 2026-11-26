@@ -149,6 +149,29 @@ a { color: var(--fg-accent); }
 @keyframes pulse { 50% { opacity: .25; } }
 .gear { color: var(--fg-faint); background: none; padding: 0 2px; }
 .gear:hover { color: var(--fg-base); background: none; }
+/* RS's rail power button (app.js railPowerButton): a 22px bordered square, a 14px icon; red on
+   hover for Stop, the accent for Start (.go), a spinning ring while busy. */
+.proj-row .power-btn {
+    flex: none; display: inline-flex; align-items: center; justify-content: center;
+    width: 22px; height: 22px; padding: 0; line-height: 0;
+    border: 1px solid var(--border-strong); border-radius: 4px;
+    background: transparent; color: var(--fg-muted);
+}
+.proj-row .power-btn svg { width: 14px; height: 14px; display: block; }
+.proj-row .power-btn:hover:not(:disabled) { color: #fff; background: var(--btn-danger-bg); border-color: var(--btn-danger-bg); }
+.proj-row .power-btn.go { color: var(--fg-accent); border-color: var(--fg-accent); }
+.proj-row .power-btn.go:hover:not(:disabled) { color: #fff; background: var(--btn-bg); border-color: var(--btn-bg); }
+.proj-row .power-btn:disabled { opacity: .6; cursor: default; }
+.proj-row .power-btn.busy svg { animation: rail-spin 1s linear infinite; }
+@keyframes rail-spin { to { transform: rotate(360deg); } }
+/* The row drawn as the button's question (app.js railAskRow). */
+.proj > .proj-row.rail-confirming { cursor: default; background: var(--bg-base); }
+.rail-confirm {
+    display: flex; flex-direction: column; gap: 6px; width: 100%; min-width: 0;
+    font-size: 12px; white-space: normal; overflow-wrap: anywhere; color: var(--fg-base);
+}
+.rail-confirm-btns { display: flex; gap: 6px; }
+.rail-confirm-btns button { flex: 1; padding: 4px 6px; }
 .rail-foot { border-top: 1px solid var(--border); padding: 6px 0; display: flex; flex-direction: column; }
 .rail-foot .foot { text-align: left; background: none; border-radius: 0; padding: 9px 16px; font-weight: 600; }
 .rail-foot .foot:hover { background: var(--bg-hover); }

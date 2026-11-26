@@ -195,6 +195,7 @@ const S = {
     checking: new Set(),   // targets whose Refresh is asking upstream
     models: null,          // the catalog of Claude's tiers (/broker/models), once read
     expanded: new Set(),   // projects shown open into their lessons in the list
+    railAsk: null,         // {name, verb}: the row drawn as the question of its Start/Stop button
     lessons: {},           // project -> {list: [lesson], error: sentence or null}, as last read
     lessonOf: {},          // project -> the id of its lesson tab (one at a time), null once closed
     activity: new Set(),   // ids of the lessons whose tutor is working (/broker/tutor/activity)
@@ -434,7 +435,7 @@ function teardownApp() {
     window.removeEventListener("resize", onWindowResize);
     Object.assign(S, { loggedIn: false, projects: [], ops: [], current: null, creating: null, tabs: {}, services: {}, panes: {}, shell: null, listError: null,
                        page: null, software: null, softwareError: null, builds: {}, checking: new Set(), models: null,
-                       expanded: new Set(), lessons: {}, lessonOf: {}, activity: new Set(), tutorError: null,
+                       expanded: new Set(), railAsk: null, lessons: {}, lessonOf: {}, activity: new Set(), tutorError: null,
                        tutorSettings: null, tutorSettingsError: null, filesOrigins: new Map(), editorFile: {},
                        cols: {}, tabLayout: null, dragging: false, renderPending: false,
                        kb: { view: "brief", raw: false, showRetired: false, showArchived: false, q: "", seq: 0, changes: null, next: null, navData: null }, kbOpen: 0,
@@ -517,18 +518,103 @@ function render() {
     showPane();
 }
 
+// ---- Start and Stop on a project's row (RS's makeRailPowerButton, openRailConfirm) ----------
+// The button asks in the row; the answer runs the ⚙ box's runAction without its dialog, so the
+// row's state line is the feedback and a corner notice comes only when it fails.
+
+// Requests sent from a row's button and not over yet (name -> verb): its button stays busy.
+const railPending = new Map();
+
+// RS's RAIL_ICON_SVG (stop, start, busy). Icon geometry from Lucide (https://lucide.dev, ISC licence).
+const RAIL_ICON_SVG = (() => {
+    const svg = (body, fill) =>
+        '<svg viewBox="0 0 24 24" aria-hidden="true" xmlns="http://www.w3.org/2000/svg"'
+        + (fill ? ' fill="currentColor" stroke="none">'
+                : ' fill="none" stroke="currentColor" stroke-width="2"'
+                  + ' stroke-linecap="round" stroke-linejoin="round">')
+        + body + '</svg>';
+    return {
+        stop: svg('<rect x="6" y="6" width="12" height="12" rx="1.5"/>', true),
+        start: svg('<polygon points="7 4 20 12 7 20 7 4"/>', true),
+        busy: svg('<path d="M21 12a9 9 0 1 1-6.22-8.56"/>'),
+    };
+})();
+
+// Stop on a running project, Start on any other (the broker's start makes what is missing);
+// a disabled spinner while an operation runs, a request is pending, or it is being destroyed.
+function railPowerButton(p) {
+    const op = opOf(p.name);
+    const busyWords = op ? (OP_WORDS[op.verb] || op.verb)
+        : railPending.has(p.name) ? OP_WORDS[railPending.get(p.name)]
+        : p.wanted === "destroying" ? OP_WORDS.destroy : null;
+    const verb = p.state === "running" ? "stop" : "start";
+    const title = busyWords || `${verb === "stop" ? "Stop" : "Start"} ${p.name}`;
+    const btn = h("button", { class: "power-btn" + (busyWords ? " busy" : verb === "start" ? " go" : ""), type: "button",
+                              title, "aria-label": title, "data-name": p.name, disabled: !!busyWords,
+                              onclick: (ev) => {
+                                  ev.stopPropagation();
+                                  if (btn.disabled) return;
+                                  S.railAsk = { name: p.name, verb };
+                                  renderRail();
+                                  const no = S.shell.rail.querySelector('.rail-confirm [data-ask="no"]');
+                                  if (no) no.focus();
+                              } });
+    btn.innerHTML = RAIL_ICON_SVG[busyWords ? "busy" : verb];
+    return btn;
+}
+
+// The asked row, drawn as RS's inline question. Clicks and presses in it never reach the row.
+function railAskRow(name, verb) {
+    const stop = verb === "stop";
+    const cancel = () => {
+        S.railAsk = null;
+        renderRail();
+        const back = [...S.shell.rail.querySelectorAll(".power-btn")].find((b) => b.dataset.name === name);
+        if (back) back.focus();
+    };
+    const go = h("button", { class: stop ? "danger" : "primary", type: "button", "data-ask": "go",
+                             onclick: (ev) => { ev.stopPropagation(); railAnswer(name, verb); } }, stop ? "Stop" : "Start");
+    const no = h("button", { type: "button", "data-ask": "no", onclick: (ev) => { ev.stopPropagation(); cancel(); } }, "Cancel");
+    return h("div", { class: "proj-row rail-confirming", onclick: (ev) => ev.stopPropagation(),
+                      onpointerdown: (ev) => ev.stopPropagation(),
+                      onkeydown: (ev) => { if (ev.key !== "Escape") return; ev.stopPropagation(); cancel(); } },
+        h("div", { class: "rail-confirm" },
+            h("div", { class: "rail-confirm-q" }, stop ? ["Stop ", h("b", {}, name), "? Running work is interrupted."] : ["Start ", h("b", {}, name), "?"]),
+            h("div", { class: "rail-confirm-btns" }, go, no)));
+}
+
+// The answer: the ⚙ box's runAction, quiet (no dialog, a notice only on failure); the button is
+// busy from here until the operation is over.
+async function railAnswer(name, verb) {
+    S.railAsk = null;
+    railPending.set(name, verb);
+    renderRail();
+    try {
+        await runAction(name, verb, { quiet: true });
+    } finally {
+        railPending.delete(name);
+        if (S.shell) renderRail();
+    }
+}
+
 function renderRail() {
+    if (S.railAsk && !shownRow(S.railAsk.name)) S.railAsk = null;
+    // Which answer of the question had the focus, so a rebuild (the poll) keeps it there.
+    const active = document.activeElement;
+    const hadAsk = S.railAsk && active && S.shell.rail.contains(active) ? active.dataset.ask : null;
     const rows = shownProjects().map((p) => {
         const st = stateWords(p);
         const op = opOf(p.name);
         const open = S.expanded.has(p.name);
+        const asked = S.railAsk && S.railAsk.name === p.name;
         return h("div", { class: "proj" + (p.name === S.current && !S.page ? " sel" : "") },
-            h("div", { class: "proj-row", onclick: () => selectProject(p.name) },
+            asked ? railAskRow(p.name, S.railAsk.verb) : h("div", { class: "proj-row", onclick: () => selectProject(p.name) },
                 h("span", { class: `dot ${st.cls}` }),
                 h("span", { class: "proj-name" }, p.name,
                     h("span", { class: "proj-prog" }, st.text, op ? " · " : null,
                         op ? h("button", { class: "link", title: "Show the operation's progress",
                                            onclick: (ev) => { ev.stopPropagation(); followOp(op.op_id, `${p.name}: ${OP_WORDS[op.verb] || op.verb}`); } }, "log") : null)),
+                railPowerButton(p),
                 h("button", { class: "gear", title: "Start, stop, limits, destroy",
                               onclick: (ev) => { ev.stopPropagation(); projectDialog(p.name); } }, "⚙"),
                 h("button", { class: "chev", title: open ? "Hide the lessons" : "Show the lessons",
@@ -542,6 +628,10 @@ function renderRail() {
         rows.push(h("button", { class: "mode-line", title: "What privileged mode means: Settings", onclick: () => showSettings("mode") }, "privileged mode"));
     }
     S.shell.rail.replaceChildren(...rows);
+    if (hadAsk) {
+        const again = S.shell.rail.querySelector(`.rail-confirm [data-ask="${hadAsk}"]`);
+        if (again) again.focus();
+    }
     S.shell.rail.parentNode.querySelector(".settings-btn").classList.toggle("sel", S.page === "settings");
     renderKbFoot();
 }
@@ -5853,7 +5943,9 @@ function exportSection(name, box, busy) {
         h("div", { class: "btns" }, go), said);
 }
 
-async function runAction(name, verb) {
+// opts.quiet (the row's Start/Stop): followed without the dialog, a notice only on failure.
+async function runAction(name, verb, opts) {
+    opts = opts || {};
     const r = await api("POST", projectPath(name, `/${verb}`));
     if (!r.body.ok) { toast(`${name}: ${errText(r.body)}`, true); refreshProjects(); return; }
     refreshProjects();
@@ -5871,7 +5963,7 @@ async function runAction(name, verb) {
         saveLayout();
         render();
     };
-    await followOp(r.body.op_id, `${name}: ${OP_WORDS[verb] || verb}`, { onEnd });
+    await followOp(r.body.op_id, `${name}: ${OP_WORDS[verb] || verb}`, { onEnd, background: !!opts.quiet, quiet: !!opts.quiet });
     // A Shell the stop or recreate closed connects again once the sandbox runs (see its update).
     const shell = S.panes[paneKey(name, "shell")];
     if (shell && (shell.state === "closed" || shell.state === "failed")) { shell.wasDown = true; shell.update(); }
@@ -5879,7 +5971,8 @@ async function runAction(name, verb) {
 
 // Follow an operation: its log as it grows, then its result. The dialog can be closed; the
 // operation goes on in the broker, and the rail says so. opts.background follows it without
-// a dialog (a build found again after a reload); opts.onEnd(ok) is told when it is over.
+// a dialog (a build found again after a reload); opts.quiet leaves out its end notice unless it
+// failed; opts.onEnd(ok) is told when it is over.
 async function followOp(opId, title, opts) {
     opts = opts || {};
     const state = h("p", { class: "opstate" }, "Running…");
@@ -5925,7 +6018,7 @@ async function followOp(opId, title, opts) {
     const knWords = !kn ? "" : kn.told ? (kn.forgotten ? "What you learned in this project is forgotten." : "What you learned in this project is kept, marked as from a removed project.")
         : String(kn.message || "The tutor service was not told the project is gone.");
     if (kn) state.after(h("p", { class: kn.told ? "note" : "bad" }, knWords));
-    if (!scrim || !scrim.isConnected) toast(`${title}: ${ok ? "done" : "failed"}${msg}${kn && !kn.told ? `. ${knWords}` : ""}`, !ok || (kn && !kn.told));
+    if ((!scrim || !scrim.isConnected) && (!opts.quiet || !ok)) toast(`${title}: ${ok ? "done" : "failed"}${msg}${kn && !kn.told ? `. ${knWords}` : ""}`, !ok || (kn && !kn.told));
     if (kn && S.page === "knowledge") renderKnowledge();
     if (opts.onEnd) opts.onEnd(ok, result);
     await refreshProjects();
