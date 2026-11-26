@@ -5857,7 +5857,21 @@ async function runAction(name, verb) {
     const r = await api("POST", projectPath(name, `/${verb}`));
     if (!r.body.ok) { toast(`${name}: ${errText(r.body)}`, true); refreshProjects(); return; }
     refreshProjects();
-    await followOp(r.body.op_id, `${name}: ${OP_WORDS[verb] || verb}`);
+    // A stop pressed here, once it ended well, closes the project (RS's teardownProjectState):
+    // its panes go with their sockets and frames, so nothing keeps connecting to the stopped
+    // sandbox, and its lessons fold. Its tab arrangement and lesson list are kept for its next run.
+    const onEnd = (ok) => {
+        if (!ok || verb !== "stop") return;
+        for (const key of Object.keys(S.panes)) if (key.startsWith(`${name}|`)) dropPane(key);
+        // Its tabs list goes too (RS: delete state.projectServices[name]): reopened, a stale list
+        // would make an Editor frame on the stopped sandbox before the fresh list comes.
+        delete S.services[name];
+        S.expanded.delete(name);
+        if (S.current === name) S.current = null;
+        saveLayout();
+        render();
+    };
+    await followOp(r.body.op_id, `${name}: ${OP_WORDS[verb] || verb}`, { onEnd });
     // A Shell the stop or recreate closed connects again once the sandbox runs (see its update).
     const shell = S.panes[paneKey(name, "shell")];
     if (shell && (shell.state === "closed" || shell.state === "failed")) { shell.wasDown = true; shell.update(); }

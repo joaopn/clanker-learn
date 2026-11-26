@@ -38,6 +38,8 @@ flowchart LR
 | Settings | Interface (themes, terminal theme, editor zoom, CLI width and font size, kept by the browser), Software, Tutor (the Claude token, the default agent, the tutor's instructions), Backup, How it runs (sysbox or privileged, the certificate) | the broker, the tutor service |
 | Knowledge | what clanker-learn keeps about you (see [Knowledge](knowledge.md)) | the tutor service |
 
+A stop pressed in a project's gear closes that project once the stop has ended well, as research-sandbox does: its tabs go with their terminals and frames, so nothing keeps connecting to a stopped sandbox, and its lessons fold. Its tab arrangement and lesson list are kept, so the tabs come back when it runs again.
+
 In privileged mode a quiet line at the bottom of the project list says so and leads to Settings → How it runs.
 
 ### Layout
