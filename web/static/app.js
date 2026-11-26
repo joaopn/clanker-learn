@@ -653,6 +653,7 @@ function makeTab(name, t, col, on) {
                                : t.type === "ports" ? null : (t.row ? `port ${t.row.default_port} of the sandbox` : "a terminal in the sandbox"),
                            // consumeTabDragClick swallows the one click the browser makes on the tab after a drag.
                            onclick: () => { if (!consumeTabDragClick()) showTab(name, t.id); } },
+        isWebTab(t) ? refreshTabButton(name, t.id) : null,
         h("span", { class: "tl" }, t.label),
         t.type === "lesson" ? h("button", { class: "tclose", title: "Close the tab (the lesson stays in the list)", "aria-label": "Close the tab",
                                            onclick: (ev) => { ev.stopPropagation(); closeLessonTab(name, lessonTabId(t.id)); } }, "×") : null,
@@ -660,6 +661,29 @@ function makeTab(name, t, col, on) {
                                                                   title: "Open in a new browser tab", onclick: (ev) => ev.stopPropagation() }, "↗") : null);
     armTabDrag(tab, name, t.id);
     return tab;
+}
+
+// A tab whose pane is a frame (the Editor, an app in the sandbox).
+const isWebTab = (t) => !!t.row;
+
+// RS's per-tab refresh glyph (webui/static/app.js REFRESH_TAB_SVG): a constant, so innerHTML
+// carries no server string.
+const REFRESH_TAB_SVG =
+    '<svg viewBox="0 0 16 16" fill="currentColor" xmlns="http://www.w3.org/2000/svg">' +
+    '<path d="M8 1.5A6.5 6.5 0 1 1 1.5 8h2A4.5 4.5 0 1 0 8 3.5z"/>' +
+    '<path d="M8 0l4.5 2.5L8 5z"/></svg>';
+
+// RS's refresh button on a tab: reloads the tab's frame without selecting or dragging the tab
+// (the drag ignores a button). A tab not opened yet is opened.
+function refreshTabButton(name, id) {
+    const b = h("button", { class: "refresh-tab-btn", title: "Refresh tab", "aria-label": "Refresh tab",
+                            onclick: (ev) => {
+                                ev.stopPropagation();
+                                const pane = S.panes[paneKey(name, id)];
+                                if (pane && pane.refresh) pane.refresh(); else showTab(name, id);
+                            } });
+    b.innerHTML = REFRESH_TAB_SVG;
+    return b;
 }
 
 function showTab(name, id) {
@@ -2015,54 +2039,49 @@ const appUrl = (originPort) => `https://${location.hostname}:${originPort}/`;
 
 function makeWebPane(name, id, row) {
     const label = id === "editor" ? "Editor" : String(row.label || row.default_port);
-    const said = h("span", { class: "grow" }, "Opening…");
-    const link = h("a", { class: "newtab", target: "_blank", rel: "noopener noreferrer", hidden: true }, "open in a new tab ↗");
-    const reload = h("button", { hidden: true, title: "Load the frame again" }, "Reload");
+    // No bar above the frame (RS has none): the tab carries ↗ and the refresh button. While there
+    // is no frame, a note in the frame area says it is opening, or why it failed.
+    const said = h("span", {}, "Opening…");
     const retry = h("button", { hidden: true }, "Try again");
-    // The file a lesson's link asked the Editor to open, with a copy of its path.
-    const fileWhere = h("code", {});
-    const fileNote = h("span", { class: "filenote", hidden: true }, "file ", fileWhere,
-        h("button", { class: "small", title: "Copy the path", onclick: () => { if (navigator.clipboard) navigator.clipboard.writeText(fileWhere.textContent).catch(() => {}); } }, "copy"));
-    const bar = h("div", { class: "appbar" }, h("span", { class: "applabel" }, label), said, fileNote, link, reload, retry);
+    const status = h("div", { class: "frame-status" }, said, retry);
     const goneNote = h("div", { class: "gone-note", hidden: true },
         h("span", {}, "This app no longer listens in the sandbox. Its frame is kept until you close it."),
         h("button", { onclick: () => { dropPane(paneKey(name, id)); render(); } }, "Close the tab"));
-    const body = h("div", { class: "frame-area" },
-        h("div", { class: "frame-hint" }, "If the frame stays empty, the browser has not accepted this address's certificate yet: open it in a new tab once, accept it there, then reload the frame."));
-    const el = h("div", { class: "pane web-pane" }, bar, goneNote, body);
-    const pane = { kind: "web", el, label, url: null, iframe: null };
+    const body = h("div", { class: "frame-area" }, status,
+        h("div", { class: "frame-hint" }, "If the frame stays empty, the browser has not accepted this address's certificate yet: open it in a new tab once with the ↗ on its tab, accept it there, then press the tab's refresh button."));
+    const el = h("div", { class: "pane web-pane" }, goneNote, body);
+    const pane = { kind: "web", el, label, url: null, iframe: null, opening: false };
     const takeFile = () => {
         const file = id === "editor" ? S.editorFile[name] : null;
         if (!file) return null;
         delete S.editorFile[name];
-        fileWhere.textContent = `/workspace/${file.path}${file.line ? `:${file.line}` : ""}`;
-        fileNote.hidden = false;
         return file;
     };
 
     async function open() {
+        pane.opening = true;
         retry.hidden = true;
+        status.hidden = false;
         said.textContent = "Opening…";
-        said.className = "grow";
-        const fail = (text) => { said.textContent = text; said.className = "grow bad"; retry.hidden = false; };
+        said.className = "";
+        const fail = (text) => { pane.opening = false; said.textContent = text; said.className = "bad"; retry.hidden = false; };
         const session = await api("POST", projectPath(name, "/session"));
         if (!session.body.ok) return fail("Could not open: " + errText(session.body));
         const origin = await api("POST", projectPath(name, "/origin"), { port: row.default_port });
         if (!origin.body.ok) return fail("Could not open: " + errText(origin.body));
         const port = origin.body.origin_port;
         if (!Number.isInteger(port) || port < 1 || port > 65535) return fail("The web server named no address for this app.");
+        pane.opening = false;
         if (S.panes[paneKey(name, id)] !== pane) return;   // closed meanwhile
         pane.url = appUrl(port);
-        link.href = pane.url;
-        link.hidden = false;
-        reload.hidden = false;
-        said.textContent = `port ${row.default_port} of the sandbox, at ${pane.url}`;
+        status.hidden = true;
         pane.iframe = h("iframe", { src: editorAddress(pane.url, takeFile()), title: label, sandbox: WEB_FRAME_SANDBOX, allow: WEB_FRAME_ALLOW });
         body.append(pane.iframe);
         renderTabbar();
     }
-    reload.addEventListener("click", () => { if (pane.iframe) pane.iframe.src = pane.url; });
     retry.addEventListener("click", open);
+    // The tab's refresh button (RS's): reload the frame, or open again when it never opened.
+    pane.refresh = () => { if (pane.iframe) pane.iframe.src = pane.url; else if (!pane.opening) open(); };
     pane.update = () => { goneNote.hidden = !!(S.services[name] || {})[id]; };
     pane.close = () => { if (pane.iframe) pane.iframe.remove(); pane.iframe = null; };
     // Opened again at the file (the editor reloads); a frame still opening takes it when it opens.

@@ -19,7 +19,7 @@ The editor's previews (Markdown, notebooks and other webviews) need a certificat
 
 ## Web apps
 
-A server that listens on the sandbox's address gets **a tab of its own** a few seconds after it starts listening, and the tab is marked when it is gone. Each such tab is served on a port of its own, behind your login. Some browsers want the certificate accepted once for each port: if a tab stays empty, use its "open in a new tab" link, accept the certificate there, and reload the tab.
+A server that listens on the sandbox's address gets **a tab of its own** a few seconds after it starts listening, and the tab is marked when it is gone. Each such tab is served on a port of its own, behind your login. Some browsers want the certificate accepted once for each port: if a tab stays empty, open it in a new browser tab with the **↗** on the tab, accept the certificate there, and press the tab's refresh button. The refresh button, before the name of every web tab, reloads that tab.
 
 A server that listens only on the sandbox's loopback (`127.0.0.1`, the default of many development and notebook servers) cannot be reached from outside the sandbox, so it gets no tab. Inside the sandbox, `cl-expose <port>` puts it on the sandbox's own address too, and the tab appears. Use it only for such a server: for one that listens on all addresses, `cl-expose` takes the port first and the server then fails to start.
 
